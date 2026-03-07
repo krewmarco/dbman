@@ -70,6 +70,21 @@ class LookupPlugin:
         """, (table, column, related_table, related_key, display_column))
         self.conn.commit()
 
+    def find_foreign_key(self, table, column):
+        """Checks if a specific column is a foreign key."""
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(f"PRAGMA foreign_key_list({table})")
+            for row in cursor.fetchall():
+                if row[3] == column:
+                    return {
+                        "to_table": row[2],
+                        "to_column": row[4]
+                    }
+        except:
+            pass
+        return None
+
     def get_lookup_config(self, table, column):
         cursor = self.conn.cursor()
         cursor.execute("""
@@ -77,7 +92,17 @@ class LookupPlugin:
             FROM _dbman_lookup_config 
             WHERE table_name = ? AND column_name = ?
         """, (table, column))
-        return cursor.fetchone()
+        res = cursor.fetchone()
+        if res:
+            return res
+        
+        # Auto-detect if it's a FK but not yet configured
+        fk = self.find_foreign_key(table, column)
+        if fk:
+            # Default to using the related column itself as the display column
+            return (fk["to_table"], fk["to_column"], fk["to_column"])
+        
+        return None
 
 class LookupSelectScreen(ModalScreen):
     """A screen with a dropdown to select a related value."""
@@ -100,8 +125,9 @@ class LookupSelectScreen(ModalScreen):
     def __init__(self, title, options, current_value):
         super().__init__()
         self.dialog_title = title
-        self.options = options
-        self.current_value = current_value
+        # Ensure options are (label, value) pairs and values are strings for Select widget
+        self.options = [(str(opt[0]), str(opt[1])) for opt in options]
+        self.current_value = str(current_value) if current_value is not None else None
 
     def compose(self) -> ComposeResult:
         with Vertical(id="lookup-dialog"):
