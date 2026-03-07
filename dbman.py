@@ -41,6 +41,7 @@ class ShortcutsScreen(ModalScreen):
                 " [bold]General[/]\n"
                 " q: Quit\n"
                 " tab: Switch focus between Sidebar and Table\n"
+                " m: Toggle View/Schema mode\n"
                 " ?: Toggle this Shortcuts panel\n"
                 " ctrl+p: Toggle this Shortcuts panel\n\n"
                 " [bold]Navigation[/]\n"
@@ -48,8 +49,9 @@ class ShortcutsScreen(ModalScreen):
                 " h / l: Move left / right (Table only)\n"
                 " pgup / pgdn: Page Up / Down (Mac: fn + up / fn + down)\n"
                 " g / G: Home / End\n\n"
-                " [bold]Editing[/]\n"
-                " e: Edit selected cell\n",
+                " [bold]Editing & Actions[/]\n"
+                " e: Edit selected cell (View mode only)\n"
+                " ctrl+x: Delete selected table\n",
                 id="shortcuts-content"
             )
             yield Button("Close", variant="primary", id="close-button")
@@ -64,59 +66,77 @@ class ShortcutsScreen(ModalScreen):
     def key_ctrl_p(self) -> None:
         self.app.pop_screen()
 
-class EditCellScreen(ModalScreen):
-    """A modal screen for editing a cell."""
+class ConfirmScreen(ModalScreen):
+    """A modal screen for confirmation."""
     CSS = """
-    EditCellScreen {
+    ConfirmScreen {
         background: rgba(0, 0, 0, 0.5);
         align: center middle;
     }
-    #edit-dialog {
+    #confirm-dialog {
         background: $panel;
-        border: thick $primary;
+        border: thick $error;
         padding: 1 2;
-        width: 60;
+        width: 40;
         height: auto;
     }
     Label {
         margin-bottom: 1;
-        text-style: bold;
+        text-align: center;
+        width: 100%;
     }
-    Input {
-        margin-bottom: 1;
-    }
-    #edit-buttons {
-        align: right middle;
+    #confirm-buttons {
+        align: center middle;
     }
     Button {
-        margin-left: 1;
+        margin: 0 1;
     }
     """
-    def __init__(self, table, column, current_value):
+    def __init__(self, message):
         super().__init__()
-        self.table = table
-        self.column = column
+        self.message = message
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="confirm-dialog"):
+            yield Label(self.message)
+            with Horizontal(id="confirm-buttons"):
+                yield Button("Cancel", id="cancel-confirm")
+                yield Button("Delete", variant="error", id="ok-confirm")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "ok-confirm":
+            self.dismiss(True)
+        else:
+            self.dismiss(False)
+
+class EditCellScreen(ModalScreen):
+    """A minimal modal screen for editing a cell in-place."""
+    CSS = """
+    EditCellScreen {
+        background: rgba(0, 0, 0, 0.3);
+        align: center middle;
+    }
+    #edit-input {
+        width: 50%;
+        border: double $primary;
+        background: $surface;
+    }
+    """
+    def __init__(self, current_value):
+        super().__init__()
         self.current_value = str(current_value) if current_value is not None else ""
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="edit-dialog"):
-            yield Label(f"Edit {self.table} -> {self.column}")
-            yield Input(value=self.current_value, id="edit-input")
-            with Horizontal(id="edit-buttons"):
-                yield Button("Cancel", variant="error", id="cancel-edit")
-                yield Button("Save", variant="success", id="save-edit")
+        yield Input(value=self.current_value, id="edit-input")
 
     def on_mount(self):
         self.query_one(Input).focus()
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "save-edit":
-            self.dismiss(self.query_one(Input).value)
-        else:
-            self.dismiss(None)
-
     def on_input_submitted(self, event: Input.Submitted) -> None:
         self.dismiss(event.value)
+
+    def key_escape(self) -> None:
+        self.dismiss(None)
 
 class TableListItem(ListItem):
     def __init__(self, table_name: str) -> None:
@@ -169,7 +189,8 @@ class DbMan(App):
         Binding("g", "scroll_home", "Home", show=False),
         Binding("G", "scroll_end", "End", show=False),
         Binding("tab", "switch_focus", "Switch Focus"),
-        Binding("enter", "select_table", "Select Table", show=False),
+        Binding("m", "toggle_mode", "View/Schema Mode"),
+        Binding("ctrl+x", "delete_table", "Delete Table"),
         Binding("?", "toggle_shortcuts", "Shortcuts", show=False),
         Binding("ctrl+p", "toggle_shortcuts", "Shortcuts"),
         Binding("e", "edit_cell", "Edit Cell"),
@@ -180,6 +201,7 @@ class DbMan(App):
         self.db_path = db_path
         self.current_table = None
         self.has_rowid = False
+        self.mode = "view" # or "schema"
         try:
             self.conn = sqlite3.connect(db_path)
             self.cursor = self.conn.cursor()
@@ -207,6 +229,13 @@ class DbMan(App):
             rows = self.cursor.fetchall()
             return columns, rows, False
 
+    def get_schema_data(self, table_name):
+        self.cursor.execute(f"PRAGMA table_info({table_name});")
+        rows = self.cursor.fetchall()
+        # PRAGMA table_info returns: cid, name, type, notnull, dflt_value, pk
+        columns = ["cid", "name", "type", "notnull", "dflt_value", "pk"]
+        return columns, rows
+
     def compose(self) -> ComposeResult:
         yield Header()
         tables = self.get_tables()
@@ -229,33 +258,93 @@ class DbMan(App):
             self.load_table(event.item.table_name, should_focus=False)
 
     def load_table(self, table_name, should_focus=False):
+        # Save current cursor position if we are reloading the same table
+        saved_coord = None
+        if self.current_table == table_name:
+            try:
+                saved_coord = self.query_one("#data-table").cursor_coordinate
+            except:
+                pass
+
         self.current_table = table_name
         table_widget = self.query_one("#data-table", DataTable)
         table_widget.clear(columns=True)
         
-        columns, rows, has_rowid = self.get_table_data(table_name)
-        self.has_rowid = has_rowid
-        
-        for i, col in enumerate(columns):
-            color = COLORS[i % len(COLORS)]
-            table_widget.add_column(f"[{color}]{col}[/]", key=col)
-        
-        for row in rows:
-            if has_rowid:
-                # Use rowid as the row key (row[0])
-                table_widget.add_row(*row[1:], key=str(row[0]))
-            else:
-                table_widget.add_row(*row)
+        if self.mode == "view":
+            columns, rows, has_rowid = self.get_table_data(table_name)
+            self.has_rowid = has_rowid
+            
+            for i, col in enumerate(columns):
+                color = COLORS[i % len(COLORS)]
+                table_widget.add_column(f"[{color}]{col}[/]", key=col)
+            
+            for row in rows:
+                if has_rowid:
+                    # Use rowid as the row key (row[0])
+                    table_widget.add_row(*row[1:], key=str(row[0]))
+                else:
+                    table_widget.add_row(*row)
+        else:
+            # Schema mode
+            columns, rows = self.get_schema_data(table_name)
+            for i, col in enumerate(columns):
+                color = COLORS[i % len(COLORS)]
+                table_widget.add_column(f"[{color}]{col}[/]", key=col)
+            table_widget.add_rows(rows)
                 
         if should_focus:
             table_widget.focus()
-        self.title = f"dbman - {table_name}"
+            
+        if saved_coord:
+            try:
+                table_widget.move_cursor(row=saved_coord.row, column=saved_coord.column)
+            except:
+                pass
+                
+        self.title = f"dbman - {table_name} ({self.mode})"
 
     def action_switch_focus(self):
         if self.focused.id == "table-list":
             self.query_one("#data-table").focus()
         else:
             self.query_one("#table-list").focus()
+
+    def action_toggle_mode(self):
+        self.mode = "schema" if self.mode == "view" else "view"
+        self.query_one("#sidebar-title").update(f" {self.mode.upper()} ")
+        if self.current_table:
+            self.load_table(self.current_table)
+
+    def action_delete_table(self):
+        # Determine table to delete (from sidebar or currently viewed)
+        table_list = self.query_one("#table-list", ListView)
+        if table_list.highlighted_child:
+            table_name = table_list.highlighted_child.table_name
+        elif self.current_table:
+            table_name = self.current_table
+        else:
+            return
+
+        def on_confirm(do_delete):
+            if do_delete:
+                try:
+                    self.cursor.execute(f"DROP TABLE {table_name}")
+                    self.conn.commit()
+                    self.notify(f"Table '{table_name}' deleted")
+                    # Refresh table list
+                    new_tables = self.get_tables()
+                    table_list.clear()
+                    for t in new_tables:
+                        table_list.append(TableListItem(t))
+                    if new_tables:
+                        self.load_table(new_tables[0])
+                    else:
+                        self.query_one("#data-table").clear(columns=True)
+                        self.current_table = None
+                except Exception as e:
+                    self.notify(f"Delete failed: {e}", severity="error")
+
+        self.push_screen(ConfirmScreen(f"Delete table '{table_name}'?"), on_confirm)
 
     def action_cursor_down(self):
         if self.focused:
@@ -296,6 +385,10 @@ class DbMan(App):
             self.push_screen(ShortcutsScreen())
 
     def action_edit_cell(self):
+        if self.mode != "view":
+            self.notify("Editing only allowed in View mode", severity="error")
+            return
+            
         if not isinstance(self.focused, DataTable) or not self.current_table:
             return
             
@@ -304,22 +397,36 @@ class DbMan(App):
             return
 
         coord = self.focused.cursor_coordinate
-        column_name = self.focused.columns[coord.column].key.value
-        row_id = self.focused.rows[coord.row].key.value
+        column_name = self.focused.ordered_columns[coord.column].key.value
+        row_id = list(self.focused.rows.values())[coord.row].key.value
         current_value = self.focused.get_cell_at(coord)
 
         def perform_update(new_value):
             if new_value is not None:
+                # Type inference
+                typed_value = new_value
+                if new_value.strip() == "":
+                    typed_value = None
+                else:
+                    try:
+                        if "." in new_value:
+                            typed_value = float(new_value)
+                        else:
+                            typed_value = int(new_value)
+                    except ValueError:
+                        pass # Keep as string
+
                 try:
                     query = f"UPDATE {self.current_table} SET {column_name} = ? WHERE rowid = ?"
-                    self.cursor.execute(query, (new_value, row_id))
+                    self.cursor.execute(query, (typed_value, row_id))
                     self.conn.commit()
-                    self.notify("Cell updated!")
+                    self.notify("Updated")
+                    # Reload table but preserve cursor
                     self.load_table(self.current_table)
                 except Exception as e:
                     self.notify(f"Update failed: {e}", severity="error")
 
-        self.push_screen(EditCellScreen(self.current_table, column_name, current_value), perform_update)
+        self.push_screen(EditCellScreen(current_value), perform_update)
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
