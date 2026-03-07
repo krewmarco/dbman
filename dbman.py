@@ -41,7 +41,8 @@ class ShortcutsScreen(ModalScreen):
                 " [bold]Shortcuts[/]\n\n"
                 " [bold]General[/]\n"
                 " q: Quit\n"
-                " tab: Cycle focus (Sidebar Views -> Sidebar Tables -> Main Area)\n"
+                " tab: Cycle focus (Sidebar -> Main Area)\n"
+                " shift+tab: Jump to next sidebar section (VIEWS/TABLES)\n"
                 " m: Toggle View/Schema/SQL mode\n"
                 " ?: Toggle this Shortcuts panel\n"
                 " ctrl+p: Toggle this Shortcuts panel\n\n"
@@ -226,6 +227,12 @@ class DbItem(ListItem):
         self.item_name = name
         self.item_type = item_type # "table" or "view"
 
+class SidebarHeader(ListItem):
+    def __init__(self, title: str) -> None:
+        super().__init__(Label(f" {title} "))
+        self.title = title
+        self.disabled = True # Headers are not selectable
+
 class DbMan(App):
     """A vim-like SQLite database browser with Sidebar navigation."""
 
@@ -239,22 +246,20 @@ class DbMan(App):
         background: $panel;
         border-right: solid $primary;
     }
-    .sidebar-section-title {
-        padding: 0 1;
+    ListView {
+        height: 1fr;
+        background: $panel;
+    }
+    SidebarHeader {
         background: $primary;
         color: $text;
         text-style: bold;
-        text-align: center;
+        padding: 0 1;
         border-bottom: solid $primary;
         border-top: solid $primary;
     }
-    #view-title {
+    SidebarHeader:first-child {
         border-top: none;
-    }
-    ListView {
-        height: auto;
-        max-height: 50%;
-        background: $panel;
     }
     DataTable {
         height: 1fr;
@@ -296,7 +301,8 @@ class DbMan(App):
         Binding("pagedown", "page_down", "PgDn", show=False),
         Binding("g", "scroll_home", "Home", show=False),
         Binding("G", "scroll_end", "End", show=False),
-        Binding("tab", "switch_focus", "Switch Focus"),
+        Binding("tab", "switch_focus", "Sidebar/Main"),
+        Binding("shift+tab", "jump_section", "Jump Section"),
         Binding("m", "toggle_mode", "View/Schema/SQL Mode"),
         Binding("ctrl+x", "delete_item", "Delete"),
         Binding("?", "toggle_shortcuts", "Shortcuts", show=False),
@@ -363,24 +369,40 @@ class DbMan(App):
 
     def compose(self) -> ComposeResult:
         yield Header()
-        tables = self.get_tables()
-        views = self.get_views()
         with Horizontal():
             with Vertical(id="sidebar"):
-                yield Static(" VIEWS ", classes="sidebar-section-title", id="view-title")
-                yield ListView(*[DbItem(v, "view") for v in views], id="view-list")
-                yield Static(" TABLES ", classes="sidebar-section-title", id="table-title")
-                yield ListView(*[DbItem(t, "table") for t in tables], id="table-list")
+                yield ListView(id="sidebar-list")
             with ContentSwitcher(initial="data-table"):
                 yield DataTable(id="data-table")
                 yield Static("", id="sql-view")
         yield Footer()
 
     def on_mount(self):
-        if self.get_views():
-            self.query_one("#view-list").focus()
-        else:
-            self.query_one("#table-list").focus()
+        self.refresh_sidebar()
+        self.query_one("#sidebar-list").focus()
+
+    def refresh_sidebar(self):
+        sidebar_list = self.query_one("#sidebar-list", ListView)
+        sidebar_list.clear()
+        
+        views = self.get_views()
+        tables = self.get_tables()
+        
+        mode_suffix = f" ({self.mode.upper()})"
+        
+        sidebar_list.append(SidebarHeader(f"VIEWS{mode_suffix}"))
+        for v in views:
+            sidebar_list.append(DbItem(v, "view"))
+            
+        sidebar_list.append(SidebarHeader(f"TABLES{mode_suffix}"))
+        for t in tables:
+            sidebar_list.append(DbItem(t, "table"))
+            
+        # Initial load if something exists
+        if views:
+            self.load_item(views[0], "view")
+        elif tables:
+            self.load_item(tables[0], "table")
 
     def on_list_view_selected(self, event: ListView.Selected):
         item = event.item
@@ -450,39 +472,63 @@ class DbMan(App):
         self.title = f"dbman - {name} ({self.mode.upper()})"
 
     def action_switch_focus(self):
-        if self.focused.id == "view-list":
-            self.query_one("#table-list").focus()
-        elif self.focused.id == "table-list":
+        if self.focused.id == "sidebar-list":
             switcher = self.query_one(ContentSwitcher)
             if switcher.current == "data-table":
                 self.query_one("#data-table").focus()
             else:
                 self.query_one("#sql-view").focus()
         else:
-            self.query_one("#view-list").focus()
+            self.query_one("#sidebar-list").focus()
+
+    def action_jump_section(self):
+        # Find headers and jump to next one
+        sidebar_list = self.query_one("#sidebar-list", ListView)
+        current_idx = sidebar_list.index
+        
+        # Look for next header starting from current index + 1
+        found = False
+        for i in range(current_idx + 1, len(sidebar_list.children)):
+            if isinstance(sidebar_list.children[i], SidebarHeader):
+                # Highlight the first item after this header
+                sidebar_list.index = i + 1
+                found = True
+                break
+        
+        # Wrap around to the first header
+        if not found:
+            for i in range(len(sidebar_list.children)):
+                if isinstance(sidebar_list.children[i], SidebarHeader):
+                    sidebar_list.index = i + 1
+                    break
 
     def action_toggle_mode(self):
         modes = ["view", "schema", "sql"]
         idx = modes.index(self.mode)
         self.mode = modes[(idx + 1) % len(modes)]
         
-        # Update sidebar titles to show current mode
-        self.query_one("#view-title").update(f" VIEWS ({self.mode.upper()}) ")
-        self.query_one("#table-title").update(f" TABLES ({self.mode.upper()}) ")
+        self.refresh_sidebar()
         
+        # Try to re-highlight the current item
+        sidebar_list = self.query_one("#sidebar-list", ListView)
+        for i, child in enumerate(sidebar_list.children):
+            if isinstance(child, DbItem) and child.item_name == self.current_item:
+                sidebar_list.index = i
+                break
+
         if self.current_item:
             self.load_item(self.current_item, self.current_type)
 
     def action_delete_item(self):
         # Determine item to delete
-        focused_list = None
-        if self.focused and self.focused.id in ["view-list", "table-list"]:
-            focused_list = self.focused
-            
-        if focused_list and focused_list.highlighted_child:
-            item = focused_list.highlighted_child
-            name = item.item_name
-            item_type = item.item_type
+        sidebar_list = self.query_one("#sidebar-list", ListView)
+        if self.focused and self.focused.id == "sidebar-list":
+            if sidebar_list.highlighted_child and isinstance(sidebar_list.highlighted_child, DbItem):
+                item = sidebar_list.highlighted_child
+                name = item.item_name
+                item_type = item.item_type
+            else:
+                return
         elif self.current_item:
             name = self.current_item
             item_type = self.current_type
@@ -496,29 +542,7 @@ class DbMan(App):
                     self.cursor.execute(f"DROP {sql_type} {name}")
                     self.conn.commit()
                     self.notify(f"{sql_type.capitalize()} '{name}' deleted")
-                    
-                    # Refresh lists
-                    view_list = self.query_one("#view-list", ListView)
-                    table_list = self.query_one("#table-list", ListView)
-                    
-                    view_list.clear()
-                    for v in self.get_views():
-                        view_list.append(DbItem(v, "view"))
-                        
-                    table_list.clear()
-                    for t in self.get_tables():
-                        table_list.append(DbItem(t, "table"))
-                        
-                    # Load something else if available
-                    views = self.get_views()
-                    tables = self.get_tables()
-                    if views:
-                        self.load_item(views[0], "view")
-                    elif tables:
-                        self.load_item(tables[0], "table")
-                    else:
-                        self.query_one("#data-table").clear(columns=True)
-                        self.current_item = None
+                    self.refresh_sidebar()
                 except Exception as e:
                     self.notify(f"Delete failed: {e}", severity="error")
 
