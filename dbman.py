@@ -42,7 +42,7 @@ class ShortcutsScreen(ModalScreen):
                 " [bold]General[/]\n"
                 " q: Quit\n"
                 " tab: Cycle focus (Sidebar -> Main Area)\n"
-                " shift+tab: Jump to next sidebar section (VIEWS/TABLES)\n"
+                " shift+tab: Jump to next sidebar section\n"
                 " m: Toggle View/Schema/SQL mode\n"
                 " ?: Toggle this Shortcuts panel\n"
                 " ctrl+p: Toggle this Shortcuts panel\n\n"
@@ -51,8 +51,10 @@ class ShortcutsScreen(ModalScreen):
                 " h / l: Move left / right (Table only)\n"
                 " pgup / pgdn: Page Up / Down (Mac: fn + up / fn + down)\n"
                 " g / G: Home / End\n\n"
-                " [bold]Editing & Actions[/]\n"
+                " [bold]Editing & Filtering[/]\n"
                 " e: Edit selected cell (View mode only)\n"
+                " f: Filter selected column (View mode only)\n"
+                " F: Clear all filters for current table\n"
                 " t: Truncate/Shorten Column data (View mode only)\n"
                 " ctrl+x: Delete selected table/view\n",
                 id="shortcuts-content"
@@ -68,6 +70,63 @@ class ShortcutsScreen(ModalScreen):
     
     def key_ctrl_p(self) -> None:
         self.app.pop_screen()
+
+class FilterColumnScreen(ModalScreen):
+    """A modal screen for filtering a column."""
+    CSS = """
+    FilterColumnScreen {
+        background: rgba(0, 0, 0, 0.5);
+        align: center middle;
+    }
+    #filter-dialog {
+        background: $panel;
+        border: thick $primary;
+        padding: 1 2;
+        width: 50;
+        height: auto;
+    }
+    Label {
+        margin-bottom: 1;
+        text-style: bold;
+    }
+    Input {
+        margin-bottom: 1;
+    }
+    #filter-buttons {
+        align: right middle;
+    }
+    Button {
+        margin-left: 1;
+    }
+    """
+    def __init__(self, column, current_filter=""):
+        super().__init__()
+        self.column = column
+        self.current_filter = current_filter
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="filter-dialog"):
+            yield Label(f"Filter Column: {self.column}")
+            yield Static("Enter search term (use 'null' for NULL, 'empty' for empty string):", id="small-label")
+            yield Input(value=self.current_filter, id="filter-input", placeholder="Filter...")
+            with Horizontal(id="filter-buttons"):
+                yield Button("Cancel", id="cancel-filter")
+                yield Button("Clear", variant="warning", id="clear-filter")
+                yield Button("Apply", variant="success", id="apply-filter")
+
+    def on_mount(self):
+        self.query_one(Input).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "apply-filter":
+            self.dismiss(self.query_one(Input).value)
+        elif event.button.id == "clear-filter":
+            self.dismiss("")
+        else:
+            self.dismiss(None)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value)
 
 class ConfirmScreen(ModalScreen):
     """A modal screen for confirmation."""
@@ -308,6 +367,8 @@ class DbMan(App):
         Binding("?", "toggle_shortcuts", "Shortcuts", show=False),
         Binding("ctrl+p", "toggle_shortcuts", "Shortcuts"),
         Binding("e", "edit_cell", "Edit Cell"),
+        Binding("f", "filter_column", "Filter Column"),
+        Binding("F", "clear_filters", "Clear Filters"),
         Binding("t", "truncate_column", "Shorten Column"),
     ]
 
@@ -318,6 +379,7 @@ class DbMan(App):
         self.current_type = None # "table" or "view"
         self.has_rowid = False
         self.mode = "view" # or "schema" or "sql"
+        self.filters = {} # {column_name: filter_string}
         try:
             self.conn = sqlite3.connect(db_path)
             self.cursor = self.conn.cursor()
@@ -333,32 +395,50 @@ class DbMan(App):
         self.cursor.execute("SELECT name FROM sqlite_master WHERE type='view' AND name NOT LIKE 'sqlite_%';")
         return [row[0] for row in self.cursor.fetchall()]
 
+    def build_filter_clause(self):
+        if not self.filters:
+            return "", []
+        
+        clauses = []
+        params = []
+        for col, val in self.filters.items():
+            if val.lower() == "null":
+                clauses.append(f"{col} IS NULL")
+            elif val.lower() == "empty":
+                clauses.append(f"({col} IS NULL OR {col} = '')")
+            else:
+                clauses.append(f"{col} LIKE ?")
+                params.append(f"%{val}%")
+        
+        return " WHERE " + " AND ".join(clauses), params
+
     def get_item_data(self, name, item_type):
         self.cursor.execute(f"PRAGMA table_info({name});")
         info = self.cursor.fetchall()
         columns = [i[1] for i in info]
         
+        filter_clause, params = self.build_filter_clause()
+        
         if item_type == "table":
             try:
-                # Try to get rowid for unique identification during updates
-                self.cursor.execute(f"SELECT rowid, * FROM {name} LIMIT 2000;")
+                query = f"SELECT rowid, * FROM {name}{filter_clause} LIMIT 2000;"
+                self.cursor.execute(query, params)
                 rows = self.cursor.fetchall()
                 return columns, rows, True
             except:
-                # Fallback if table doesn't have rowid (WITHOUT ROWID)
-                self.cursor.execute(f"SELECT * FROM {name} LIMIT 2000;")
+                query = f"SELECT * FROM {name}{filter_clause} LIMIT 2000;"
+                self.cursor.execute(query, params)
                 rows = self.cursor.fetchall()
                 return columns, rows, False
         else:
-            # Views don't have rowids in the same way
-            self.cursor.execute(f"SELECT * FROM {name} LIMIT 2000;")
+            query = f"SELECT * FROM {name}{filter_clause} LIMIT 2000;"
+            self.cursor.execute(query, params)
             rows = self.cursor.fetchall()
             return columns, rows, False
 
     def get_schema_data(self, name):
         self.cursor.execute(f"PRAGMA table_info({name});")
         rows = self.cursor.fetchall()
-        # PRAGMA table_info returns: cid, name, type, notnull, dflt_value, pk
         columns = ["cid", "name", "type", "notnull", "dflt_value", "pk"]
         return columns, rows
 
@@ -398,20 +478,23 @@ class DbMan(App):
         for t in tables:
             sidebar_list.append(DbItem(t, "table"))
             
-        # Initial load if something exists
-        if views:
-            self.load_item(views[0], "view")
-        elif tables:
-            self.load_item(tables[0], "table")
+        # Initial load if something exists and nothing is loaded
+        if not self.current_item:
+            if views:
+                self.load_item(views[0], "view")
+            elif tables:
+                self.load_item(tables[0], "table")
 
     def on_list_view_selected(self, event: ListView.Selected):
         item = event.item
         if isinstance(item, DbItem):
+            self.filters = {} # Clear filters when switching items
             self.load_item(item.item_name, item.item_type, should_focus=True)
 
     def on_list_view_highlighted(self, event: ListView.Highlighted):
         item = event.item
         if isinstance(item, DbItem):
+            self.filters = {} # Clear filters when switching items
             self.load_item(item.item_name, item.item_type, should_focus=False)
 
     def load_item(self, name, item_type, should_focus=False):
@@ -439,7 +522,10 @@ class DbMan(App):
                 
                 for i, col in enumerate(columns):
                     color = COLORS[i % len(COLORS)]
-                    table_widget.add_column(f"[{color}]{col}[/]", key=col)
+                    label = f"[{color}]{col}[/]"
+                    if col in self.filters:
+                        label = f"[reverse]{label} (F)[/]"
+                    table_widget.add_column(label, key=col)
                 
                 for row in rows:
                     if has_rowid:
@@ -482,20 +568,14 @@ class DbMan(App):
             self.query_one("#sidebar-list").focus()
 
     def action_jump_section(self):
-        # Find headers and jump to next one
         sidebar_list = self.query_one("#sidebar-list", ListView)
         current_idx = sidebar_list.index
-        
-        # Look for next header starting from current index + 1
         found = False
         for i in range(current_idx + 1, len(sidebar_list.children)):
             if isinstance(sidebar_list.children[i], SidebarHeader):
-                # Highlight the first item after this header
                 sidebar_list.index = i + 1
                 found = True
                 break
-        
-        # Wrap around to the first header
         if not found:
             for i in range(len(sidebar_list.children)):
                 if isinstance(sidebar_list.children[i], SidebarHeader):
@@ -506,21 +586,43 @@ class DbMan(App):
         modes = ["view", "schema", "sql"]
         idx = modes.index(self.mode)
         self.mode = modes[(idx + 1) % len(modes)]
-        
         self.refresh_sidebar()
-        
-        # Try to re-highlight the current item
         sidebar_list = self.query_one("#sidebar-list", ListView)
         for i, child in enumerate(sidebar_list.children):
             if isinstance(child, DbItem) and child.item_name == self.current_item:
                 sidebar_list.index = i
                 break
-
         if self.current_item:
             self.load_item(self.current_item, self.current_type)
 
+    def action_filter_column(self):
+        if self.mode != "view":
+            self.notify("Filtering only allowed in View mode", severity="error")
+            return
+        if not isinstance(self.focused, DataTable) or not self.current_item:
+            return
+
+        coord = self.focused.cursor_coordinate
+        column_name = self.focused.ordered_columns[coord.column].key.value
+        current_filter = self.filters.get(column_name, "")
+
+        def apply_filter(val):
+            if val is not None:
+                if val == "":
+                    self.filters.pop(column_name, None)
+                else:
+                    self.filters[column_name] = val
+                self.load_item(self.current_item, self.current_type)
+
+        self.push_screen(FilterColumnScreen(column_name, current_filter), apply_filter)
+
+    def action_clear_filters(self):
+        self.filters = {}
+        if self.current_item:
+            self.load_item(self.current_item, self.current_type)
+        self.notify("All filters cleared")
+
     def action_delete_item(self):
-        # Determine item to delete
         sidebar_list = self.query_one("#sidebar-list", ListView)
         if self.focused and self.focused.id == "sidebar-list":
             if sidebar_list.highlighted_child and isinstance(sidebar_list.highlighted_child, DbItem):
@@ -591,14 +693,11 @@ class DbMan(App):
         if self.mode != "view":
             self.notify(f"Editing only allowed in View mode (current: {self.mode})", severity="error")
             return
-            
         if not isinstance(self.focused, DataTable) or not self.current_item:
             return
-            
         if self.current_type == "view":
             self.notify("Cannot edit Views directly", severity="error")
             return
-
         if not self.has_rowid:
             self.notify("Cannot edit tables without rowid (yet)", severity="error")
             return
@@ -610,7 +709,6 @@ class DbMan(App):
 
         def perform_update(new_value):
             if new_value is not None:
-                # Type inference
                 typed_value = new_value
                 if new_value.strip() == "":
                     typed_value = None
@@ -621,14 +719,13 @@ class DbMan(App):
                         else:
                             typed_value = int(new_value)
                     except ValueError:
-                        pass # Keep as string
+                        pass 
 
                 try:
                     query = f"UPDATE {self.current_item} SET {column_name} = ? WHERE rowid = ?"
                     self.cursor.execute(query, (typed_value, row_id))
                     self.conn.commit()
                     self.notify("Updated")
-                    # Reload item but preserve cursor
                     self.load_item(self.current_item, self.current_type)
                 except Exception as e:
                     self.notify(f"Update failed: {e}", severity="error")
@@ -639,18 +736,14 @@ class DbMan(App):
         if self.mode != "view":
             self.notify("Truncate only allowed in View mode", severity="error")
             return
-            
         if not isinstance(self.focused, DataTable) or not self.current_item:
             return
-
         if self.current_type == "view":
             self.notify("Cannot truncate Views directly", severity="error")
             return
 
         coord = self.focused.cursor_coordinate
         column_name = self.focused.ordered_columns[coord.column].key.value
-        
-        # Calculate max length of current column values
         try:
             self.cursor.execute(f"SELECT MAX(LENGTH({column_name})) FROM {self.current_item}")
             max_len = self.cursor.fetchone()[0] or 0
@@ -677,7 +770,6 @@ class DbMan(App):
                             self.load_item(self.current_item, self.current_type)
                         except Exception as e:
                             self.notify(f"Truncate failed: {e}", severity="error")
-                
                 self.push_screen(ConfirmScreen(f"Truncate ALL values in '{column_name}' to {target_len}?", "Apply"), do_it)
 
         self.push_screen(TruncateColumnScreen(self.current_item, column_name, max_len, suggested, self.conn), perform_truncate)
@@ -686,6 +778,5 @@ if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: dbman <database_file>")
         sys.exit(1)
-    
     app = DbMan(sys.argv[1])
     app.run()
