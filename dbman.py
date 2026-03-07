@@ -3,6 +3,7 @@ import sys
 import sqlite3
 import os
 import importlib.util
+import traceback
 from textual.app import App, ComposeResult
 from textual.widgets import Header, Footer, DataTable, ListView, ListItem, Label, Static, Button, Input, ContentSwitcher
 from textual.containers import Horizontal, Vertical, Center
@@ -12,6 +13,17 @@ from textual.reactive import reactive
 
 # Import LookupPlugin from plugins folder
 from plugins.lookup import LookupPlugin, LookupSelectScreen, LookupConfigScreen
+
+# Crash logging setup
+def handle_exception(exc_type, exc_value, exc_traceback):
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    with open("dbman_crash.log", "w") as f:
+        traceback.print_exception(exc_type, exc_value, exc_traceback, file=f)
+    sys.__excepthook__(exc_type, exc_value, exc_traceback)
+
+sys.excepthook = handle_exception
 
 COLORS = [
     "cyan", "magenta", "green", "yellow", "blue", "red", 
@@ -75,6 +87,63 @@ class ShortcutsScreen(ModalScreen):
     
     def key_ctrl_p(self) -> None:
         self.app.pop_screen()
+
+class FilterColumnScreen(ModalScreen):
+    """A modal screen for filtering a column."""
+    CSS = """
+    FilterColumnScreen {
+        background: rgba(0, 0, 0, 0.5);
+        align: center middle;
+    }
+    #filter-dialog {
+        background: $panel;
+        border: thick $primary;
+        padding: 1 2;
+        width: 50;
+        height: auto;
+    }
+    Label {
+        margin-bottom: 1;
+        text-style: bold;
+    }
+    Input {
+        margin-bottom: 1;
+    }
+    #filter-buttons {
+        align: right middle;
+    }
+    Button {
+        margin-left: 1;
+    }
+    """
+    def __init__(self, column, current_filter=""):
+        super().__init__()
+        self.column = column
+        self.current_filter = current_filter
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="filter-dialog"):
+            yield Label(f"Filter Column: {self.column}")
+            yield Static("Enter search term (use 'null' for NULL, 'empty' for empty string):", id="small-label")
+            yield Input(value=self.current_filter, id="filter-input", placeholder="Filter...")
+            with Horizontal(id="filter-buttons"):
+                yield Button("Cancel", id="cancel-filter")
+                yield Button("Clear", variant="warning", id="clear-filter")
+                yield Button("Apply", variant="success", id="apply-filter")
+
+    def on_mount(self):
+        self.query_one(Input).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "apply-filter":
+            self.dismiss(self.query_one(Input).value)
+        elif event.button.id == "clear-filter":
+            self.dismiss("")
+        else:
+            self.dismiss(None)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value)
 
 class ConfirmScreen(ModalScreen):
     """A modal screen for confirmation."""
@@ -213,7 +282,8 @@ class TruncateColumnScreen(ModalScreen):
         try:
             target_len = int(value)
             cursor = self.conn.cursor()
-            cursor.execute(f"SELECT COUNT(*) FROM {self.table} WHERE LENGTH({self.column}) > ?", (target_len,))
+            # Quote identifiers
+            cursor.execute(f'SELECT COUNT(*) FROM "{self.table}" WHERE LENGTH("{self.column}") > ?', (target_len,))
             count = cursor.fetchone()[0]
             self.query_one("#stats-label").update(f"Will affect [bold red]{count}[/] rows")
         except:
@@ -324,14 +394,13 @@ class DbMan(App):
         super().__init__()
         self.db_path = db_path
         self.current_item = None
-        self.current_type = None # "table", "view", "plugin"
+        self.current_type = None 
         self.has_rowid = False
-        self.mode = "view" # or "schema" or "sql"
+        self.mode = "view" 
         self.filters = {}
         try:
             self.conn = sqlite3.connect(db_path)
             self.cursor = self.conn.cursor()
-            # Initialize Lookup Plugin
             self.lookup_plugin = LookupPlugin(self.conn)
         except Exception as e:
             print(f"Error connecting to database: {e}")
@@ -348,16 +417,18 @@ class DbMan(App):
     def build_filter_clause(self):
         if not self.filters:
             return "", []
+        
         clauses = []
         params = []
         for col, val in self.filters.items():
             if val.lower() == "null":
-                clauses.append(f"{col} IS NULL")
+                clauses.append(f'"{col}" IS NULL')
             elif val.lower() == "empty":
-                clauses.append(f"({col} IS NULL OR {col} = '')")
+                clauses.append(f'("{col}" IS NULL OR "{col}" = \'\')')
             else:
-                clauses.append(f"{col} LIKE ?")
+                clauses.append(f'"{col}" LIKE ?')
                 params.append(f"%{val}%")
+        
         return " WHERE " + " AND ".join(clauses), params
 
     def get_item_data(self, name, item_type):
@@ -368,30 +439,30 @@ class DbMan(App):
                 return columns, rows, False
             return [], [], False
 
-        self.cursor.execute(f"PRAGMA table_info({name});")
+        self.cursor.execute(f'PRAGMA table_info("{name}");')
         info = self.cursor.fetchall()
         columns = [i[1] for i in info]
         filter_clause, params = self.build_filter_clause()
         
         if item_type == "table":
             try:
-                query = f"SELECT rowid, * FROM {name}{filter_clause} LIMIT 2000;"
+                query = f'SELECT rowid, * FROM "{name}"{filter_clause} LIMIT 2000;'
                 self.cursor.execute(query, params)
                 rows = self.cursor.fetchall()
                 return columns, rows, True
             except:
-                query = f"SELECT * FROM {name}{filter_clause} LIMIT 2000;"
+                query = f'SELECT * FROM "{name}"{filter_clause} LIMIT 2000;'
                 self.cursor.execute(query, params)
                 rows = self.cursor.fetchall()
                 return columns, rows, False
         else:
-            query = f"SELECT * FROM {name}{filter_clause} LIMIT 2000;"
+            query = f'SELECT * FROM "{name}"{filter_clause} LIMIT 2000;'
             self.cursor.execute(query, params)
             rows = self.cursor.fetchall()
             return columns, rows, False
 
     def get_schema_data(self, name):
-        self.cursor.execute(f"PRAGMA table_info({name});")
+        self.cursor.execute(f'PRAGMA table_info("{name}");')
         rows = self.cursor.fetchall()
         columns = ["cid", "name", "type", "notnull", "dflt_value", "pk"]
         return columns, rows
@@ -600,7 +671,7 @@ class DbMan(App):
             if do_delete:
                 try:
                     sql_type = "TABLE" if item_type == "table" else "VIEW"
-                    self.cursor.execute(f"DROP {sql_type} {name}")
+                    self.cursor.execute(f'DROP {sql_type} "{name}"')
                     self.conn.commit()
                     self.notify(f"{sql_type.capitalize()} '{name}' deleted")
                     self.refresh_sidebar()
@@ -649,21 +720,15 @@ class DbMan(App):
 
     def action_edit_cell(self):
         if self.current_type == "plugin" and self.current_item == "lookup":
-            # Handle Lookup Configuration
             coord = self.focused.cursor_coordinate
-            # row data: Table, FKField, RelatedTable, RelatedKey, LookupField
             row_vals = self.focused.get_row_at(coord.row)
             table, fk_col, rel_table, rel_key, current_lookup = row_vals
-            
-            # Fetch columns of related table
-            self.cursor.execute(f"PRAGMA table_info({rel_table})")
+            self.cursor.execute(f'PRAGMA table_info("{rel_table}")')
             cols = [r[1] for r in self.cursor.fetchall()]
-            
             def save_lookup(val):
                 if val:
                     self.lookup_plugin.save_config(table, fk_col, rel_table, rel_key, val)
                     self.load_item("lookup", "plugin")
-            
             self.push_screen(LookupConfigScreen(table, fk_col, rel_table, rel_key, cols), save_lookup)
             return
 
@@ -684,28 +749,23 @@ class DbMan(App):
         row_id = list(self.focused.rows.values())[coord.row].key.value
         current_value = self.focused.get_cell_at(coord)
 
-        # Check if Lookup Plugin should handle this column
         lookup_conf = self.lookup_plugin.get_lookup_config(self.current_item, column_name)
         if lookup_conf:
             rel_table, rel_key, display_col = lookup_conf
-            # Fetch options from related table
-            self.cursor.execute(f"SELECT {rel_key}, {display_col} FROM {rel_table}")
+            self.cursor.execute(f'SELECT "{rel_key}", "{display_col}" FROM "{rel_table}"')
             options = [(str(r[1]), r[0]) for r in self.cursor.fetchall()]
-            
             def perform_lookup_update(new_val):
                 if new_val is not None:
                     try:
-                        self.cursor.execute(f"UPDATE {self.current_item} SET {column_name} = ? WHERE rowid = ?", (new_val, row_id))
+                        self.cursor.execute(f'UPDATE "{self.current_item}" SET "{column_name}" = ? WHERE rowid = ?', (new_val, row_id))
                         self.conn.commit()
                         self.notify("Updated")
                         self.load_item(self.current_item, self.current_type)
                     except Exception as e:
                         self.notify(f"Update failed: {e}", severity="error")
-            
             self.push_screen(LookupSelectScreen(f"Select {column_name}", options, current_value), perform_lookup_update)
             return
 
-        # Default edit
         def perform_update(new_value):
             if new_value is not None:
                 typed_value = new_value
@@ -717,7 +777,7 @@ class DbMan(App):
                         else: typed_value = int(new_value)
                     except ValueError: pass 
                 try:
-                    query = f"UPDATE {self.current_item} SET {column_name} = ? WHERE rowid = ?"
+                    query = f'UPDATE "{self.current_item}" SET "{column_name}" = ? WHERE rowid = ?'
                     self.cursor.execute(query, (typed_value, row_id))
                     self.conn.commit()
                     self.notify("Updated")
@@ -738,7 +798,7 @@ class DbMan(App):
         coord = self.focused.cursor_coordinate
         column_name = self.focused.ordered_columns[coord.column].key.value
         try:
-            self.cursor.execute(f"SELECT MAX(LENGTH({column_name})) FROM {self.current_item}")
+            self.cursor.execute(f'SELECT MAX(LENGTH("{column_name}")) FROM "{self.current_item}"')
             max_len = self.cursor.fetchone()[0] or 0
             suggested = 50 if max_len > 50 else max_len
         except Exception as e:
@@ -754,7 +814,7 @@ class DbMan(App):
                 def do_it(confirm):
                     if confirm:
                         try:
-                            query = f"UPDATE {self.current_item} SET {column_name} = SUBSTR({column_name}, 1, ?)"
+                            query = f'UPDATE "{self.current_item}" SET "{column_name}" = SUBSTR("{column_name}", 1, ?)'
                             self.cursor.execute(query, (target_len,))
                             self.conn.commit()
                             self.notify(f"Truncated column to {target_len} chars")
