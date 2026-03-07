@@ -1,0 +1,14 @@
+#!/bin/bash
+# Wrapper to run dbman using the project's virtual environment
+
+# Resolve the physical path of the script, handling symlinks
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+
+# Run using the local virtual environment
+"$SCRIPT_DIR/venv/bin/python3" "$SCRIPT_DIR/dbman.py" "$@"
