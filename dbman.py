@@ -2,7 +2,7 @@
 import sys
 import sqlite3
 from textual.app import App, ComposeResult
-from textual.widgets import Header, Footer, DataTable, ListView, ListItem, Label, Static, Button, Input
+from textual.widgets import Header, Footer, DataTable, ListView, ListItem, Label, Static, Button, Input, ContentSwitcher
 from textual.containers import Horizontal, Vertical, Center
 from textual.binding import Binding
 from textual.screen import ModalScreen
@@ -41,8 +41,8 @@ class ShortcutsScreen(ModalScreen):
                 " [bold]Shortcuts[/]\n\n"
                 " [bold]General[/]\n"
                 " q: Quit\n"
-                " tab: Cycle focus (Sidebar Views -> Sidebar Tables -> Main Table)\n"
-                " m: Toggle View/Schema mode\n"
+                " tab: Cycle focus (Sidebar Views -> Sidebar Tables -> Main Area)\n"
+                " m: Toggle View/Schema/SQL mode\n"
                 " ?: Toggle this Shortcuts panel\n"
                 " ctrl+p: Toggle this Shortcuts panel\n\n"
                 " [bold]Navigation[/]\n"
@@ -262,6 +262,17 @@ class DbMan(App):
     DataTable:focus {
         border: double $accent;
     }
+    #sql-view {
+        height: 1fr;
+        padding: 1 2;
+        background: $surface;
+        color: $text;
+        overflow-x: scroll;
+        overflow-y: scroll;
+    }
+    #sql-view:focus {
+        border: double $accent;
+    }
     ListItem {
         padding: 0 1;
     }
@@ -286,7 +297,7 @@ class DbMan(App):
         Binding("g", "scroll_home", "Home", show=False),
         Binding("G", "scroll_end", "End", show=False),
         Binding("tab", "switch_focus", "Switch Focus"),
-        Binding("m", "toggle_mode", "View/Schema Mode"),
+        Binding("m", "toggle_mode", "View/Schema/SQL Mode"),
         Binding("ctrl+x", "delete_item", "Delete"),
         Binding("?", "toggle_shortcuts", "Shortcuts", show=False),
         Binding("ctrl+p", "toggle_shortcuts", "Shortcuts"),
@@ -300,7 +311,7 @@ class DbMan(App):
         self.current_item = None
         self.current_type = None # "table" or "view"
         self.has_rowid = False
-        self.mode = "view" # or "schema"
+        self.mode = "view" # or "schema" or "sql"
         try:
             self.conn = sqlite3.connect(db_path)
             self.cursor = self.conn.cursor()
@@ -345,6 +356,11 @@ class DbMan(App):
         columns = ["cid", "name", "type", "notnull", "dflt_value", "pk"]
         return columns, rows
 
+    def get_sql_data(self, name):
+        self.cursor.execute("SELECT sql FROM sqlite_master WHERE name = ?", (name,))
+        sql = self.cursor.fetchone()
+        return sql[0] if sql else "Not found"
+
     def compose(self) -> ComposeResult:
         yield Header()
         tables = self.get_tables()
@@ -355,8 +371,9 @@ class DbMan(App):
                 yield ListView(*[DbItem(v, "view") for v in views], id="view-list")
                 yield Static(" TABLES ", classes="sidebar-section-title", id="table-title")
                 yield ListView(*[DbItem(t, "table") for t in tables], id="table-list")
-            with Vertical():
+            with ContentSwitcher(initial="data-table"):
                 yield DataTable(id="data-table")
+                yield Static("", id="sql-view")
         yield Footer()
 
     def on_mount(self):
@@ -387,51 +404,72 @@ class DbMan(App):
         self.current_item = name
         self.current_type = item_type
         table_widget = self.query_one("#data-table", DataTable)
-        table_widget.clear(columns=True)
+        sql_widget = self.query_one("#sql-view", Static)
+        switcher = self.query_one(ContentSwitcher)
         
-        if self.mode == "view":
-            columns, rows, has_rowid = self.get_item_data(name, item_type)
-            self.has_rowid = has_rowid
+        if self.mode in ["view", "schema"]:
+            switcher.current = "data-table"
+            table_widget.clear(columns=True)
             
-            for i, col in enumerate(columns):
-                color = COLORS[i % len(COLORS)]
-                table_widget.add_column(f"[{color}]{col}[/]", key=col)
-            
-            for row in rows:
-                if has_rowid:
-                    # Use rowid as the row key (row[0])
-                    table_widget.add_row(*row[1:], key=str(row[0]))
-                else:
-                    table_widget.add_row(*row)
+            if self.mode == "view":
+                columns, rows, has_rowid = self.get_item_data(name, item_type)
+                self.has_rowid = has_rowid
+                
+                for i, col in enumerate(columns):
+                    color = COLORS[i % len(COLORS)]
+                    table_widget.add_column(f"[{color}]{col}[/]", key=col)
+                
+                for row in rows:
+                    if has_rowid:
+                        table_widget.add_row(*row[1:], key=str(row[0]))
+                    else:
+                        table_widget.add_row(*row)
+            else:
+                # Schema mode
+                columns, rows = self.get_schema_data(name)
+                for i, col in enumerate(columns):
+                    color = COLORS[i % len(COLORS)]
+                    table_widget.add_column(f"[{color}]{col}[/]", key=col)
+                table_widget.add_rows(rows)
+                
+            if should_focus:
+                table_widget.focus()
+            if saved_coord:
+                try:
+                    table_widget.move_cursor(row=saved_coord.row, column=saved_coord.column)
+                except:
+                    pass
         else:
-            # Schema mode
-            columns, rows = self.get_schema_data(name)
-            for i, col in enumerate(columns):
-                color = COLORS[i % len(COLORS)]
-                table_widget.add_column(f"[{color}]{col}[/]", key=col)
-            table_widget.add_rows(rows)
+            # SQL mode
+            switcher.current = "sql-view"
+            sql_text = self.get_sql_data(name)
+            sql_widget.update(sql_text)
+            if should_focus:
+                sql_widget.focus()
                 
-        if should_focus:
-            table_widget.focus()
-            
-        if saved_coord:
-            try:
-                table_widget.move_cursor(row=saved_coord.row, column=saved_coord.column)
-            except:
-                pass
-                
-        self.title = f"dbman - {name} ({self.mode})"
+        self.title = f"dbman - {name} ({self.mode.upper()})"
 
     def action_switch_focus(self):
         if self.focused.id == "view-list":
             self.query_one("#table-list").focus()
         elif self.focused.id == "table-list":
-            self.query_one("#data-table").focus()
+            switcher = self.query_one(ContentSwitcher)
+            if switcher.current == "data-table":
+                self.query_one("#data-table").focus()
+            else:
+                self.query_one("#sql-view").focus()
         else:
             self.query_one("#view-list").focus()
 
     def action_toggle_mode(self):
-        self.mode = "schema" if self.mode == "view" else "view"
+        modes = ["view", "schema", "sql"]
+        idx = modes.index(self.mode)
+        self.mode = modes[(idx + 1) % len(modes)]
+        
+        # Update sidebar titles to show current mode
+        self.query_one("#view-title").update(f" VIEWS ({self.mode.upper()}) ")
+        self.query_one("#table-title").update(f" TABLES ({self.mode.upper()}) ")
+        
         if self.current_item:
             self.load_item(self.current_item, self.current_type)
 
@@ -527,7 +565,7 @@ class DbMan(App):
 
     def action_edit_cell(self):
         if self.mode != "view":
-            self.notify("Editing only allowed in View mode", severity="error")
+            self.notify(f"Editing only allowed in View mode (current: {self.mode})", severity="error")
             return
             
         if not isinstance(self.focused, DataTable) or not self.current_item:
