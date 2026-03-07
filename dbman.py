@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 import sys
 import sqlite3
+import os
+import importlib.util
 from textual.app import App, ComposeResult
 from textual.widgets import Header, Footer, DataTable, ListView, ListItem, Label, Static, Button, Input, ContentSwitcher
 from textual.containers import Horizontal, Vertical, Center
 from textual.binding import Binding
 from textual.screen import ModalScreen
 from textual.reactive import reactive
+
+# Import LookupPlugin from plugins folder
+from plugins.lookup import LookupPlugin, LookupSelectScreen, LookupConfigScreen
 
 COLORS = [
     "cyan", "magenta", "green", "yellow", "blue", "red", 
@@ -70,63 +75,6 @@ class ShortcutsScreen(ModalScreen):
     
     def key_ctrl_p(self) -> None:
         self.app.pop_screen()
-
-class FilterColumnScreen(ModalScreen):
-    """A modal screen for filtering a column."""
-    CSS = """
-    FilterColumnScreen {
-        background: rgba(0, 0, 0, 0.5);
-        align: center middle;
-    }
-    #filter-dialog {
-        background: $panel;
-        border: thick $primary;
-        padding: 1 2;
-        width: 50;
-        height: auto;
-    }
-    Label {
-        margin-bottom: 1;
-        text-style: bold;
-    }
-    Input {
-        margin-bottom: 1;
-    }
-    #filter-buttons {
-        align: right middle;
-    }
-    Button {
-        margin-left: 1;
-    }
-    """
-    def __init__(self, column, current_filter=""):
-        super().__init__()
-        self.column = column
-        self.current_filter = current_filter
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="filter-dialog"):
-            yield Label(f"Filter Column: {self.column}")
-            yield Static("Enter search term (use 'null' for NULL, 'empty' for empty string):", id="small-label")
-            yield Input(value=self.current_filter, id="filter-input", placeholder="Filter...")
-            with Horizontal(id="filter-buttons"):
-                yield Button("Cancel", id="cancel-filter")
-                yield Button("Clear", variant="warning", id="clear-filter")
-                yield Button("Apply", variant="success", id="apply-filter")
-
-    def on_mount(self):
-        self.query_one(Input).focus()
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "apply-filter":
-            self.dismiss(self.query_one(Input).value)
-        elif event.button.id == "clear-filter":
-            self.dismiss("")
-        else:
-            self.dismiss(None)
-
-    def on_input_submitted(self, event: Input.Submitted) -> None:
-        self.dismiss(event.value)
 
 class ConfirmScreen(ModalScreen):
     """A modal screen for confirmation."""
@@ -284,13 +232,13 @@ class DbItem(ListItem):
     def __init__(self, name: str, item_type: str) -> None:
         super().__init__(Label(f" {name} "))
         self.item_name = name
-        self.item_type = item_type # "table" or "view"
+        self.item_type = item_type # "table", "view", "plugin"
 
 class SidebarHeader(ListItem):
     def __init__(self, title: str) -> None:
         super().__init__(Label(f" {title} "))
         self.title = title
-        self.disabled = True # Headers are not selectable
+        self.disabled = True 
 
 class DbMan(App):
     """A vim-like SQLite database browser with Sidebar navigation."""
@@ -376,19 +324,21 @@ class DbMan(App):
         super().__init__()
         self.db_path = db_path
         self.current_item = None
-        self.current_type = None # "table" or "view"
+        self.current_type = None # "table", "view", "plugin"
         self.has_rowid = False
         self.mode = "view" # or "schema" or "sql"
-        self.filters = {} # {column_name: filter_string}
+        self.filters = {}
         try:
             self.conn = sqlite3.connect(db_path)
             self.cursor = self.conn.cursor()
+            # Initialize Lookup Plugin
+            self.lookup_plugin = LookupPlugin(self.conn)
         except Exception as e:
             print(f"Error connecting to database: {e}")
             sys.exit(1)
 
     def get_tables(self):
-        self.cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';")
+        self.cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_dbman_%';")
         return [row[0] for row in self.cursor.fetchall()]
 
     def get_views(self):
@@ -398,7 +348,6 @@ class DbMan(App):
     def build_filter_clause(self):
         if not self.filters:
             return "", []
-        
         clauses = []
         params = []
         for col, val in self.filters.items():
@@ -409,14 +358,19 @@ class DbMan(App):
             else:
                 clauses.append(f"{col} LIKE ?")
                 params.append(f"%{val}%")
-        
         return " WHERE " + " AND ".join(clauses), params
 
     def get_item_data(self, name, item_type):
+        if item_type == "plugin":
+            if name == "lookup":
+                columns = ["Table", "ForeignKeyField", "RelatedTable", "RelatedKey", "LookupField"]
+                rows = self.lookup_plugin.get_config_data()
+                return columns, rows, False
+            return [], [], False
+
         self.cursor.execute(f"PRAGMA table_info({name});")
         info = self.cursor.fetchall()
         columns = [i[1] for i in info]
-        
         filter_clause, params = self.build_filter_clause()
         
         if item_type == "table":
@@ -467,6 +421,7 @@ class DbMan(App):
         
         views = self.get_views()
         tables = self.get_tables()
+        plugins = ["lookup"]
         
         mode_suffix = f" ({self.mode.upper()})"
         
@@ -477,8 +432,11 @@ class DbMan(App):
         sidebar_list.append(SidebarHeader(f"TABLES{mode_suffix}"))
         for t in tables:
             sidebar_list.append(DbItem(t, "table"))
+
+        sidebar_list.append(SidebarHeader(f"PLUGINS"))
+        for p in plugins:
+            sidebar_list.append(DbItem(p, "plugin"))
             
-        # Initial load if something exists and nothing is loaded
         if not self.current_item:
             if views:
                 self.load_item(views[0], "view")
@@ -488,17 +446,16 @@ class DbMan(App):
     def on_list_view_selected(self, event: ListView.Selected):
         item = event.item
         if isinstance(item, DbItem):
-            self.filters = {} # Clear filters when switching items
+            self.filters = {}
             self.load_item(item.item_name, item.item_type, should_focus=True)
 
     def on_list_view_highlighted(self, event: ListView.Highlighted):
         item = event.item
         if isinstance(item, DbItem):
-            self.filters = {} # Clear filters when switching items
+            self.filters = {}
             self.load_item(item.item_name, item.item_type, should_focus=False)
 
     def load_item(self, name, item_type, should_focus=False):
-        # Save current cursor position if we are reloading the same item
         saved_coord = None
         if self.current_item == name:
             try:
@@ -512,11 +469,11 @@ class DbMan(App):
         sql_widget = self.query_one("#sql-view", Static)
         switcher = self.query_one(ContentSwitcher)
         
-        if self.mode in ["view", "schema"]:
+        if self.mode in ["view", "schema"] or item_type == "plugin":
             switcher.current = "data-table"
             table_widget.clear(columns=True)
             
-            if self.mode == "view":
+            if self.mode == "view" or item_type == "plugin":
                 columns, rows, has_rowid = self.get_item_data(name, item_type)
                 self.has_rowid = has_rowid
                 
@@ -527,11 +484,11 @@ class DbMan(App):
                         label = f"[reverse]{label} (F)[/]"
                     table_widget.add_column(label, key=col)
                 
-                for row in rows:
+                for i, row in enumerate(rows):
                     if has_rowid:
                         table_widget.add_row(*row[1:], key=str(row[0]))
                     else:
-                        table_widget.add_row(*row)
+                        table_widget.add_row(*row, key=str(i))
             else:
                 # Schema mode
                 columns, rows = self.get_schema_data(name)
@@ -573,16 +530,19 @@ class DbMan(App):
         found = False
         for i in range(current_idx + 1, len(sidebar_list.children)):
             if isinstance(sidebar_list.children[i], SidebarHeader):
-                sidebar_list.index = i + 1
+                sidebar_list.index = min(i + 1, len(sidebar_list.children)-1)
                 found = True
                 break
         if not found:
             for i in range(len(sidebar_list.children)):
                 if isinstance(sidebar_list.children[i], SidebarHeader):
-                    sidebar_list.index = i + 1
+                    sidebar_list.index = min(i + 1, len(sidebar_list.children)-1)
                     break
 
     def action_toggle_mode(self):
+        if self.current_type == "plugin":
+            self.notify("Plugins only have View mode", severity="error")
+            return
         modes = ["view", "schema", "sql"]
         idx = modes.index(self.mode)
         self.mode = modes[(idx + 1) % len(modes)]
@@ -601,11 +561,9 @@ class DbMan(App):
             return
         if not isinstance(self.focused, DataTable) or not self.current_item:
             return
-
         coord = self.focused.cursor_coordinate
         column_name = self.focused.ordered_columns[coord.column].key.value
         current_filter = self.filters.get(column_name, "")
-
         def apply_filter(val):
             if val is not None:
                 if val == "":
@@ -613,7 +571,6 @@ class DbMan(App):
                 else:
                     self.filters[column_name] = val
                 self.load_item(self.current_item, self.current_type)
-
         self.push_screen(FilterColumnScreen(column_name, current_filter), apply_filter)
 
     def action_clear_filters(self):
@@ -623,6 +580,9 @@ class DbMan(App):
         self.notify("All filters cleared")
 
     def action_delete_item(self):
+        if self.current_type == "plugin":
+            self.notify("Cannot delete Plugins", severity="error")
+            return
         sidebar_list = self.query_one("#sidebar-list", ListView)
         if self.focused and self.focused.id == "sidebar-list":
             if sidebar_list.highlighted_child and isinstance(sidebar_list.highlighted_child, DbItem):
@@ -636,7 +596,6 @@ class DbMan(App):
             item_type = self.current_type
         else:
             return
-
         def on_confirm(do_delete):
             if do_delete:
                 try:
@@ -647,7 +606,6 @@ class DbMan(App):
                     self.refresh_sidebar()
                 except Exception as e:
                     self.notify(f"Delete failed: {e}", severity="error")
-
         msg = f"Delete {item_type} '{name}'?"
         self.push_screen(ConfirmScreen(msg, "Delete"), on_confirm)
 
@@ -690,8 +648,27 @@ class DbMan(App):
             self.push_screen(ShortcutsScreen())
 
     def action_edit_cell(self):
+        if self.current_type == "plugin" and self.current_item == "lookup":
+            # Handle Lookup Configuration
+            coord = self.focused.cursor_coordinate
+            # row data: Table, FKField, RelatedTable, RelatedKey, LookupField
+            row_vals = self.focused.get_row_at(coord.row)
+            table, fk_col, rel_table, rel_key, current_lookup = row_vals
+            
+            # Fetch columns of related table
+            self.cursor.execute(f"PRAGMA table_info({rel_table})")
+            cols = [r[1] for r in self.cursor.fetchall()]
+            
+            def save_lookup(val):
+                if val:
+                    self.lookup_plugin.save_config(table, fk_col, rel_table, rel_key, val)
+                    self.load_item("lookup", "plugin")
+            
+            self.push_screen(LookupConfigScreen(table, fk_col, rel_table, rel_key, cols), save_lookup)
+            return
+
         if self.mode != "view":
-            self.notify(f"Editing only allowed in View mode (current: {self.mode})", severity="error")
+            self.notify(f"Editing only allowed in View mode", severity="error")
             return
         if not isinstance(self.focused, DataTable) or not self.current_item:
             return
@@ -707,6 +684,28 @@ class DbMan(App):
         row_id = list(self.focused.rows.values())[coord.row].key.value
         current_value = self.focused.get_cell_at(coord)
 
+        # Check if Lookup Plugin should handle this column
+        lookup_conf = self.lookup_plugin.get_lookup_config(self.current_item, column_name)
+        if lookup_conf:
+            rel_table, rel_key, display_col = lookup_conf
+            # Fetch options from related table
+            self.cursor.execute(f"SELECT {rel_key}, {display_col} FROM {rel_table}")
+            options = [(str(r[1]), r[0]) for r in self.cursor.fetchall()]
+            
+            def perform_lookup_update(new_val):
+                if new_val is not None:
+                    try:
+                        self.cursor.execute(f"UPDATE {self.current_item} SET {column_name} = ? WHERE rowid = ?", (new_val, row_id))
+                        self.conn.commit()
+                        self.notify("Updated")
+                        self.load_item(self.current_item, self.current_type)
+                    except Exception as e:
+                        self.notify(f"Update failed: {e}", severity="error")
+            
+            self.push_screen(LookupSelectScreen(f"Select {column_name}", options, current_value), perform_lookup_update)
+            return
+
+        # Default edit
         def perform_update(new_value):
             if new_value is not None:
                 typed_value = new_value
@@ -714,13 +713,9 @@ class DbMan(App):
                     typed_value = None
                 else:
                     try:
-                        if "." in new_value:
-                            typed_value = float(new_value)
-                        else:
-                            typed_value = int(new_value)
-                    except ValueError:
-                        pass 
-
+                        if "." in new_value: typed_value = float(new_value)
+                        else: typed_value = int(new_value)
+                    except ValueError: pass 
                 try:
                     query = f"UPDATE {self.current_item} SET {column_name} = ? WHERE rowid = ?"
                     self.cursor.execute(query, (typed_value, row_id))
@@ -729,7 +724,6 @@ class DbMan(App):
                     self.load_item(self.current_item, self.current_type)
                 except Exception as e:
                     self.notify(f"Update failed: {e}", severity="error")
-
         self.push_screen(EditCellScreen(current_value), perform_update)
 
     def action_truncate_column(self):
@@ -741,7 +735,6 @@ class DbMan(App):
         if self.current_type == "view":
             self.notify("Cannot truncate Views directly", severity="error")
             return
-
         coord = self.focused.cursor_coordinate
         column_name = self.focused.ordered_columns[coord.column].key.value
         try:
@@ -751,7 +744,6 @@ class DbMan(App):
         except Exception as e:
             self.notify(f"Error checking column: {e}", severity="error")
             return
-
         def perform_truncate(target_len_str):
             if target_len_str is not None:
                 try:
@@ -759,7 +751,6 @@ class DbMan(App):
                 except ValueError:
                     self.notify("Invalid length", severity="error")
                     return
-
                 def do_it(confirm):
                     if confirm:
                         try:
@@ -771,7 +762,6 @@ class DbMan(App):
                         except Exception as e:
                             self.notify(f"Truncate failed: {e}", severity="error")
                 self.push_screen(ConfirmScreen(f"Truncate ALL values in '{column_name}' to {target_len}?", "Apply"), do_it)
-
         self.push_screen(TruncateColumnScreen(self.current_item, column_name, max_len, suggested, self.conn), perform_truncate)
 
 if __name__ == "__main__":
