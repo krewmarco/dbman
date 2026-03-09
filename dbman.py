@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 import sys
-import sqlite3
 import os
-import importlib.util
 import traceback
+from sqlalchemy import create_engine, inspect, text, MetaData, Table, Column, String, Integer, select, update, delete, func
+from sqlalchemy.exc import SQLAlchemyError
 from textual.app import App, ComposeResult
 from textual.widgets import Header, Footer, DataTable, ListView, ListItem, Label, Static, Button, Input, ContentSwitcher
 from textual.containers import Horizontal, Vertical, Center
@@ -253,13 +253,13 @@ class TruncateColumnScreen(ModalScreen):
     
     affected_count = reactive(0)
 
-    def __init__(self, table, column, current_max, suggested_len, conn):
+    def __init__(self, table_name, column, current_max, suggested_len, engine):
         super().__init__()
-        self.table = table
+        self.table_name = table_name
         self.column = column
         self.current_max = current_max
         self.suggested_len = suggested_len
-        self.conn = conn
+        self.engine = engine
 
     def compose(self) -> ComposeResult:
         with Vertical(id="truncate-dialog"):
@@ -281,11 +281,13 @@ class TruncateColumnScreen(ModalScreen):
     def update_stats(self, value):
         try:
             target_len = int(value)
-            cursor = self.conn.cursor()
-            # Quote identifiers
-            cursor.execute(f'SELECT COUNT(*) FROM "{self.table}" WHERE LENGTH("{self.column}") > ?', (target_len,))
-            count = cursor.fetchone()[0]
-            self.query_one("#stats-label").update(f"Will affect [bold red]{count}[/] rows")
+            with self.engine.connect() as conn:
+                metadata = MetaData()
+                table = Table(self.table_name, metadata, autoload_with=self.engine)
+                col = table.c[self.column]
+                stmt = select(func.count()).where(func.length(col) > target_len)
+                count = conn.execute(stmt).scalar()
+                self.query_one("#stats-label").update(f"Will affect [bold red]{count}[/] rows")
         except:
             self.query_one("#stats-label").update("Invalid length")
 
@@ -311,7 +313,7 @@ class SidebarHeader(ListItem):
         self.disabled = True 
 
 class DbMan(App):
-    """A vim-like SQLite database browser with Sidebar navigation."""
+    """A vim-like database browser powered by SQLAlchemy."""
 
     TITLE = "dbman"
     CSS = """
@@ -390,46 +392,44 @@ class DbMan(App):
         Binding("t", "truncate_column", "Shorten Column"),
     ]
 
-    def __init__(self, db_path):
+    def __init__(self, db_url):
         super().__init__()
-        self.db_path = db_path
+        # If db_url is a file path, assume sqlite
+        if not (db_url.startswith("sqlite://") or db_url.startswith("postgresql://") or db_url.startswith("mysql://")):
+             db_url = f"sqlite:///{os.path.abspath(db_url)}"
+        
+        self.db_url = db_url
         self.current_item = None
         self.current_type = None 
         self.has_rowid = False
         self.mode = "view" 
         self.filters = {}
         try:
-            self.conn = sqlite3.connect(db_path)
-            self.cursor = self.conn.cursor()
-            self.lookup_plugin = LookupPlugin(self.conn)
+            self.engine = create_engine(db_url)
+            self.inspector = inspect(self.engine)
+            self.lookup_plugin = LookupPlugin(self.engine)
         except Exception as e:
             print(f"Error connecting to database: {e}")
             sys.exit(1)
 
     def get_tables(self):
-        self.cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_dbman_%';")
-        return [row[0] for row in self.cursor.fetchall()]
+        tables = self.inspector.get_table_names()
+        return [t for t in tables if not t.startswith("sqlite_") and not t.startswith("_dbman_")]
 
     def get_views(self):
-        self.cursor.execute("SELECT name FROM sqlite_master WHERE type='view' AND name NOT LIKE 'sqlite_%';")
-        return [row[0] for row in self.cursor.fetchall()]
+        return self.inspector.get_view_names()
 
-    def build_filter_clause(self):
-        if not self.filters:
-            return "", []
-        
+    def build_filter_clause(self, table_obj):
         clauses = []
-        params = []
-        for col, val in self.filters.items():
+        for col_name, val in self.filters.items():
+            col = table_obj.c[col_name]
             if val.lower() == "null":
-                clauses.append(f'"{col}" IS NULL')
+                clauses.append(col.is_(None))
             elif val.lower() == "empty":
-                clauses.append(f'("{col}" IS NULL OR "{col}" = \'\')')
+                clauses.append((col.is_(None)) | (col == ""))
             else:
-                clauses.append(f'"{col}" LIKE ?')
-                params.append(f"%{val}%")
-        
-        return " WHERE " + " AND ".join(clauses), params
+                clauses.append(col.like(f"%{val}%"))
+        return clauses
 
     def get_item_data(self, name, item_type):
         if item_type == "plugin":
@@ -439,38 +439,70 @@ class DbMan(App):
                 return columns, rows, False
             return [], [], False
 
-        self.cursor.execute(f'PRAGMA table_info("{name}");')
-        info = self.cursor.fetchall()
-        columns = [i[1] for i in info]
-        filter_clause, params = self.build_filter_clause()
+        metadata = MetaData()
+        table = Table(name, metadata, autoload_with=self.engine)
+        columns = [c.name for c in table.columns]
         
-        if item_type == "table":
-            try:
-                query = f'SELECT rowid, * FROM "{name}"{filter_clause} LIMIT 2000;'
-                self.cursor.execute(query, params)
-                rows = self.cursor.fetchall()
-                return columns, rows, True
-            except:
-                query = f'SELECT * FROM "{name}"{filter_clause} LIMIT 2000;'
-                self.cursor.execute(query, params)
-                rows = self.cursor.fetchall()
-                return columns, rows, False
-        else:
-            query = f'SELECT * FROM "{name}"{filter_clause} LIMIT 2000;'
-            self.cursor.execute(query, params)
-            rows = self.cursor.fetchall()
-            return columns, rows, False
+        has_rowid = False
+        if self.engine.dialect.name == "sqlite":
+             # Rowid check is tricky with SQLAlchemy Core for reflected tables
+             # We'll just try to select it if it's a table
+             if item_type == "table":
+                 has_rowid = True # Default to true for sqlite tables, handled in try/except later
+
+        with self.engine.connect() as conn:
+            stmt = select(table)
+            filter_clauses = self.build_filter_clause(table)
+            if filter_clauses:
+                stmt = stmt.where(*filter_clauses)
+            
+            stmt = stmt.limit(2000)
+            
+            if item_type == "table" and self.engine.dialect.name == "sqlite":
+                try:
+                    # Try to select rowid explicitly for sqlite
+                    rowid_stmt = select(text("rowid"), table).limit(2000)
+                    if filter_clauses:
+                         rowid_stmt = select(text("rowid"), table).where(*filter_clauses).limit(2000)
+                    
+                    result = conn.execute(rowid_stmt)
+                    rows = [list(row) for row in result]
+                    return columns, rows, True
+                except:
+                    has_rowid = False
+
+            result = conn.execute(stmt)
+            rows = [list(row) for row in result]
+            return columns, rows, has_rowid
 
     def get_schema_data(self, name):
-        self.cursor.execute(f'PRAGMA table_info("{name}");')
-        rows = self.cursor.fetchall()
-        columns = ["cid", "name", "type", "notnull", "dflt_value", "pk"]
+        columns_info = self.inspector.get_columns(name)
+        rows = []
+        for col in columns_info:
+            rows.append((
+                col.get("name"),
+                str(col.get("type")),
+                "NOT NULL" if not col.get("nullable") else "NULL",
+                str(col.get("default")) if col.get("default") is not None else "",
+                "PK" if col.get("primary_key") else ""
+            ))
+        columns = ["name", "type", "nullable", "default", "pk"]
         return columns, rows
 
     def get_sql_data(self, name):
-        self.cursor.execute("SELECT sql FROM sqlite_master WHERE name = ?", (name,))
-        sql = self.cursor.fetchone()
-        return sql[0] if sql else "Not found"
+        # SQLAlchemy doesn't provide a cross-db "get CREATE SQL" easily
+        # For SQLite/Postgres/MySQL we might have to use dialect specific queries
+        try:
+            if self.engine.dialect.name == "sqlite":
+                with self.engine.connect() as conn:
+                    res = conn.execute(text("SELECT sql FROM sqlite_master WHERE name = :name"), {"name": name}).fetchone()
+                    return res[0] if res else "Not found"
+            elif self.engine.dialect.name == "postgresql":
+                # Very basic view/table definition fetch
+                return f"-- SQL View/Table definition for {name} (Postgres support limited)"
+            return f"-- SQL View/Table definition for {name}"
+        except Exception as e:
+            return f"Error fetching SQL: {e}"
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -670,10 +702,10 @@ class DbMan(App):
         def on_confirm(do_delete):
             if do_delete:
                 try:
-                    sql_type = "TABLE" if item_type == "table" else "VIEW"
-                    self.cursor.execute(f'DROP {sql_type} "{name}"')
-                    self.conn.commit()
-                    self.notify(f"{sql_type.capitalize()} '{name}' deleted")
+                    metadata = MetaData()
+                    table = Table(name, metadata, autoload_with=self.engine)
+                    table.drop(self.engine)
+                    self.notify(f"{item_type.capitalize()} '{name}' deleted")
                     self.refresh_sidebar()
                 except Exception as e:
                     self.notify(f"Delete failed: {e}", severity="error")
@@ -723,8 +755,8 @@ class DbMan(App):
             coord = self.focused.cursor_coordinate
             row_vals = self.focused.get_row_at(coord.row)
             table, fk_col, rel_table, rel_key, current_lookup = row_vals
-            self.cursor.execute(f'PRAGMA table_info("{rel_table}")')
-            cols = [r[1] for r in self.cursor.fetchall()]
+            
+            cols = [c["name"] for c in self.inspector.get_columns(rel_table)]
             def save_lookup(val):
                 if val:
                     self.lookup_plugin.save_config(table, fk_col, rel_table, rel_key, val)
@@ -741,7 +773,7 @@ class DbMan(App):
             self.notify("Cannot edit Views directly", severity="error")
             return
         if not self.has_rowid:
-            self.notify("Cannot edit tables without rowid (yet)", severity="error")
+            self.notify("Cannot edit tables without identifiable rows (yet)", severity="error")
             return
 
         coord = self.focused.cursor_coordinate
@@ -752,13 +784,26 @@ class DbMan(App):
         lookup_conf = self.lookup_plugin.get_lookup_config(self.current_item, column_name)
         if lookup_conf:
             rel_table, rel_key, display_col = lookup_conf
-            self.cursor.execute(f'SELECT "{rel_key}", "{display_col}" FROM "{rel_table}"')
-            options = [(str(r[1]), r[0]) for r in self.cursor.fetchall()]
+            
+            with self.engine.connect() as conn:
+                metadata = MetaData()
+                rt = Table(rel_table, metadata, autoload_with=self.engine)
+                res = conn.execute(select(rt.c[rel_key], rt.c[display_col]))
+                options = [(str(r[1]), r[0]) for r in res]
+            
             def perform_lookup_update(new_val):
                 if new_val is not None:
                     try:
-                        self.cursor.execute(f'UPDATE "{self.current_item}" SET "{column_name}" = ? WHERE rowid = ?', (new_val, row_id))
-                        self.conn.commit()
+                        with self.engine.connect() as conn:
+                             metadata = MetaData()
+                             t = Table(self.current_item, metadata, autoload_with=self.engine)
+                             if self.engine.dialect.name == "sqlite":
+                                 stmt = update(t).where(text("rowid = :rid")).values({column_name: new_val})
+                                 conn.execute(stmt, {"rid": row_id})
+                             else:
+                                 # Fallback for non-sqlite would need PK logic
+                                 pass
+                             conn.commit()
                         self.notify("Updated")
                         self.load_item(self.current_item, self.current_type)
                     except Exception as e:
@@ -777,9 +822,16 @@ class DbMan(App):
                         else: typed_value = int(new_value)
                     except ValueError: pass 
                 try:
-                    query = f'UPDATE "{self.current_item}" SET "{column_name}" = ? WHERE rowid = ?'
-                    self.cursor.execute(query, (typed_value, row_id))
-                    self.conn.commit()
+                    with self.engine.connect() as conn:
+                         metadata = MetaData()
+                         t = Table(self.current_item, metadata, autoload_with=self.engine)
+                         if self.engine.dialect.name == "sqlite":
+                             stmt = update(t).where(text("rowid = :rid")).values({column_name: typed_value})
+                             conn.execute(stmt, {"rid": row_id})
+                         else:
+                             # PK logic needed for non-sqlite
+                             pass
+                         conn.commit()
                     self.notify("Updated")
                     self.load_item(self.current_item, self.current_type)
                 except Exception as e:
@@ -797,13 +849,18 @@ class DbMan(App):
             return
         coord = self.focused.cursor_coordinate
         column_name = self.focused.ordered_columns[coord.column].key.value
+        
         try:
-            self.cursor.execute(f'SELECT MAX(LENGTH("{column_name}")) FROM "{self.current_item}"')
-            max_len = self.cursor.fetchone()[0] or 0
-            suggested = 50 if max_len > 50 else max_len
+            with self.engine.connect() as conn:
+                metadata = MetaData()
+                t = Table(self.current_item, metadata, autoload_with=self.engine)
+                col = t.c[column_name]
+                max_len = conn.execute(select(func.max(func.length(col)))).scalar() or 0
+                suggested = 50 if max_len > 50 else max_len
         except Exception as e:
             self.notify(f"Error checking column: {e}", severity="error")
             return
+            
         def perform_truncate(target_len_str):
             if target_len_str is not None:
                 try:
@@ -814,19 +871,24 @@ class DbMan(App):
                 def do_it(confirm):
                     if confirm:
                         try:
-                            query = f'UPDATE "{self.current_item}" SET "{column_name}" = SUBSTR("{column_name}", 1, ?)'
-                            self.cursor.execute(query, (target_len,))
-                            self.conn.commit()
+                            with self.engine.connect() as conn:
+                                metadata = MetaData()
+                                t = Table(self.current_item, metadata, autoload_with=self.engine)
+                                col = t.c[column_name]
+                                # SQLite specific substr for now, but SQLAlchemy can abstract it
+                                stmt = update(t).values({column_name: func.substr(col, 1, target_len)})
+                                conn.execute(stmt)
+                                conn.commit()
                             self.notify(f"Truncated column to {target_len} chars")
                             self.load_item(self.current_item, self.current_type)
                         except Exception as e:
                             self.notify(f"Truncate failed: {e}", severity="error")
                 self.push_screen(ConfirmScreen(f"Truncate ALL values in '{column_name}' to {target_len}?", "Apply"), do_it)
-        self.push_screen(TruncateColumnScreen(self.current_item, column_name, max_len, suggested, self.conn), perform_truncate)
+        self.push_screen(TruncateColumnScreen(self.current_item, column_name, max_len, suggested, self.engine), perform_truncate)
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: dbman <database_file>")
+        print("Usage: dbman <database_url_or_file>")
         sys.exit(1)
     app = DbMan(sys.argv[1])
     app.run()

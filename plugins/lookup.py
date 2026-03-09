@@ -1,53 +1,58 @@
-import sqlite3
+import os
+from sqlalchemy import create_engine, inspect, text, MetaData, Table, Column, String, select, insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from textual.app import ComposeResult
 from textual.widgets import DataTable, Select, Label, Button, Static
 from textual.containers import Vertical, Horizontal
 from textual.screen import ModalScreen
 
 class LookupPlugin:
-    def __init__(self, db_conn):
-        self.conn = db_conn
+    def __init__(self, engine):
+        self.engine = engine
+        self.inspector = inspect(self.engine)
         self.ensure_config_table()
 
     def ensure_config_table(self):
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS _dbman_lookup_config (
-                table_name TEXT,
-                column_name TEXT,
-                related_table TEXT,
-                related_key TEXT,
-                display_column TEXT,
-                PRIMARY KEY (table_name, column_name)
-            )
-        """)
-        self.conn.commit()
+        metadata = MetaData()
+        table = Table(
+            '_dbman_lookup_config', metadata,
+            Column('table_name', String, primary_key=True),
+            Column('column_name', String, primary_key=True),
+            Column('related_table', String),
+            Column('related_key', String),
+            Column('display_column', String)
+        )
+        metadata.create_all(self.engine)
 
     def get_foreign_keys(self):
         """Scans the database for all foreign keys."""
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_dbman_%'")
-        tables = [row[0] for row in cursor.fetchall()]
-        
+        tables = self.inspector.get_table_names()
         fks = []
         for table in tables:
-            cursor.execute(f"PRAGMA foreign_key_list({table})")
-            for row in cursor.fetchall():
-                # row: id, seq, table, from, to, on_update, on_delete, match
-                fks.append({
-                    "table": table,
-                    "from": row[3],
-                    "to_table": row[2],
-                    "to_column": row[4]
-                })
+            if table.startswith("sqlite_") or table.startswith("_dbman_"):
+                continue
+            for fk in self.inspector.get_foreign_keys(table):
+                # fk: {'name': ..., 'constrained_columns': [...], 'referred_schema': ..., 'referred_table': ..., 'referred_columns': [...]}
+                for i in range(len(fk['constrained_columns'])):
+                    fks.append({
+                        "table": table,
+                        "from": fk['constrained_columns'][i],
+                        "to_table": fk['referred_table'],
+                        "to_column": fk['referred_columns'][i]
+                    })
         return fks
 
     def get_config_data(self):
         """Returns the configuration data for the UI."""
         fks = self.get_foreign_keys()
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT table_name, column_name, display_column FROM _dbman_lookup_config")
-        saved_configs = {(r[0], r[1]): r[2] for r in cursor.fetchall()}
+        
+        metadata = MetaData()
+        config_table = Table('_dbman_lookup_config', metadata, autoload_with=self.engine)
+        
+        with self.engine.connect() as conn:
+            stmt = select(config_table)
+            res = conn.execute(stmt)
+            saved_configs = {(r[0], r[1]): r[4] for r in res}
         
         rows = []
         for fk in fks:
@@ -61,45 +66,69 @@ class LookupPlugin:
             ))
         return rows
 
-    def save_config(self, table, column, related_table, related_key, display_column):
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            INSERT OR REPLACE INTO _dbman_lookup_config 
-            (table_name, column_name, related_table, related_key, display_column)
-            VALUES (?, ?, ?, ?, ?)
-        """, (table, column, related_table, related_key, display_column))
-        self.conn.commit()
+    def save_config(self, table_name, column, related_table, related_key, display_column):
+        metadata = MetaData()
+        config_table = Table('_dbman_lookup_config', metadata, autoload_with=self.engine)
+        
+        with self.engine.connect() as conn:
+            if self.engine.dialect.name == "sqlite":
+                stmt = sqlite_insert(config_table).values(
+                    table_name=table_name,
+                    column_name=column,
+                    related_table=related_table,
+                    related_key=related_key,
+                    display_column=display_column
+                ).on_conflict_do_update(
+                    index_elements=['table_name', 'column_name'],
+                    set_=dict(related_table=related_table, related_key=related_key, display_column=display_column)
+                )
+            else:
+                # Generic UPSERT is harder in SQLAlchemy Core across all DBs
+                # We'll do a delete then insert for now as a simple fallback
+                conn.execute(config_table.delete().where(
+                    config_table.c.table_name == table_name,
+                    config_table.c.column_name == column
+                ))
+                stmt = insert(config_table).values(
+                    table_name=table_name,
+                    column_name=column,
+                    related_table=related_table,
+                    related_key=related_key,
+                    display_column=display_column
+                )
+            conn.execute(stmt)
+            conn.commit()
 
     def find_foreign_key(self, table, column):
         """Checks if a specific column is a foreign key."""
-        cursor = self.conn.cursor()
         try:
-            cursor.execute(f"PRAGMA foreign_key_list({table})")
-            for row in cursor.fetchall():
-                if row[3] == column:
+            for fk in self.inspector.get_foreign_keys(table):
+                if column in fk['constrained_columns']:
+                    idx = fk['constrained_columns'].index(column)
                     return {
-                        "to_table": row[2],
-                        "to_column": row[4]
+                        "to_table": fk['referred_table'],
+                        "to_column": fk['referred_columns'][idx]
                     }
         except:
             pass
         return None
 
-    def get_lookup_config(self, table, column):
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            SELECT related_table, related_key, display_column 
-            FROM _dbman_lookup_config 
-            WHERE table_name = ? AND column_name = ?
-        """, (table, column))
-        res = cursor.fetchone()
-        if res:
-            return res
+    def get_lookup_config(self, table_name, column):
+        metadata = MetaData()
+        config_table = Table('_dbman_lookup_config', metadata, autoload_with=self.engine)
+        
+        with self.engine.connect() as conn:
+            stmt = select(config_table.c.related_table, config_table.c.related_key, config_table.c.display_column).where(
+                config_table.c.table_name == table_name,
+                config_table.c.column_name == column
+            )
+            res = conn.execute(stmt).fetchone()
+            if res:
+                return res
         
         # Auto-detect if it's a FK but not yet configured
-        fk = self.find_foreign_key(table, column)
+        fk = self.find_foreign_key(table_name, column)
         if fk:
-            # Default to using the related column itself as the display column
             return (fk["to_table"], fk["to_column"], fk["to_column"])
         
         return None
@@ -125,7 +154,6 @@ class LookupSelectScreen(ModalScreen):
     def __init__(self, title, options, current_value):
         super().__init__()
         self.dialog_title = title
-        # Ensure options are (label, value) pairs and values are strings for Select widget
         self.options = [(str(opt[0]), str(opt[1])) for opt in options]
         self.current_value = str(current_value) if current_value is not None else None
 
