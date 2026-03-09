@@ -6,13 +6,62 @@ from sqlalchemy import create_engine, inspect, text, MetaData, Table, Column, St
 from sqlalchemy.exc import SQLAlchemyError
 from textual.app import App, ComposeResult
 from textual.widgets import Header, Footer, DataTable, ListView, ListItem, Label, Static, Button, Input, ContentSwitcher
-from textual.containers import Horizontal, Vertical, Center
+from textual.containers import Horizontal, Vertical, Center, VerticalScroll
 from textual.binding import Binding
 from textual.screen import ModalScreen
 from textual.reactive import reactive
+from rich.panel import Panel
+from rich.table import Table as RichTable
 
 # Import LookupPlugin from plugins folder
 from plugins.lookup import LookupPlugin, LookupSelectScreen, LookupConfigScreen
+
+# ... (rest of imports unchanged) ...
+
+# ... (ShortcutsScreen, FilterColumnScreen, ConfirmScreen, EditCellScreen, TruncateColumnScreen, DbItem, SidebarHeader unchanged) ...
+
+class TableDiagram(Static, can_focus=True):
+    """A widget for displaying a single table and its relationships."""
+    
+    def __init__(self, table_name, columns, pks, fks, **kwargs):
+        super().__init__(**kwargs)
+        self.table_name = table_name
+        self.columns = columns
+        self.pks = pks
+        self.fks = fks
+
+    def render(self):
+        table = RichTable(show_header=False, box=None, padding=(0, 1), expand=True)
+        for col in self.columns:
+            name = col["name"]
+            col_type = str(col["type"])
+            pk_marker = "[bold yellow]*[/]" if name in self.pks else " "
+            table.add_row(f"{pk_marker} {name}", f"[dim]{col_type}[/]")
+            
+        if self.fks:
+            table.add_section()
+            table.add_row("[italic yellow]Relationships[/]", "")
+            for fk in self.fks:
+                ref_table = fk["referred_table"]
+                ref_cols = fk["referred_columns"]
+                cons_cols = fk["constrained_columns"]
+                rel_str = f"{cons_cols[0]} -> {ref_table}({ref_cols[0]})"
+                table.add_row(f"  [dim]↳[/] {rel_str}", "")
+                
+        return Panel(
+            table, 
+            title=f"[bold cyan] {self.table_name} [/]", 
+            border_style="accent" if self.has_focus else "blue",
+            expand=False,
+            width=50
+        )
+
+    def on_focus(self):
+        self.refresh()
+        self.scroll_visible()
+
+    def on_blur(self):
+        self.refresh()
 
 # Crash logging setup
 def handle_exception(exc_type, exc_value, exc_traceback):
@@ -313,8 +362,8 @@ class SidebarHeader(ListItem):
         self.title = title
         self.disabled = True 
 
-class DiagramView(Static, can_focus=True):
-    """A widget for displaying a diagram of tables and relationships."""
+class DiagramView(VerticalScroll, can_focus=True):
+    """A container for displaying table diagrams."""
     
     def __init__(self, engine, **kwargs):
         super().__init__(**kwargs)
@@ -331,56 +380,29 @@ class DiagramView(Static, can_focus=True):
         try:
             self._inspector = inspect(self.engine)
             tables = self.inspector.get_table_names()
-            diagram_text = ""
             
+            # Remove existing diagrams
+            self.query(TableDiagram).remove()
+            
+            table_widgets = []
             for table_name in sorted(tables):
                 if table_name.startswith("sqlite_") or table_name.startswith("_dbman_"):
                     continue
                 
-                header = f" TABLE {table_name} "
-                top_border = f"┌─{header}─{'─' * max(0, 42 - len(header))}┐\n"
-                diagram_text += f"[bold cyan]{top_border}[/]"
-                
                 columns = self.inspector.get_columns(table_name)
                 pk_constraint = self.inspector.get_pk_constraint(table_name)
                 pks = pk_constraint.get("constrained_columns", [])
-                
-                for col in columns:
-                    name = col["name"]
-                    col_type = str(col["type"])
-                    pk_marker = "*" if name in pks else " "
-                    diagram_text += f"│ {pk_marker} {name:20} [dim]{col_type:17}[/] │\n"
-                
                 fks = self.inspector.get_foreign_keys(table_name)
-                if fks:
-                    diagram_text += f"├─ [italic yellow]Relationships[/] {'─' * 27}┤\n"
-                    for fk in fks:
-                        ref_table = fk["referred_table"]
-                        ref_cols = fk["referred_columns"]
-                        cons_cols = fk["constrained_columns"]
-                        rel_str = f"{cons_cols[0]} -> {ref_table}({ref_cols[0]})"
-                        diagram_text += f"│ {rel_str:44} │\n"
                 
-                diagram_text += f"└{'─' * 46}┘\n\n"
+                table_widgets.append(TableDiagram(table_name, columns, pks, fks))
             
-            if not diagram_text:
-                diagram_text = "No tables found."
+            if not table_widgets:
+                self.mount(Static("No tables found."))
+            else:
+                self.mount(*table_widgets)
                 
-            self.update(diagram_text)
         except Exception as e:
-            self.update(f"Error generating diagram: {e}")
-
-    def action_cursor_down(self):
-        self.scroll_by(y=1)
-
-    def action_cursor_up(self):
-        self.scroll_by(y=-1)
-
-    def action_cursor_left(self):
-        self.scroll_by(x=-1)
-
-    def action_cursor_right(self):
-        self.scroll_by(x=1)
+            self.mount(Static(f"Error generating diagram: {e}"))
 
 class DbMan(App):
     """A vim-like database browser powered by SQLAlchemy."""
@@ -426,6 +448,11 @@ class DbMan(App):
     }
     #sql-view:focus, #diagram-view:focus {
         border: double $accent;
+    }
+    TableDiagram {
+        width: auto;
+        margin: 1 2;
+        height: auto;
     }
     ListItem {
         padding: 0 1;
@@ -646,13 +673,16 @@ class DbMan(App):
         sql_widget = self.query_one("#sql-view", Static)
         diag_widget = self.query_one("#diagram-view", DiagramView)
         switcher = self.query_one(ContentSwitcher)
+        sidebar = self.query_one("#sidebar")
         
         if self.mode == "diagram":
+            sidebar.display = False
             switcher.current = "diagram-view"
             diag_widget.refresh_diagram()
             if should_focus:
                 diag_widget.focus()
         elif self.mode in ["view", "schema"] or item_type == "plugin":
+            sidebar.display = True
             switcher.current = "data-table"
             table_widget.clear(columns=True)
             
@@ -689,6 +719,7 @@ class DbMan(App):
                     pass
         else:
             # SQL mode
+            sidebar.display = True
             switcher.current = "sql-view"
             sql_text = self.get_sql_data(name)
             sql_widget.update(sql_text)
@@ -698,16 +729,25 @@ class DbMan(App):
         self.title = f"dbman - {name} ({self.mode.upper()})"
 
     def action_switch_focus(self):
-        if self.focused.id == "sidebar-list":
-            switcher = self.query_one(ContentSwitcher)
-            if switcher.current == "data-table":
-                self.query_one("#data-table").focus()
-            elif switcher.current == "sql-view":
-                self.query_one("#sql-view").focus()
-            elif switcher.current == "diagram-view":
-                self.query_one("#diagram-view").focus()
+        if self.query_one("#sidebar").display:
+            if self.focused.id == "sidebar-list":
+                switcher = self.query_one(ContentSwitcher)
+                if switcher.current == "data-table":
+                    self.query_one("#data-table").focus()
+                elif switcher.current == "sql-view":
+                    self.query_one("#sql-view").focus()
+                elif switcher.current == "diagram-view":
+                    self.query_one("#diagram-view").focus()
+            else:
+                self.query_one("#sidebar-list").focus()
         else:
-            self.query_one("#sidebar-list").focus()
+            # Sidebar is hidden (Diagram mode)
+            # Default Textual focus cycling (Tab) will cycle through focusable widgets
+            # Since we consumed Tab with this action, we should manually cycle if needed
+            # or just do nothing and let Textual handle it if we remove the binding?
+            # But the binding is global. 
+            # If sidebar is hidden, we can just focus the next widget in the app.
+            self.app.focused.screen.focus_next()
 
     def action_jump_section(self):
         sidebar_list = self.query_one("#sidebar-list", ListView)
@@ -746,6 +786,7 @@ class DbMan(App):
         if self.current_item:
             self.load_item(self.current_item, self.current_type, should_focus=True)
         else:
+            self.query_one("#sidebar").display = False
             switcher = self.query_one(ContentSwitcher)
             switcher.current = "diagram-view"
             diag_widget = self.query_one("#diagram-view", DiagramView)
