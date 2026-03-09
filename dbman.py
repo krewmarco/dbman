@@ -60,7 +60,8 @@ class ShortcutsScreen(ModalScreen):
                 " q: Quit\n"
                 " tab: Cycle focus (Sidebar -> Main Area)\n"
                 " shift+tab: Jump to next sidebar section\n"
-                " m: Toggle View/Schema/SQL mode\n"
+                " m: Toggle View/Schema/SQL/Diag mode\n"
+                " d / ctrl+d: Switch to Diagram mode\n"
                 " ?: Toggle this Shortcuts panel\n"
                 " ctrl+p: Toggle this Shortcuts panel\n\n"
                 " [bold]Navigation[/]\n"
@@ -312,6 +313,75 @@ class SidebarHeader(ListItem):
         self.title = title
         self.disabled = True 
 
+class DiagramView(Static, can_focus=True):
+    """A widget for displaying a diagram of tables and relationships."""
+    
+    def __init__(self, engine, **kwargs):
+        super().__init__(**kwargs)
+        self.engine = engine
+        self._inspector = None
+
+    @property
+    def inspector(self):
+        if self._inspector is None:
+            self._inspector = inspect(self.engine)
+        return self._inspector
+
+    def refresh_diagram(self):
+        try:
+            self._inspector = inspect(self.engine)
+            tables = self.inspector.get_table_names()
+            diagram_text = ""
+            
+            for table_name in sorted(tables):
+                if table_name.startswith("sqlite_") or table_name.startswith("_dbman_"):
+                    continue
+                
+                header = f" TABLE {table_name} "
+                top_border = f"┌─{header}─{'─' * max(0, 42 - len(header))}┐\n"
+                diagram_text += f"[bold cyan]{top_border}[/]"
+                
+                columns = self.inspector.get_columns(table_name)
+                pk_constraint = self.inspector.get_pk_constraint(table_name)
+                pks = pk_constraint.get("constrained_columns", [])
+                
+                for col in columns:
+                    name = col["name"]
+                    col_type = str(col["type"])
+                    pk_marker = "*" if name in pks else " "
+                    diagram_text += f"│ {pk_marker} {name:20} [dim]{col_type:17}[/] │\n"
+                
+                fks = self.inspector.get_foreign_keys(table_name)
+                if fks:
+                    diagram_text += f"├─ [italic yellow]Relationships[/] {'─' * 27}┤\n"
+                    for fk in fks:
+                        ref_table = fk["referred_table"]
+                        ref_cols = fk["referred_columns"]
+                        cons_cols = fk["constrained_columns"]
+                        rel_str = f"{cons_cols[0]} -> {ref_table}({ref_cols[0]})"
+                        diagram_text += f"│ {rel_str:44} │\n"
+                
+                diagram_text += f"└{'─' * 46}┘\n\n"
+            
+            if not diagram_text:
+                diagram_text = "No tables found."
+                
+            self.update(diagram_text)
+        except Exception as e:
+            self.update(f"Error generating diagram: {e}")
+
+    def action_cursor_down(self):
+        self.scroll_by(y=1)
+
+    def action_cursor_up(self):
+        self.scroll_by(y=-1)
+
+    def action_cursor_left(self):
+        self.scroll_by(x=-1)
+
+    def action_cursor_right(self):
+        self.scroll_by(x=1)
+
 class DbMan(App):
     """A vim-like database browser powered by SQLAlchemy."""
 
@@ -346,7 +416,7 @@ class DbMan(App):
     DataTable:focus {
         border: double $accent;
     }
-    #sql-view {
+    #sql-view, #diagram-view {
         height: 1fr;
         padding: 1 2;
         background: $surface;
@@ -354,7 +424,7 @@ class DbMan(App):
         overflow-x: scroll;
         overflow-y: scroll;
     }
-    #sql-view:focus {
+    #sql-view:focus, #diagram-view:focus {
         border: double $accent;
     }
     ListItem {
@@ -382,7 +452,10 @@ class DbMan(App):
         Binding("G", "scroll_end", "End", show=False),
         Binding("tab", "switch_focus", "Sidebar/Main"),
         Binding("shift+tab", "jump_section", "Jump Section"),
-        Binding("m", "toggle_mode", "View/Schema/SQL Mode"),
+        Binding("m", "toggle_mode", "View/Schema/SQL/Diag Mode"),
+        Binding("d", "change_mode_diagram", "Diagram Mode"),
+        Binding("ctrl+d", "change_mode_diagram", "Diagram Mode", show=False),
+        Binding("command+d", "change_mode_diagram", "Diagram Mode", show=False),
         Binding("ctrl+x", "delete_item", "Delete"),
         Binding("?", "toggle_shortcuts", "Shortcuts", show=False),
         Binding("ctrl+p", "toggle_shortcuts", "Shortcuts"),
@@ -512,6 +585,7 @@ class DbMan(App):
             with ContentSwitcher(initial="data-table"):
                 yield DataTable(id="data-table")
                 yield Static("", id="sql-view")
+                yield DiagramView(self.engine, id="diagram-view")
         yield Footer()
 
     def on_mount(self):
@@ -570,9 +644,15 @@ class DbMan(App):
         self.current_type = item_type
         table_widget = self.query_one("#data-table", DataTable)
         sql_widget = self.query_one("#sql-view", Static)
+        diag_widget = self.query_one("#diagram-view", DiagramView)
         switcher = self.query_one(ContentSwitcher)
         
-        if self.mode in ["view", "schema"] or item_type == "plugin":
+        if self.mode == "diagram":
+            switcher.current = "diagram-view"
+            diag_widget.refresh_diagram()
+            if should_focus:
+                diag_widget.focus()
+        elif self.mode in ["view", "schema"] or item_type == "plugin":
             switcher.current = "data-table"
             table_widget.clear(columns=True)
             
@@ -622,8 +702,10 @@ class DbMan(App):
             switcher = self.query_one(ContentSwitcher)
             if switcher.current == "data-table":
                 self.query_one("#data-table").focus()
-            else:
+            elif switcher.current == "sql-view":
                 self.query_one("#sql-view").focus()
+            elif switcher.current == "diagram-view":
+                self.query_one("#diagram-view").focus()
         else:
             self.query_one("#sidebar-list").focus()
 
@@ -646,7 +728,7 @@ class DbMan(App):
         if self.current_type == "plugin":
             self.notify("Plugins only have View mode", severity="error")
             return
-        modes = ["view", "schema", "sql"]
+        modes = ["view", "schema", "sql", "diagram"]
         idx = modes.index(self.mode)
         self.mode = modes[(idx + 1) % len(modes)]
         self.refresh_sidebar()
@@ -657,6 +739,18 @@ class DbMan(App):
                 break
         if self.current_item:
             self.load_item(self.current_item, self.current_type)
+
+    def action_change_mode_diagram(self):
+        self.mode = "diagram"
+        self.refresh_sidebar()
+        if self.current_item:
+            self.load_item(self.current_item, self.current_type, should_focus=True)
+        else:
+            switcher = self.query_one(ContentSwitcher)
+            switcher.current = "diagram-view"
+            diag_widget = self.query_one("#diagram-view", DiagramView)
+            diag_widget.refresh_diagram()
+            diag_widget.focus()
 
     def action_filter_column(self):
         if self.mode != "view":
