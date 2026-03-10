@@ -51,7 +51,7 @@ class TableDiagram(Static, can_focus=True):
         return Panel(
             table, 
             title=f"[bold cyan] {self.table_name} [/]", 
-            border_style="accent" if self.has_focus else "blue",
+            border_style="green" if self.has_focus else "blue",
             expand=False,
             width=50
         )
