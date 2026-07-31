@@ -2,16 +2,21 @@
 import sys
 import os
 import traceback
+import math
+import random
+import csv
 from sqlalchemy import create_engine, inspect, text, MetaData, Table, Column, String, Integer, select, update, delete, func
 from sqlalchemy.exc import SQLAlchemyError
 from textual.app import App, ComposeResult
-from textual.widgets import Header, Footer, DataTable, ListView, ListItem, Label, Static, Button, Input, ContentSwitcher
+from textual.widgets import Header, Footer, DataTable, ListView, ListItem, Label, Static, Button, Input, ContentSwitcher, TextArea
 from textual.containers import Horizontal, Vertical, Center, VerticalScroll
 from textual.binding import Binding
 from textual.screen import ModalScreen
 from textual.reactive import reactive
+from textual.message import Message
 from rich.panel import Panel
 from rich.table import Table as RichTable
+from rich.text import Text
 
 # Import LookupPlugin from plugins folder
 from plugins.lookup import LookupPlugin, LookupSelectScreen, LookupConfigScreen
@@ -55,6 +60,28 @@ class TableDiagram(Static, can_focus=True):
             expand=False,
             width=50
         )
+
+    BINDINGS = [
+        Binding("up", "move(0, -1)", "Up", show=False),
+        Binding("down", "move(0, 1)", "Down", show=False),
+        Binding("left", "move(-2, 0)", "Left", show=False),
+        Binding("right", "move(2, 0)", "Right", show=False),
+    ]
+
+    class Moved(Message):
+        def __init__(self, table_name, dx, dy):
+            self.table_name = table_name
+            self.dx = dx
+            self.dy = dy
+            super().__init__()
+
+    def action_move(self, dx: int, dy: int) -> None:
+        self.post_message(self.Moved(self.table_name, dx, dy))
+
+    def action_cursor_up(self): self.action_move(0, -1)
+    def action_cursor_down(self): self.action_move(0, 1)
+    def action_cursor_left(self): self.action_move(-2, 0)
+    def action_cursor_right(self): self.action_move(2, 0)
 
     def on_focus(self):
         self.refresh()
@@ -119,7 +146,9 @@ class ShortcutsScreen(ModalScreen):
                 " pgup / pgdn: Page Up / Down (Mac: fn + up / fn + down)\n"
                 " g / G: Home / End\n\n"
                 " [bold]Editing & Filtering[/]\n"
-                " e: Edit selected cell (View mode only)\n"
+                " e: Edit selected cell (View mode) or SQL (SQL mode)\n"
+                " v: Create new View\n"
+                " x: Export current Table/View to CSV\n"
                 " f: Filter selected column (View mode only)\n"
                 " F: Clear all filters for current table\n"
                 " t: Truncate/Shorten Column data (View mode only)\n"
@@ -350,6 +379,110 @@ class TruncateColumnScreen(ModalScreen):
     def on_input_submitted(self, event: Input.Submitted) -> None:
         self.dismiss(event.value)
 
+class EditSqlScreen(ModalScreen):
+    """A modal screen for editing SQL."""
+    CSS = """
+    EditSqlScreen {
+        background: rgba(0, 0, 0, 0.5);
+        align: center middle;
+    }
+    #edit-sql-dialog {
+        background: $panel;
+        border: thick $primary;
+        padding: 1 2;
+        width: 80%;
+        height: 80%;
+    }
+    Label {
+        margin-bottom: 1;
+        text-style: bold;
+    }
+    TextArea {
+        margin-bottom: 1;
+        height: 1fr;
+    }
+    #edit-sql-buttons {
+        align: right middle;
+    }
+    Button {
+        margin-left: 1;
+    }
+    """
+    def __init__(self, title, initial_sql=""):
+        super().__init__()
+        self.title_text = title
+        self.initial_sql = initial_sql
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="edit-sql-dialog"):
+            yield Label(self.title_text)
+            yield TextArea(self.initial_sql, id="sql-editor", language="sql")
+            with Horizontal(id="edit-sql-buttons"):
+                yield Button("Cancel", id="cancel-edit-sql")
+                yield Button("Execute", variant="success", id="apply-edit-sql")
+
+    def on_mount(self):
+        self.query_one(TextArea).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "apply-edit-sql":
+            self.dismiss(self.query_one(TextArea).text)
+        else:
+            self.dismiss(None)
+
+class ExportCsvScreen(ModalScreen):
+    """A modal screen for exporting to CSV."""
+    CSS = """
+    ExportCsvScreen {
+        background: rgba(0, 0, 0, 0.5);
+        align: center middle;
+    }
+    #export-csv-dialog {
+        background: $panel;
+        border: thick $primary;
+        padding: 1 2;
+        width: 60;
+        height: auto;
+    }
+    Label {
+        margin-bottom: 1;
+        text-style: bold;
+    }
+    Input {
+        margin-bottom: 1;
+    }
+    #export-csv-buttons {
+        align: right middle;
+    }
+    Button {
+        margin-left: 1;
+    }
+    """
+    def __init__(self, default_filename):
+        super().__init__()
+        self.default_filename = default_filename
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="export-csv-dialog"):
+            yield Label("Export to CSV")
+            yield Static("Enter filename (absolute path or relative to project root):", id="small-label")
+            yield Input(value=self.default_filename, id="export-filename-input")
+            with Horizontal(id="export-csv-buttons"):
+                yield Button("Cancel", id="cancel-export")
+                yield Button("Export", variant="success", id="apply-export")
+
+    def on_mount(self):
+        self.query_one(Input).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "apply-export":
+            self.dismiss(self.query_one(Input).value)
+        else:
+            self.dismiss(None)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value)
+
 class DbItem(ListItem):
     def __init__(self, name: str, item_type: str) -> None:
         super().__init__(Label(f" {name} "))
@@ -363,18 +496,165 @@ class SidebarHeader(ListItem):
         self.disabled = True 
 
 class DiagramView(VerticalScroll, can_focus=True):
-    """A container for displaying table diagrams."""
+    """A container for displaying table diagrams using a force-directed layout."""
     
     def __init__(self, engine, **kwargs):
         super().__init__(**kwargs)
         self.engine = engine
         self._inspector = None
+        self.positions = {}
+        self.edges = []
+        self.width = 150
+        self.height = 50
 
     @property
     def inspector(self):
         if self._inspector is None:
             self._inspector = inspect(self.engine)
         return self._inspector
+
+    def get_saved_positions(self):
+        saved = {}
+        try:
+            with self.engine.connect() as conn:
+                res = conn.execute(text("SELECT table_name, x, y FROM _dbman_layout"))
+                for row in res:
+                    saved[row[0]] = [row[1], row[2]]
+        except Exception:
+            pass # Table probably doesn't exist
+        return saved
+
+    def save_position(self, table_name, x, y):
+        try:
+            with self.engine.connect() as conn:
+                conn.execute(text("CREATE TABLE IF NOT EXISTS _dbman_layout (table_name TEXT PRIMARY KEY, x INTEGER, y INTEGER)"))
+                conn.execute(text("DELETE FROM _dbman_layout WHERE table_name = :name"), {"name": table_name})
+                conn.execute(text("INSERT INTO _dbman_layout (table_name, x, y) VALUES (:name, :x, :y)"), 
+                             {"name": table_name, "x": x, "y": y})
+                conn.commit()
+        except Exception:
+            pass
+
+    def layout_graph(self, nodes, edges, width, height, iterations=None):
+        positions = self.get_saved_positions()
+        
+        remaining = [n for n in nodes if n not in positions]
+        if not remaining:
+            return positions
+            
+        degrees = {n: 0 for n in remaining}
+        for u, v in edges:
+            if u in remaining:
+                degrees[u] += 1
+            if v in remaining:
+                degrees[v] += 1
+                
+        remaining.sort(key=lambda n: degrees[n], reverse=True)
+        
+        center_x = width // 2 - 25
+        center_y = height // 2 - 5
+        
+        radius = 20.0
+        angle = 0.0
+        for idx, node in enumerate(remaining):
+            if idx == 0:
+                positions[node] = [center_x, center_y]
+            else:
+                x = center_x + int(radius * math.cos(angle) * 2)
+                y = center_y + int(radius * math.sin(angle))
+                
+                x = max(0, min(width - 50, x))
+                y = max(0, min(height - 10, y))
+                positions[node] = [x, y]
+                
+                angle += 2.4  # radians step
+                radius += 3.0 # expand outwards
+                
+        return positions
+
+    def draw_lines(self, width, height, edges, positions):
+        # We'll use a Text object for rich text with styles directly so it's performant
+        grid_chars = [[' ' for _ in range(int(width))] for _ in range(int(height))]
+        
+        def plot_hline(x0, x1, y):
+            if not (0 <= y < int(height)): return
+            start_x, end_x = min(x0, x1), max(x0, x1)
+            for x in range(start_x, end_x + 1):
+                if 0 <= x < int(width):
+                    if grid_chars[y][x] == ' ': grid_chars[y][x] = '─'
+        
+        def plot_vline(x, y0, y1):
+            if not (0 <= x < int(width)): return
+            start_y, end_y = min(y0, y1), max(y0, y1)
+            for y in range(start_y, end_y + 1):
+                if 0 <= y < int(height):
+                    if grid_chars[y][x] in (' ', '─'): grid_chars[y][x] = '│'
+        
+        def plot_corner(x, y, char):
+            if 0 <= y < int(height) and 0 <= x < int(width):
+                grid_chars[y][x] = char
+                
+        for u, v in edges:
+            if u in positions and v in positions:
+                x0, y0 = positions[u]
+                x1, y1 = positions[v]
+                
+                # Offset by half the panel width/height approximately to center lines
+                x0, y0 = int(round(x0)) + 25, int(round(y0)) + 5
+                x1, y1 = int(round(x1)) + 25, int(round(y1)) + 5
+                
+                mid_x = (x0 + x1) // 2
+                
+                plot_hline(x0, mid_x, y0)
+                plot_vline(mid_x, y0, y1)
+                plot_hline(mid_x, x1, y1)
+                
+                # Plot corners accurately based on direction
+                c1 = '┐' if (x0 < mid_x and y0 < y1) or (x0 > mid_x and y0 > y1) else '┌'
+                c2 = '└' if (x1 > mid_x and y1 > y0) or (x1 < mid_x and y1 < y0) else '┘'
+                
+                if y0 <= y1:
+                    if x0 <= x1:
+                        c1, c2 = '┐', '└'
+                    else:
+                        c1, c2 = '┌', '┘'
+                else:
+                    if x0 <= x1:
+                        c1, c2 = '┘', '┌'
+                    else:
+                        c1, c2 = '└', '┐'
+                
+                plot_corner(mid_x, y0, c1)
+                plot_corner(mid_x, y1, c2)
+                
+        text = Text()
+        for row in grid_chars:
+            text.append("".join(row) + "\n", style="dim cyan")
+        return text
+
+    def update_lines(self):
+        bg_text = self.draw_lines(self.width, self.height, self.edges, self.positions)
+        # Use query instead of query_one to avoid crash and update all if multiple exist temporarily
+        for bg in self.query(".diagram-bg"):
+            bg.update(bg_text)
+
+    def on_table_diagram_moved(self, event: TableDiagram.Moved):
+        widget = None
+        for w in self.query(TableDiagram):
+            if w.table_name == event.table_name:
+                widget = w
+                break
+        
+        if widget and widget.table_name in self.positions:
+            x, y = self.positions[widget.table_name]
+            new_x = max(0, min(self.width - 20, x + event.dx))
+            new_y = max(0, min(self.height - 5, y + event.dy))
+            self.positions[widget.table_name] = [new_x, new_y]
+            
+            widget.styles.offset = (int(new_x), int(new_y))
+            
+            self.save_position(widget.table_name, int(new_x), int(new_y))
+            self.update_lines()
 
     def refresh_diagram(self):
         try:
@@ -385,6 +665,9 @@ class DiagramView(VerticalScroll, can_focus=True):
             self.query(TableDiagram).remove()
             
             table_widgets = []
+            nodes = []
+            edges = []
+
             for table_name in sorted(tables):
                 if table_name.startswith("sqlite_") or table_name.startswith("_dbman_"):
                     continue
@@ -395,14 +678,44 @@ class DiagramView(VerticalScroll, can_focus=True):
                 fks = self.inspector.get_foreign_keys(table_name)
                 
                 table_widgets.append(TableDiagram(table_name, columns, pks, fks))
+                nodes.append(table_name)
+                for fk in fks:
+                    edges.append((table_name, fk["referred_table"]))
+            
+            self.width = max(self.app.console.size.width, 150)
+            self.height = max(self.app.console.size.height, 50)
+            self.edges = edges
             
             if not table_widgets:
-                self.mount(Static("No tables found."))
+                bg_text = "No tables found."
             else:
-                self.mount(*table_widgets)
+                self.positions = self.layout_graph(nodes, edges, self.width, self.height)
+                bg_text = self.draw_lines(self.width, self.height, self.edges, self.positions)
+            
+            # Reuse existing background widget if possible to avoid DuplicateIds or stacking
+            bg_query = self.query(".diagram-bg")
+            if bg_query:
+                bg_query.first().update(bg_text)
+                # If we somehow got duplicates, remove the extras
+                for other in bg_query[1:]:
+                    other.remove()
+            else:
+                self.mount(Static(bg_text, classes="diagram-bg"))
+
+            for w in table_widgets:
+                if w.table_name in self.positions:
+                    x, y = self.positions[w.table_name]
+                    w.styles.position = "absolute"
+                    w.styles.offset = (int(x), int(y))
+                    w.styles.margin = 0
+                self.mount(w)
                 
         except Exception as e:
-            self.mount(Static(f"Error generating diagram: {e}"))
+            bg_query = self.query(".diagram-bg")
+            if bg_query:
+                bg_query.first().update(f"Error generating diagram: {e}")
+            else:
+                self.mount(Static(f"Error generating diagram: {e}", classes="diagram-bg"))
 
 class DbMan(App):
     """A vim-like database browser powered by SQLAlchemy."""
@@ -451,7 +764,10 @@ class DbMan(App):
     }
     TableDiagram {
         width: auto;
-        margin: 1 2;
+        height: auto;
+    }
+    .diagram-bg {
+        width: auto;
         height: auto;
     }
     ListItem {
@@ -487,6 +803,8 @@ class DbMan(App):
         Binding("?", "toggle_shortcuts", "Shortcuts", show=False),
         Binding("ctrl+p", "toggle_shortcuts", "Shortcuts"),
         Binding("e", "edit_cell", "Edit Cell"),
+        Binding("v", "create_view", "Create View"),
+        Binding("x", "export_csv", "Export CSV"),
         Binding("f", "filter_column", "Filter Column"),
         Binding("F", "clear_filters", "Clear Filters"),
         Binding("t", "truncate_column", "Shorten Column"),
@@ -531,7 +849,7 @@ class DbMan(App):
                 clauses.append(col.like(f"%{val}%"))
         return clauses
 
-    def get_item_data(self, name, item_type):
+    def get_item_data(self, name, item_type, limit=2000):
         if item_type == "plugin":
             if name == "lookup":
                 columns = ["Table", "ForeignKeyField", "RelatedTable", "RelatedKey", "LookupField"]
@@ -556,14 +874,17 @@ class DbMan(App):
             if filter_clauses:
                 stmt = stmt.where(*filter_clauses)
             
-            stmt = stmt.limit(2000)
+            if limit:
+                stmt = stmt.limit(limit)
             
             if item_type == "table" and self.engine.dialect.name == "sqlite":
                 try:
                     # Try to select rowid explicitly for sqlite
-                    rowid_stmt = select(text("rowid"), table).limit(2000)
+                    rowid_stmt = select(text("rowid"), table)
+                    if limit:
+                        rowid_stmt = rowid_stmt.limit(limit)
                     if filter_clauses:
-                         rowid_stmt = select(text("rowid"), table).where(*filter_clauses).limit(2000)
+                         rowid_stmt = rowid_stmt.where(*filter_clauses)
                     
                     result = conn.execute(rowid_stmt)
                     rows = [list(row) for row in result]
@@ -886,6 +1207,10 @@ class DbMan(App):
             self.push_screen(ShortcutsScreen())
 
     def action_edit_cell(self):
+        if self.mode == "sql":
+            self.action_edit_sql()
+            return
+
         if self.current_type == "plugin" and self.current_item == "lookup":
             coord = self.focused.cursor_coordinate
             row_vals = self.focused.get_row_at(coord.row)
@@ -905,7 +1230,7 @@ class DbMan(App):
         if not isinstance(self.focused, DataTable) or not self.current_item:
             return
         if self.current_type == "view":
-            self.notify("Cannot edit Views directly", severity="error")
+            self.notify("Cannot edit Views directly (press 'e' in SQL mode to edit View SQL)", severity="error")
             return
         if not self.has_rowid:
             self.notify("Cannot edit tables without identifiable rows (yet)", severity="error")
@@ -972,6 +1297,65 @@ class DbMan(App):
                 except Exception as e:
                     self.notify(f"Update failed: {e}", severity="error")
         self.push_screen(EditCellScreen(current_value), perform_update)
+
+    def action_edit_sql(self):
+        if self.current_type != "view":
+            self.notify("Can only edit SQL of Views", severity="error")
+            return
+        
+        current_sql = self.get_sql_data(self.current_item)
+        
+        def execute_sql(new_sql):
+            if new_sql:
+                try:
+                    with self.engine.connect() as conn:
+                        # SQLite specific DROP then CREATE
+                        if self.current_type == "view" and self.engine.dialect.name == "sqlite":
+                             conn.execute(text(f"DROP VIEW IF EXISTS {self.current_item}"))
+                        
+                        conn.execute(text(new_sql))
+                        conn.commit()
+                        self.notify("SQL Executed Successfully")
+                        self.refresh_sidebar()
+                        self.load_item(self.current_item, self.current_type)
+                except Exception as e:
+                    self.notify(f"SQL Error: {e}", severity="error")
+        
+        self.push_screen(EditSqlScreen(f"Edit View: {self.current_item}", current_sql), execute_sql)
+
+    def action_create_view(self):
+        default_sql = "CREATE VIEW new_view AS\nSELECT * FROM table_name"
+        def execute_create(new_sql):
+            if new_sql:
+                try:
+                    with self.engine.connect() as conn:
+                        conn.execute(text(new_sql))
+                        conn.commit()
+                        self.notify("View Created")
+                        self.refresh_sidebar()
+                except Exception as e:
+                    self.notify(f"Creation failed: {e}", severity="error")
+        self.push_screen(EditSqlScreen("Create New View", default_sql), execute_create)
+
+    def action_export_csv(self):
+        if not self.current_item:
+            return
+        
+        default_filename = f"{self.current_item}.csv"
+        
+        def do_export(filename):
+            if filename:
+                try:
+                    columns, rows, _ = self.get_item_data(self.current_item, self.current_type, limit=None)
+                    with open(filename, 'w', newline='') as f:
+                        writer = csv.writer(f)
+                        writer.writerow(columns)
+                        writer.writerows(rows)
+                    self.notify(f"Exported to {filename}")
+                except Exception as e:
+                    self.notify(f"Export failed: {e}", severity="error")
+                    
+        self.push_screen(ExportCsvScreen(default_filename), do_export)
 
     def action_truncate_column(self):
         if self.mode != "view":
