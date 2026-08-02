@@ -70,6 +70,11 @@ There's also no automated coverage of the app itself — verify changes by actua
 - It's inherently relational, so it's only ever instantiated when `provider.capabilities.lookup_plugin` is `True`: `DbMan.__init__` sets `self.lookup_plugin = LookupPlugin(provider.sqlalchemy_engine()) if provider.capabilities.lookup_plugin else None`, and every call site (`refresh_sidebar`'s plugin list, `action_edit_cell`'s plugin branch, `action_toggle_mode`) guards on `self.lookup_plugin is not None` first.
 - There's no formal plugin interface/registry — adding a new plugin currently means importing it directly in `dbman.py` and hardcoding it into `refresh_sidebar()`'s `plugins = [...]` list and the `item_type == "plugin"` branches in `load_item()` / `action_edit_cell()`.
 
+### View settings (`view_settings.py`)
+- Per-table/per-view display preferences (hidden columns, explicit widths, column order) persist to a local, provider-agnostic file: `<cwd>/.dbman/<db-name>.json`, gitignored since it's local machine state rather than shared config. `<db-name>` comes from `derive_db_name()` (last URL path segment, extension stripped) — works uniformly across bare sqlite paths, `sqlite://`/`postgresql://`/`mysql://` URLs, and `couchdb://` URLs, so it lives outside `providers/` rather than inside any one provider.
+- `DbMan.__init__` builds one `ViewSettingsStore` per connection (`self.view_settings`). `load_item`'s `"view"` mode branch calls `apply_view_settings(page.columns, page.rows, view_settings)` to project the fetched `RowPage` through hidden/order before rendering, and passes `view_settings.widths.get(col.name)` to `DataTable.add_column` — this applies uniformly across providers since it operates on the already-fetched column/row list, not provider internals.
+- There's no in-app UI to *set* these yet — `ViewSettingsStore.save()` exists and is exercised by tests but has no caller in `dbman.py`. It's the landing point for hide/unhide, column-width, and column-reorder UI (tracked separately; see the project's GitHub issues).
+
 ## Testing the CouchDB provider
 
 There's no fixture/CI setup for this — spin up a throwaway local CouchDB in Docker, on a port that won't collide with any other CouchDB container you might already have running:

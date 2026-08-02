@@ -20,6 +20,7 @@ from rich.text import Text
 # Import LookupPlugin from plugins folder
 from plugins.lookup import LookupPlugin, LookupSelectScreen, LookupConfigScreen
 from providers import create_provider
+from view_settings import ViewSettingsStore, derive_db_name, apply_view_settings
 
 # ... (rest of imports unchanged) ...
 
@@ -828,6 +829,7 @@ class DbMan(App):
                 LookupPlugin(self.provider.sqlalchemy_engine())
                 if self.provider.capabilities.lookup_plugin else None
             )
+            self.view_settings = ViewSettingsStore(derive_db_name(db_url))
         except Exception as e:
             print(f"Error connecting to database: {e}")
             sys.exit(1)
@@ -953,14 +955,17 @@ class DbMan(App):
                 self.raw_docs = {}
                 self.rows_editable = bool(page.row_keys) and page.row_keys[0].value is not None
 
-                for i, col in enumerate(page.columns):
+                view_settings = self.view_settings.get(name)
+                display_columns, display_rows = apply_view_settings(page.columns, page.rows, view_settings)
+
+                for i, col in enumerate(display_columns):
                     color = COLORS[i % len(COLORS)]
                     label = f"[{color}]{col.name}[/]"
                     if col.name in self.filters:
                         label = f"[reverse]{label} (F)[/]"
-                    table_widget.add_column(label, key=col.name)
+                    table_widget.add_column(label, key=col.name, width=view_settings.widths.get(col.name))
 
-                for i, (row, row_key) in enumerate(zip(page.rows, page.row_keys)):
+                for i, (row, row_key) in enumerate(zip(display_rows, page.row_keys)):
                     if row_key.value is None:
                         key_str = str(i)
                     elif isinstance(row_key.value, dict):
