@@ -882,7 +882,12 @@ def _edit_cell_ctx(app):
 
 
 def _filter_column_ctx(app):
-    return app.mode == "view" and bool(app.current_item) and app.provider.is_filterable(app.current_type)
+    return (
+        app.mode == "view"
+        and app.select_mode == "column"
+        and bool(app.current_item)
+        and app.provider.is_filterable(app.current_type)
+    )
 
 
 def _truncate_column_ctx(app):
@@ -903,11 +908,15 @@ def _toggle_mode_ctx(app):
 
 
 def _unhide_column_ctx(app):
-    """Greys out (rather than hides) 'u' when there's nothing to unhide,
-    since the key is always conceptually valid in View mode."""
-    if app.mode != "view" or not app.current_item:
+    """Column-select-mode-scoped, like hiding. Greys out (rather than hides)
+    'u' when there's nothing to unhide."""
+    if app.mode != "view" or app.select_mode != "column" or not app.current_item:
         return False
     return True if app.view_settings.get(app.current_item).hidden else None
+
+
+def _export_csv_ctx(app):
+    return app.current_type in ("table", "view")
 
 
 class DbMan(App):
@@ -1023,7 +1032,7 @@ class DbMan(App):
         "edit_document": _ctx(modes={"view"}, capability="whole_row_edit"),
         "filter_column": _filter_column_ctx,
         "truncate_column": _truncate_column_ctx,
-        "set_column_width": _ctx(modes={"view"}),
+        "set_column_width": _ctx(modes={"view"}, select_modes={"column"}),
         "rotate_select_mode": _ctx(modes={"view"}),
         "reorder_column": _ctx(modes={"view"}, select_modes={"column"}),
         "hide_column": _ctx(modes={"view"}, select_modes={"column"}),
@@ -1032,6 +1041,7 @@ class DbMan(App):
         "toggle_mode": _toggle_mode_ctx,
         "change_mode_diagram": _ctx(capability="diagram"),
         "create_view": _ctx(capability="create_definition"),
+        "export_csv": _export_csv_ctx,
     }
 
     def check_action(self, action, parameters):
@@ -1391,10 +1401,13 @@ class DbMan(App):
         self.load_item(self.current_item, self.current_type)
 
     def action_unhide_column(self):
-        """'u', mode-independent: pick a previously hidden column to bring
-        back. See issue #2."""
+        """'u', column-select-mode-scoped like hiding: pick a previously
+        hidden column to bring back. See issue #2."""
         if self.mode != "view" or not self.current_item:
             self.notify("Unhide only allowed in View mode", severity="error")
+            return
+        if self.select_mode != "column":
+            self.notify("Unhide only allowed in column select mode (press 's' to rotate)", severity="error")
             return
 
         settings = self.view_settings.get(self.current_item)
@@ -1433,6 +1446,9 @@ class DbMan(App):
     def action_filter_column(self):
         if self.mode != "view":
             self.notify("Filtering only allowed in View mode", severity="error")
+            return
+        if self.select_mode != "column":
+            self.notify("Filtering only allowed in column select mode (press 's' to rotate)", severity="error")
             return
         if not isinstance(self.focused, DataTable) or not self.current_item:
             return
@@ -1778,6 +1794,9 @@ class DbMan(App):
         mutates the underlying data rather than just how it's displayed."""
         if self.mode != "view":
             self.notify("Column width only allowed in View mode", severity="error")
+            return
+        if self.select_mode != "column":
+            self.notify("Column width only allowed in column select mode (press 's' to rotate)", severity="error")
             return
         if not isinstance(self.focused, DataTable) or not self.current_item:
             return
