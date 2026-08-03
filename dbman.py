@@ -841,6 +841,75 @@ class DiagramView(VerticalScroll, can_focus=True):
             else:
                 self.mount(Static(f"Error generating diagram: {e}", classes="diagram-bg"))
 
+def _ctx(modes=None, select_modes=None, item_types=None, capability=None):
+    """Build a check_action predicate for the common case: an AND of
+    mode/select_mode/item_type/capability checks. `None` for any parameter
+    means "any value is fine" on that axis. See issue #10."""
+    modes = frozenset(modes) if modes is not None else None
+    select_modes = frozenset(select_modes) if select_modes is not None else None
+    item_types = frozenset(item_types) if item_types is not None else None
+
+    def predicate(app):
+        if modes is not None and app.mode not in modes:
+            return False
+        if select_modes is not None and app.select_mode not in select_modes:
+            return False
+        if item_types is not None and app.current_type not in item_types:
+            return False
+        if capability is not None and not getattr(app.provider.capabilities, capability, False):
+            return False
+        return True
+
+    return predicate
+
+
+def _edit_cell_ctx(app):
+    """'e' is polymorphic: SQL mode edits the View's SQL, the lookup plugin
+    edits its own config, and in View mode what it edits depends on
+    select_mode (field: the cell, row: the whole row/document, column: n/a).
+    Too many cross-cutting branches to express as a plain _ctx() AND."""
+    if app.mode == "sql":
+        return app.current_type == "view" and app.provider.capabilities.create_definition
+    if app.current_type == "plugin":
+        return app.current_item == "lookup" and app.lookup_plugin is not None
+    if app.mode != "view":
+        return False
+    if app.select_mode == "row":
+        return app.provider.capabilities.whole_row_edit
+    if app.select_mode == "column":
+        return False
+    return app.current_type == "table" and app.rows_editable
+
+
+def _filter_column_ctx(app):
+    return app.mode == "view" and bool(app.current_item) and app.provider.is_filterable(app.current_type)
+
+
+def _truncate_column_ctx(app):
+    return (
+        app.mode == "view"
+        and app.current_type == "table"
+        and bool(app.current_item)
+        and app.provider.capabilities.truncate_column
+    )
+
+
+def _delete_item_ctx(app):
+    return bool(app.current_type) and app.current_type != "plugin" and app.provider.capabilities.delete_item
+
+
+def _toggle_mode_ctx(app):
+    return app.current_type != "plugin"
+
+
+def _unhide_column_ctx(app):
+    """Greys out (rather than hides) 'u' when there's nothing to unhide,
+    since the key is always conceptually valid in View mode."""
+    if app.mode != "view" or not app.current_item:
+        return False
+    return True if app.view_settings.get(app.current_item).hidden else None
+
+
 class DbMan(App):
     """A vim-like database browser powered by SQLAlchemy."""
 
@@ -945,6 +1014,31 @@ class DbMan(App):
 
     SELECT_MODES = ["field", "row", "column"]
     CURSOR_TYPE_BY_SELECT_MODE = {"field": "cell", "row": "row", "column": "column"}
+
+    # Per-action visibility/enablement predicates for the footer, keyed by
+    # action name (not by key — see _ctx/_edit_cell_ctx etc. above). Actions
+    # not listed here are always shown+enabled. See issue #10.
+    ACTION_CONTEXTS = {
+        "edit_cell": _edit_cell_ctx,
+        "edit_document": _ctx(modes={"view"}, capability="whole_row_edit"),
+        "filter_column": _filter_column_ctx,
+        "truncate_column": _truncate_column_ctx,
+        "set_column_width": _ctx(modes={"view"}),
+        "rotate_select_mode": _ctx(modes={"view"}),
+        "reorder_column": _ctx(modes={"view"}, select_modes={"column"}),
+        "hide_column": _ctx(modes={"view"}, select_modes={"column"}),
+        "unhide_column": _unhide_column_ctx,
+        "delete_item": _delete_item_ctx,
+        "toggle_mode": _toggle_mode_ctx,
+        "change_mode_diagram": _ctx(capability="diagram"),
+        "create_view": _ctx(capability="create_definition"),
+    }
+
+    def check_action(self, action, parameters):
+        ctx = self.ACTION_CONTEXTS.get(action)
+        if ctx is None:
+            return True
+        return ctx(self)
 
     def __init__(self, db_url):
         super().__init__()
@@ -1160,6 +1254,7 @@ class DbMan(App):
                 sql_widget.focus()
                 
         self.update_title()
+        self.refresh_bindings()
 
     def _cursor_type_for_select_mode(self):
         return self.CURSOR_TYPE_BY_SELECT_MODE[self.select_mode]
@@ -1220,6 +1315,7 @@ class DbMan(App):
             modes = [m for m in modes if m != "diagram"]
         idx = modes.index(self.mode)
         self.mode = modes[(idx + 1) % len(modes)]
+        self.refresh_bindings()
         self.refresh_sidebar()
         sidebar_list = self.query_one("#sidebar-list", ListView)
         for i, child in enumerate(sidebar_list.children):
@@ -1242,6 +1338,7 @@ class DbMan(App):
         self.select_mode = self.SELECT_MODES[(idx + 1) % len(self.SELECT_MODES)]
         self.focused.cursor_type = self._cursor_type_for_select_mode()
         self.update_title()
+        self.refresh_bindings()
         self.notify(f"Select mode: {self.select_mode}")
 
     def action_reorder_column(self, direction: int):
@@ -1321,6 +1418,7 @@ class DbMan(App):
             self.notify("Diagram not available for this provider", severity="error")
             return
         self.mode = "diagram"
+        self.refresh_bindings()
         self.refresh_sidebar()
         if self.current_item:
             self.load_item(self.current_item, self.current_type, should_focus=True)
