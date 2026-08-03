@@ -156,7 +156,10 @@ class ShortcutsScreen(ModalScreen):
                 " F: Clear all filters for current table\n"
                 " t: Truncate/Shorten Column data (View mode only)\n"
                 " w: Set/clear column display width (View mode only)\n"
-                " ctrl+x: Delete selected table/view\n",
+                " ctrl+x: Delete selected table/view\n\n"
+                " [bold]Select Mode (View mode only)[/]\n"
+                " s: Rotate select mode: field -> row -> column -> field\n"
+                " option+left / option+right: Reorder selected column (column mode)\n",
                 id="shortcuts-content"
             )
             yield Button("Close", variant="primary", id="close-button")
@@ -876,9 +879,15 @@ class DbMan(App):
         Binding("F", "clear_filters", "Clear Filters"),
         Binding("t", "truncate_column", "Shorten Column"),
         Binding("w", "set_column_width", "Column Width"),
+        Binding("s", "rotate_select_mode", "Select Mode"),
+        Binding("alt+left", "reorder_column(-1)", "Move Column Left", show=False),
+        Binding("alt+right", "reorder_column(1)", "Move Column Right", show=False),
         Binding("]", "next_page", "Next Page", show=False),
         Binding("[", "prev_page", "Prev Page", show=False),
     ]
+
+    SELECT_MODES = ["field", "row", "column"]
+    CURSOR_TYPE_BY_SELECT_MODE = {"field": "cell", "row": "row", "column": "column"}
 
     def __init__(self, db_url):
         super().__init__()
@@ -891,6 +900,7 @@ class DbMan(App):
         self.row_values = {}
         self.column_widths = {}
         self.mode = "view"
+        self.select_mode = "field"
         self.filters = {}
         self.page_size = 500
         self.page_cursor = None
@@ -1074,6 +1084,8 @@ class DbMan(App):
                 ]
                 table_widget.add_rows(rows)
 
+            table_widget.cursor_type = self._cursor_type_for_select_mode() if self.mode == "view" else "cell"
+
             if should_focus:
                 table_widget.focus()
             if saved_coord:
@@ -1090,12 +1102,21 @@ class DbMan(App):
             if should_focus:
                 sql_widget.focus()
                 
+        self.update_title()
+
+    def _cursor_type_for_select_mode(self):
+        return self.CURSOR_TYPE_BY_SELECT_MODE[self.select_mode]
+
+    def update_title(self):
         page_indicator = ""
         if self.mode == "view":
             page_num = len(self.page_history) + 1
             if page_num > 1 or self.page_has_more:
                 page_indicator = f" [page {page_num}{'+' if self.page_has_more else ''}]"
-        self.title = f"dbman - {name} ({self.mode.upper()}){page_indicator}"
+        select_indicator = (
+            f" [{self.select_mode.upper()}]" if self.mode == "view" and self.select_mode != "field" else ""
+        )
+        self.title = f"dbman - {self.current_item} ({self.mode.upper()}){page_indicator}{select_indicator}"
 
     def action_switch_focus(self):
         if self.query_one("#sidebar").display:
@@ -1150,6 +1171,44 @@ class DbMan(App):
                 break
         if self.current_item:
             self.load_item(self.current_item, self.current_type)
+
+    def action_rotate_select_mode(self):
+        """Rotate field -> row -> column -> field. Determines what the cursor
+        selects (via DataTable's native cursor_type) and what mode-dependent
+        action keys (starting with 'e') operate on. See issue #7."""
+        if self.mode != "view":
+            self.notify("Select mode only applies in View mode", severity="error")
+            return
+        if not isinstance(self.focused, DataTable):
+            return
+        idx = self.SELECT_MODES.index(self.select_mode)
+        self.select_mode = self.SELECT_MODES[(idx + 1) % len(self.SELECT_MODES)]
+        self.focused.cursor_type = self._cursor_type_for_select_mode()
+        self.update_title()
+        self.notify(f"Select mode: {self.select_mode}")
+
+    def action_reorder_column(self, direction: int):
+        """option+left/right (alt+left/right) in column select mode: swap the
+        selected column with its neighbor and persist the new order via
+        ViewSettingsStore. Uses alt, not ctrl, because macOS reserves
+        ctrl+left/right for Mission Control space-switching by default."""
+        if self.mode != "view" or self.select_mode != "column":
+            return
+        if not isinstance(self.focused, DataTable) or not self.current_item:
+            return
+        table_widget = self.focused
+        coord = table_widget.cursor_coordinate
+        columns = [c.key.value for c in table_widget.ordered_columns]
+        idx = coord.column
+        new_idx = idx + direction
+        if new_idx < 0 or new_idx >= len(columns):
+            return
+        columns[idx], columns[new_idx] = columns[new_idx], columns[idx]
+        settings = self.view_settings.get(self.current_item)
+        settings.order = columns
+        self.view_settings.save(self.current_item, settings)
+        self.load_item(self.current_item, self.current_type)
+        self.query_one("#data-table", DataTable).move_cursor(row=coord.row, column=new_idx)
 
     def action_change_mode_diagram(self):
         if not self.provider.capabilities.diagram:
@@ -1307,6 +1366,17 @@ class DbMan(App):
             return
         if not isinstance(self.focused, DataTable) or not self.current_item:
             return
+
+        if self.select_mode == "row":
+            if self.provider.capabilities.whole_row_edit:
+                self.action_edit_document()
+            else:
+                self.notify("Row edit not supported for this provider — switch to field mode", severity="error")
+            return
+        if self.select_mode == "column":
+            self.notify("No edit action in column mode (use 't' to shorten, option+left/right to reorder)", severity="error")
+            return
+
         if self.current_type == "view":
             self.notify("Cannot edit Views directly (press 'e' in SQL mode to edit View SQL)", severity="error")
             return
