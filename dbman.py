@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 import sys
-import os
 import traceback
 import math
 import random
 import csv
-from sqlalchemy import create_engine, inspect, text, MetaData, Table, Column, String, Integer, select, update, delete, func
-from sqlalchemy.exc import SQLAlchemyError
+import json
+from sqlalchemy import text
 from textual.app import App, ComposeResult
 from textual.widgets import Header, Footer, DataTable, ListView, ListItem, Label, Static, Button, Input, ContentSwitcher, TextArea
 from textual.containers import Horizontal, Vertical, Center, VerticalScroll
@@ -20,6 +19,11 @@ from rich.text import Text
 
 # Import LookupPlugin from plugins folder
 from plugins.lookup import LookupPlugin, LookupSelectScreen, LookupConfigScreen
+from providers import create_provider
+from view_settings import (
+    ViewSettingsStore, derive_db_name, apply_view_settings,
+    compute_column_widths, truncate_rows,
+)
 
 # ... (rest of imports unchanged) ...
 
@@ -38,19 +42,16 @@ class TableDiagram(Static, can_focus=True):
     def render(self):
         table = RichTable(show_header=False, box=None, padding=(0, 1), expand=True)
         for col in self.columns:
-            name = col["name"]
-            col_type = str(col["type"])
+            name = col.name
+            col_type = col.type_name
             pk_marker = "[bold yellow]*[/]" if name in self.pks else " "
             table.add_row(f"{pk_marker} {name}", f"[dim]{col_type}[/]")
-            
+
         if self.fks:
             table.add_section()
             table.add_row("[italic yellow]Relationships[/]", "")
             for fk in self.fks:
-                ref_table = fk["referred_table"]
-                ref_cols = fk["referred_columns"]
-                cons_cols = fk["constrained_columns"]
-                rel_str = f"{cons_cols[0]} -> {ref_table}({ref_cols[0]})"
+                rel_str = f"{fk.from_column} -> {fk.to_table}({fk.to_column})"
                 table.add_row(f"  [dim]↳[/] {rel_str}", "")
                 
         return Panel(
@@ -144,14 +145,17 @@ class ShortcutsScreen(ModalScreen):
                 " j / k: Move down / up\n"
                 " h / l: Move left / right (Table only)\n"
                 " pgup / pgdn: Page Up / Down (Mac: fn + up / fn + down)\n"
-                " g / G: Home / End\n\n"
+                " g / G: Home / End\n"
+                " ] / [: Next / Previous page of rows (View mode)\n\n"
                 " [bold]Editing & Filtering[/]\n"
                 " e: Edit selected cell (View mode) or SQL (SQL mode)\n"
+                " E: Edit whole document as JSON (document DB providers)\n"
                 " v: Create new View\n"
                 " x: Export current Table/View to CSV\n"
                 " f: Filter selected column (View mode only)\n"
                 " F: Clear all filters for current table\n"
                 " t: Truncate/Shorten Column data (View mode only)\n"
+                " w: Set/clear column display width (View mode only)\n"
                 " ctrl+x: Delete selected table/view\n",
                 id="shortcuts-content"
             )
@@ -332,13 +336,13 @@ class TruncateColumnScreen(ModalScreen):
     
     affected_count = reactive(0)
 
-    def __init__(self, table_name, column, current_max, suggested_len, engine):
+    def __init__(self, table_name, column, current_max, suggested_len, provider):
         super().__init__()
         self.table_name = table_name
         self.column = column
         self.current_max = current_max
         self.suggested_len = suggested_len
-        self.engine = engine
+        self.provider = provider
 
     def compose(self) -> ComposeResult:
         with Vertical(id="truncate-dialog"):
@@ -360,13 +364,8 @@ class TruncateColumnScreen(ModalScreen):
     def update_stats(self, value):
         try:
             target_len = int(value)
-            with self.engine.connect() as conn:
-                metadata = MetaData()
-                table = Table(self.table_name, metadata, autoload_with=self.engine)
-                col = table.c[self.column]
-                stmt = select(func.count()).where(func.length(col) > target_len)
-                count = conn.execute(stmt).scalar()
-                self.query_one("#stats-label").update(f"Will affect [bold red]{count}[/] rows")
+            count = self.provider.count_over_length(self.table_name, self.column, target_len)
+            self.query_one("#stats-label").update(f"Will affect [bold red]{count}[/] rows")
         except:
             self.query_one("#stats-label").update("Invalid length")
 
@@ -379,10 +378,78 @@ class TruncateColumnScreen(ModalScreen):
     def on_input_submitted(self, event: Input.Submitted) -> None:
         self.dismiss(event.value)
 
-class EditSqlScreen(ModalScreen):
-    """A modal screen for editing SQL."""
+class ColumnWidthScreen(ModalScreen):
+    """A modal screen for pinning (or clearing) a column's display width."""
     CSS = """
-    EditSqlScreen {
+    ColumnWidthScreen {
+        background: rgba(0, 0, 0, 0.5);
+        align: center middle;
+    }
+    #width-dialog {
+        background: $panel;
+        border: thick $primary;
+        padding: 1 2;
+        width: 50;
+        height: auto;
+    }
+    Label {
+        margin-bottom: 1;
+        text-style: bold;
+    }
+    Input {
+        margin-bottom: 1;
+    }
+    #width-hint {
+        color: $text-muted;
+        margin-bottom: 1;
+    }
+    #width-buttons {
+        align: right middle;
+    }
+    Button {
+        margin-left: 1;
+    }
+    """
+
+    def __init__(self, column: str, current_width, auto_width: int):
+        super().__init__()
+        self.column = column
+        self.current_width = current_width
+        self.auto_width = auto_width
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="width-dialog"):
+            yield Label(f"Width for '{self.column}'")
+            yield Input(
+                value=str(self.current_width) if self.current_width is not None else "",
+                placeholder=str(self.auto_width),
+                id="width-input",
+            )
+            yield Static(
+                f"Auto width would be {self.auto_width}. Clear the field to remove the override.",
+                id="width-hint",
+            )
+            with Horizontal(id="width-buttons"):
+                yield Button("Cancel", id="cancel-width")
+                yield Button("Apply", variant="success", id="apply-width")
+
+    def on_mount(self):
+        self.query_one(Input).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "apply-width":
+            self.dismiss(self.query_one(Input).value)
+        else:
+            self.dismiss(None)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value)
+
+class EditTextScreen(ModalScreen):
+    """A modal screen for editing a block of text: SQL, a CouchDB view's
+    JS map/reduce definition, or a whole JSON document."""
+    CSS = """
+    EditTextScreen {
         background: rgba(0, 0, 0, 0.5);
         align: center middle;
     }
@@ -408,15 +475,16 @@ class EditSqlScreen(ModalScreen):
         margin-left: 1;
     }
     """
-    def __init__(self, title, initial_sql=""):
+    def __init__(self, title, initial_text="", language="sql"):
         super().__init__()
         self.title_text = title
-        self.initial_sql = initial_sql
+        self.initial_text = initial_text
+        self.language = language
 
     def compose(self) -> ComposeResult:
         with Vertical(id="edit-sql-dialog"):
             yield Label(self.title_text)
-            yield TextArea(self.initial_sql, id="sql-editor", language="sql")
+            yield TextArea(self.initial_text, id="sql-editor", language=self.language)
             with Horizontal(id="edit-sql-buttons"):
                 yield Button("Cancel", id="cancel-edit-sql")
                 yield Button("Execute", variant="success", id="apply-edit-sql")
@@ -498,35 +566,30 @@ class SidebarHeader(ListItem):
 class DiagramView(VerticalScroll, can_focus=True):
     """A container for displaying table diagrams using a force-directed layout."""
     
-    def __init__(self, engine, **kwargs):
+    def __init__(self, provider, **kwargs):
         super().__init__(**kwargs)
-        self.engine = engine
-        self._inspector = None
+        self.provider = provider
         self.positions = {}
         self.edges = []
         self.width = 150
         self.height = 50
 
-    @property
-    def inspector(self):
-        if self._inspector is None:
-            self._inspector = inspect(self.engine)
-        return self._inspector
-
     def get_saved_positions(self):
         saved = {}
         try:
-            with self.engine.connect() as conn:
+            engine = self.provider.sqlalchemy_engine()
+            with engine.connect() as conn:
                 res = conn.execute(text("SELECT table_name, x, y FROM _dbman_layout"))
                 for row in res:
                     saved[row[0]] = [row[1], row[2]]
         except Exception:
-            pass # Table probably doesn't exist
+            pass # Table probably doesn't exist, or provider has no diagram-position storage
         return saved
 
     def save_position(self, table_name, x, y):
         try:
-            with self.engine.connect() as conn:
+            engine = self.provider.sqlalchemy_engine()
+            with engine.connect() as conn:
                 conn.execute(text("CREATE TABLE IF NOT EXISTS _dbman_layout (table_name TEXT PRIMARY KEY, x INTEGER, y INTEGER)"))
                 conn.execute(text("DELETE FROM _dbman_layout WHERE table_name = :name"), {"name": table_name})
                 conn.execute(text("INSERT INTO _dbman_layout (table_name, x, y) VALUES (:name, :x, :y)"), 
@@ -658,34 +721,37 @@ class DiagramView(VerticalScroll, can_focus=True):
 
     def refresh_diagram(self):
         try:
-            self._inspector = inspect(self.engine)
-            tables = self.inspector.get_table_names()
-            
+            if not self.provider.capabilities.diagram:
+                self.query(TableDiagram).remove()
+                bg_query = self.query(".diagram-bg")
+                msg = "Diagram not available for this provider."
+                if bg_query:
+                    bg_query.first().update(msg)
+                else:
+                    self.mount(Static(msg, classes="diagram-bg"))
+                return
+
             # Remove existing diagrams
             self.query(TableDiagram).remove()
-            
+
+            model = self.provider.get_diagram_model()
+
             table_widgets = []
             nodes = []
             edges = []
 
-            for table_name in sorted(tables):
-                if table_name.startswith("sqlite_") or table_name.startswith("_dbman_"):
-                    continue
-                
-                columns = self.inspector.get_columns(table_name)
-                pk_constraint = self.inspector.get_pk_constraint(table_name)
-                pks = pk_constraint.get("constrained_columns", [])
-                fks = self.inspector.get_foreign_keys(table_name)
-                
-                table_widgets.append(TableDiagram(table_name, columns, pks, fks))
-                nodes.append(table_name)
-                for fk in fks:
-                    edges.append((table_name, fk["referred_table"]))
-            
+            for node in model.nodes:
+                node_fks = [e for e in model.edges if e.from_table == node.name]
+                table_widgets.append(TableDiagram(node.name, node.columns, node.primary_keys, node_fks))
+                nodes.append(node.name)
+
+            for e in model.edges:
+                edges.append((e.from_table, e.to_table))
+
             self.width = max(self.app.console.size.width, 150)
             self.height = max(self.app.console.size.height, 50)
             self.edges = edges
-            
+
             if not table_widgets:
                 bg_text = "No tables found."
             else:
@@ -803,127 +869,57 @@ class DbMan(App):
         Binding("?", "toggle_shortcuts", "Shortcuts", show=False),
         Binding("ctrl+p", "toggle_shortcuts", "Shortcuts"),
         Binding("e", "edit_cell", "Edit Cell"),
+        Binding("E", "edit_document", "Edit Document", show=False),
         Binding("v", "create_view", "Create View"),
         Binding("x", "export_csv", "Export CSV"),
         Binding("f", "filter_column", "Filter Column"),
         Binding("F", "clear_filters", "Clear Filters"),
         Binding("t", "truncate_column", "Shorten Column"),
+        Binding("w", "set_column_width", "Column Width"),
+        Binding("]", "next_page", "Next Page", show=False),
+        Binding("[", "prev_page", "Prev Page", show=False),
     ]
 
     def __init__(self, db_url):
         super().__init__()
-        # If db_url is a file path, assume sqlite
-        if not (db_url.startswith("sqlite://") or db_url.startswith("postgresql://") or db_url.startswith("mysql://")):
-             db_url = f"sqlite:///{os.path.abspath(db_url)}"
-        
         self.db_url = db_url
         self.current_item = None
-        self.current_type = None 
-        self.has_rowid = False
-        self.mode = "view" 
+        self.current_type = None
+        self.rows_editable = False
+        self.row_keys = {}
+        self.raw_docs = {}
+        self.row_values = {}
+        self.column_widths = {}
+        self.mode = "view"
         self.filters = {}
+        self.page_size = 500
+        self.page_cursor = None
+        self.page_history = []
+        self.page_has_more = False
+        self._next_cursor = None
         try:
-            self.engine = create_engine(db_url)
-            self.inspector = inspect(self.engine)
-            self.lookup_plugin = LookupPlugin(self.engine)
+            self.provider = create_provider(db_url)
+            self.lookup_plugin = (
+                LookupPlugin(self.provider.sqlalchemy_engine())
+                if self.provider.capabilities.lookup_plugin else None
+            )
+            self.view_settings = ViewSettingsStore(derive_db_name(db_url))
         except Exception as e:
             print(f"Error connecting to database: {e}")
             sys.exit(1)
 
     def get_tables(self):
-        tables = self.inspector.get_table_names()
-        return [t for t in tables if not t.startswith("sqlite_") and not t.startswith("_dbman_")]
+        return self.provider.list_tables()
 
     def get_views(self):
-        return self.inspector.get_view_names()
+        return self.provider.list_views()
 
-    def build_filter_clause(self, table_obj):
-        clauses = []
-        for col_name, val in self.filters.items():
-            col = table_obj.c[col_name]
-            if val.lower() == "null":
-                clauses.append(col.is_(None))
-            elif val.lower() == "empty":
-                clauses.append((col.is_(None)) | (col == ""))
-            else:
-                clauses.append(col.like(f"%{val}%"))
-        return clauses
-
-    def get_item_data(self, name, item_type, limit=2000):
-        if item_type == "plugin":
-            if name == "lookup":
-                columns = ["Table", "ForeignKeyField", "RelatedTable", "RelatedKey", "LookupField"]
-                rows = self.lookup_plugin.get_config_data()
-                return columns, rows, False
-            return [], [], False
-
-        metadata = MetaData()
-        table = Table(name, metadata, autoload_with=self.engine)
-        columns = [c.name for c in table.columns]
-        
-        has_rowid = False
-        if self.engine.dialect.name == "sqlite":
-             # Rowid check is tricky with SQLAlchemy Core for reflected tables
-             # We'll just try to select it if it's a table
-             if item_type == "table":
-                 has_rowid = True # Default to true for sqlite tables, handled in try/except later
-
-        with self.engine.connect() as conn:
-            stmt = select(table)
-            filter_clauses = self.build_filter_clause(table)
-            if filter_clauses:
-                stmt = stmt.where(*filter_clauses)
-            
-            if limit:
-                stmt = stmt.limit(limit)
-            
-            if item_type == "table" and self.engine.dialect.name == "sqlite":
-                try:
-                    # Try to select rowid explicitly for sqlite
-                    rowid_stmt = select(text("rowid"), table)
-                    if limit:
-                        rowid_stmt = rowid_stmt.limit(limit)
-                    if filter_clauses:
-                         rowid_stmt = rowid_stmt.where(*filter_clauses)
-                    
-                    result = conn.execute(rowid_stmt)
-                    rows = [list(row) for row in result]
-                    return columns, rows, True
-                except:
-                    has_rowid = False
-
-            result = conn.execute(stmt)
-            rows = [list(row) for row in result]
-            return columns, rows, has_rowid
-
-    def get_schema_data(self, name):
-        columns_info = self.inspector.get_columns(name)
-        rows = []
-        for col in columns_info:
-            rows.append((
-                col.get("name"),
-                str(col.get("type")),
-                "NOT NULL" if not col.get("nullable") else "NULL",
-                str(col.get("default")) if col.get("default") is not None else "",
-                "PK" if col.get("primary_key") else ""
-            ))
-        columns = ["name", "type", "nullable", "default", "pk"]
-        return columns, rows
-
-    def get_sql_data(self, name):
-        # SQLAlchemy doesn't provide a cross-db "get CREATE SQL" easily
-        # For SQLite/Postgres/MySQL we might have to use dialect specific queries
-        try:
-            if self.engine.dialect.name == "sqlite":
-                with self.engine.connect() as conn:
-                    res = conn.execute(text("SELECT sql FROM sqlite_master WHERE name = :name"), {"name": name}).fetchone()
-                    return res[0] if res else "Not found"
-            elif self.engine.dialect.name == "postgresql":
-                # Very basic view/table definition fetch
-                return f"-- SQL View/Table definition for {name} (Postgres support limited)"
-            return f"-- SQL View/Table definition for {name}"
-        except Exception as e:
-            return f"Error fetching SQL: {e}"
+    def get_plugin_data(self, name):
+        if name == "lookup":
+            columns = ["Table", "ForeignKeyField", "RelatedTable", "RelatedKey", "LookupField"]
+            rows = self.lookup_plugin.get_config_data()
+            return columns, rows
+        return [], []
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -933,7 +929,7 @@ class DbMan(App):
             with ContentSwitcher(initial="data-table"):
                 yield DataTable(id="data-table")
                 yield Static("", id="sql-view")
-                yield DiagramView(self.engine, id="diagram-view")
+                yield DiagramView(self.provider, id="diagram-view")
         yield Footer()
 
     def on_mount(self):
@@ -946,7 +942,7 @@ class DbMan(App):
         
         views = self.get_views()
         tables = self.get_tables()
-        plugins = ["lookup"]
+        plugins = ["lookup"] if self.lookup_plugin else []
         
         mode_suffix = f" ({self.mode.upper()})"
         
@@ -968,16 +964,23 @@ class DbMan(App):
             elif tables:
                 self.load_item(tables[0], "table")
 
+    def reset_paging(self):
+        self.page_cursor = None
+        self.page_history = []
+        self.page_has_more = False
+
     def on_list_view_selected(self, event: ListView.Selected):
         item = event.item
         if isinstance(item, DbItem):
             self.filters = {}
+            self.reset_paging()
             self.load_item(item.item_name, item.item_type, should_focus=True)
 
     def on_list_view_highlighted(self, event: ListView.Highlighted):
         item = event.item
         if isinstance(item, DbItem):
             self.filters = {}
+            self.reset_paging()
             self.load_item(item.item_name, item.item_type, should_focus=False)
 
     def load_item(self, name, item_type, should_focus=False):
@@ -1007,30 +1010,70 @@ class DbMan(App):
             switcher.current = "data-table"
             table_widget.clear(columns=True)
             
-            if self.mode == "view" or item_type == "plugin":
-                columns, rows, has_rowid = self.get_item_data(name, item_type)
-                self.has_rowid = has_rowid
-                
-                for i, col in enumerate(columns):
-                    color = COLORS[i % len(COLORS)]
-                    label = f"[{color}]{col}[/]"
-                    if col in self.filters:
-                        label = f"[reverse]{label} (F)[/]"
-                    table_widget.add_column(label, key=col)
-                
-                for i, row in enumerate(rows):
-                    if has_rowid:
-                        table_widget.add_row(*row[1:], key=str(row[0]))
-                    else:
-                        table_widget.add_row(*row, key=str(i))
-            else:
-                # Schema mode
-                columns, rows = self.get_schema_data(name)
+            if item_type == "plugin":
+                self.row_keys = {}
+                self.raw_docs = {}
+                self.row_values = {}
+                self.rows_editable = False
+                self.page_has_more = False
+                columns, rows = self.get_plugin_data(name)
                 for i, col in enumerate(columns):
                     color = COLORS[i % len(COLORS)]
                     table_widget.add_column(f"[{color}]{col}[/]", key=col)
+                for i, row in enumerate(rows):
+                    table_widget.add_row(*row, key=str(i))
+            elif self.mode == "view":
+                page = self.provider.get_page(name, item_type, self.filters, cursor=self.page_cursor, page_size=self.page_size)
+                self.page_has_more = page.has_more
+                self._next_cursor = page.next_cursor
+                self.row_keys = {}
+                self.raw_docs = {}
+                self.row_values = {}
+                self.rows_editable = bool(page.row_keys) and page.row_keys[0].value is not None
+
+                view_settings = self.view_settings.get(name)
+                display_columns, display_rows = apply_view_settings(page.columns, page.rows, view_settings)
+                column_widths = compute_column_widths(display_columns, display_rows, view_settings)
+                self.column_widths = column_widths
+                rendered_rows = truncate_rows(display_columns, display_rows, column_widths)
+
+                for i, col in enumerate(display_columns):
+                    color = COLORS[i % len(COLORS)]
+                    label = f"[{color}]{col.name}[/]"
+                    if col.name in self.filters:
+                        label = f"[reverse]{label} (F)[/]"
+                    table_widget.add_column(label, key=col.name, width=column_widths[col.name])
+
+                for i, (row, rendered_row, row_key) in enumerate(zip(display_rows, rendered_rows, page.row_keys)):
+                    if row_key.value is None:
+                        key_str = str(i)
+                    elif isinstance(row_key.value, dict):
+                        key_str = json.dumps(row_key.value, sort_keys=True)
+                    else:
+                        key_str = str(row_key.value)
+                    self.row_keys[key_str] = row_key
+                    self.row_values[key_str] = dict(zip((c.name for c in display_columns), row))
+                    if page.raw_rows is not None:
+                        self.raw_docs[key_str] = page.raw_rows[i]
+                    table_widget.add_row(*rendered_row, key=key_str)
+            else:
+                # Schema mode
+                self.row_keys = {}
+                self.raw_docs = {}
+                self.row_values = {}
+                self.rows_editable = False
+                self.page_has_more = False
+                schema_cols = self.provider.get_schema(name, item_type)
+                columns = ["name", "type", "nullable", "default", "pk"]
+                for i, col in enumerate(columns):
+                    color = COLORS[i % len(COLORS)]
+                    table_widget.add_column(f"[{color}]{col}[/]", key=col)
+                rows = [
+                    (c.name, c.type_name, "NOT NULL" if not c.nullable else "NULL", c.default or "", "PK" if c.primary_key else "")
+                    for c in schema_cols
+                ]
                 table_widget.add_rows(rows)
-                
+
             if should_focus:
                 table_widget.focus()
             if saved_coord:
@@ -1042,12 +1085,17 @@ class DbMan(App):
             # SQL mode
             sidebar.display = True
             switcher.current = "sql-view"
-            sql_text = self.get_sql_data(name)
+            sql_text = self.provider.get_definition(name, item_type)
             sql_widget.update(sql_text)
             if should_focus:
                 sql_widget.focus()
                 
-        self.title = f"dbman - {name} ({self.mode.upper()})"
+        page_indicator = ""
+        if self.mode == "view":
+            page_num = len(self.page_history) + 1
+            if page_num > 1 or self.page_has_more:
+                page_indicator = f" [page {page_num}{'+' if self.page_has_more else ''}]"
+        self.title = f"dbman - {name} ({self.mode.upper()}){page_indicator}"
 
     def action_switch_focus(self):
         if self.query_one("#sidebar").display:
@@ -1090,6 +1138,8 @@ class DbMan(App):
             self.notify("Plugins only have View mode", severity="error")
             return
         modes = ["view", "schema", "sql", "diagram"]
+        if not self.provider.capabilities.diagram:
+            modes = [m for m in modes if m != "diagram"]
         idx = modes.index(self.mode)
         self.mode = modes[(idx + 1) % len(modes)]
         self.refresh_sidebar()
@@ -1102,6 +1152,9 @@ class DbMan(App):
             self.load_item(self.current_item, self.current_type)
 
     def action_change_mode_diagram(self):
+        if not self.provider.capabilities.diagram:
+            self.notify("Diagram not available for this provider", severity="error")
+            return
         self.mode = "diagram"
         self.refresh_sidebar()
         if self.current_item:
@@ -1120,6 +1173,9 @@ class DbMan(App):
             return
         if not isinstance(self.focused, DataTable) or not self.current_item:
             return
+        if not self.provider.is_filterable(self.current_type):
+            self.notify("Filtering not available for this item", severity="error")
+            return
         coord = self.focused.cursor_coordinate
         column_name = self.focused.ordered_columns[coord.column].key.value
         current_filter = self.filters.get(column_name, "")
@@ -1129,18 +1185,42 @@ class DbMan(App):
                     self.filters.pop(column_name, None)
                 else:
                     self.filters[column_name] = val
+                self.reset_paging()
                 self.load_item(self.current_item, self.current_type)
         self.push_screen(FilterColumnScreen(column_name, current_filter), apply_filter)
 
     def action_clear_filters(self):
         self.filters = {}
+        self.reset_paging()
         if self.current_item:
             self.load_item(self.current_item, self.current_type)
         self.notify("All filters cleared")
 
+    def action_next_page(self):
+        if self.mode != "view" or not self.current_item:
+            return
+        if not self.page_has_more:
+            self.notify("No more rows")
+            return
+        self.page_history.append(self.page_cursor)
+        self.page_cursor = self._next_cursor
+        self.load_item(self.current_item, self.current_type)
+
+    def action_prev_page(self):
+        if self.mode != "view" or not self.current_item:
+            return
+        if not self.page_history:
+            self.notify("Already at first page")
+            return
+        self.page_cursor = self.page_history.pop()
+        self.load_item(self.current_item, self.current_type)
+
     def action_delete_item(self):
         if self.current_type == "plugin":
             self.notify("Cannot delete Plugins", severity="error")
+            return
+        if not self.provider.capabilities.delete_item:
+            self.notify("Deleting is not available for this provider", severity="error")
             return
         sidebar_list = self.query_one("#sidebar-list", ListView)
         if self.focused and self.focused.id == "sidebar-list":
@@ -1158,9 +1238,7 @@ class DbMan(App):
         def on_confirm(do_delete):
             if do_delete:
                 try:
-                    metadata = MetaData()
-                    table = Table(name, metadata, autoload_with=self.engine)
-                    table.drop(self.engine)
+                    self.provider.delete_item(name, item_type)
                     self.notify(f"{item_type.capitalize()} '{name}' deleted")
                     self.refresh_sidebar()
                 except Exception as e:
@@ -1211,12 +1289,12 @@ class DbMan(App):
             self.action_edit_sql()
             return
 
-        if self.current_type == "plugin" and self.current_item == "lookup":
+        if self.current_type == "plugin" and self.current_item == "lookup" and self.lookup_plugin:
             coord = self.focused.cursor_coordinate
             row_vals = self.focused.get_row_at(coord.row)
             table, fk_col, rel_table, rel_key, current_lookup = row_vals
-            
-            cols = [c["name"] for c in self.inspector.get_columns(rel_table)]
+
+            cols = [c.name for c in self.provider.get_schema(rel_table, "table")]
             def save_lookup(val):
                 if val:
                     self.lookup_plugin.save_config(table, fk_col, rel_table, rel_key, val)
@@ -1232,38 +1310,35 @@ class DbMan(App):
         if self.current_type == "view":
             self.notify("Cannot edit Views directly (press 'e' in SQL mode to edit View SQL)", severity="error")
             return
-        if not self.has_rowid:
+        if not self.rows_editable:
             self.notify("Cannot edit tables without identifiable rows (yet)", severity="error")
             return
 
         coord = self.focused.cursor_coordinate
         column_name = self.focused.ordered_columns[coord.column].key.value
-        row_id = list(self.focused.rows.values())[coord.row].key.value
-        current_value = self.focused.get_cell_at(coord)
+        row_id_str = list(self.focused.rows.values())[coord.row].key.value
+        row_key = self.row_keys.get(row_id_str)
+        # Prefer the untruncated value: the DataTable cell may hold a
+        # display-only ".."-truncated string (see view_settings.truncate_rows).
+        current_value = self.row_values.get(row_id_str, {}).get(column_name, self.focused.get_cell_at(coord))
 
-        lookup_conf = self.lookup_plugin.get_lookup_config(self.current_item, column_name)
+        if row_key is None or row_key.value is None:
+            self.notify("Cannot edit tables without identifiable rows (yet)", severity="error")
+            return
+
+        if self.provider.capabilities.whole_row_edit and isinstance(current_value, (dict, list)):
+            self.action_edit_document()
+            return
+
+        lookup_conf = self.lookup_plugin.get_lookup_config(self.current_item, column_name) if self.lookup_plugin else None
         if lookup_conf:
             rel_table, rel_key, display_col = lookup_conf
-            
-            with self.engine.connect() as conn:
-                metadata = MetaData()
-                rt = Table(rel_table, metadata, autoload_with=self.engine)
-                res = conn.execute(select(rt.c[rel_key], rt.c[display_col]))
-                options = [(str(r[1]), r[0]) for r in res]
-            
+            options = self.provider.get_lookup_options(rel_table, rel_key, display_col)
+
             def perform_lookup_update(new_val):
                 if new_val is not None:
                     try:
-                        with self.engine.connect() as conn:
-                             metadata = MetaData()
-                             t = Table(self.current_item, metadata, autoload_with=self.engine)
-                             if self.engine.dialect.name == "sqlite":
-                                 stmt = update(t).where(text("rowid = :rid")).values({column_name: new_val})
-                                 conn.execute(stmt, {"rid": row_id})
-                             else:
-                                 # Fallback for non-sqlite would need PK logic
-                                 pass
-                             conn.commit()
+                        self.provider.update_cell(self.current_item, self.current_type, row_key, column_name, new_val)
                         self.notify("Updated")
                         self.load_item(self.current_item, self.current_type)
                     except Exception as e:
@@ -1280,62 +1355,83 @@ class DbMan(App):
                     try:
                         if "." in new_value: typed_value = float(new_value)
                         else: typed_value = int(new_value)
-                    except ValueError: pass 
+                    except ValueError: pass
                 try:
-                    with self.engine.connect() as conn:
-                         metadata = MetaData()
-                         t = Table(self.current_item, metadata, autoload_with=self.engine)
-                         if self.engine.dialect.name == "sqlite":
-                             stmt = update(t).where(text("rowid = :rid")).values({column_name: typed_value})
-                             conn.execute(stmt, {"rid": row_id})
-                         else:
-                             # PK logic needed for non-sqlite
-                             pass
-                         conn.commit()
+                    self.provider.update_cell(self.current_item, self.current_type, row_key, column_name, typed_value)
                     self.notify("Updated")
                     self.load_item(self.current_item, self.current_type)
                 except Exception as e:
                     self.notify(f"Update failed: {e}", severity="error")
         self.push_screen(EditCellScreen(current_value), perform_update)
 
+    def action_edit_document(self):
+        if self.mode != "view" or not self.provider.capabilities.whole_row_edit:
+            self.notify("Whole-document editing is not available for this provider", severity="error")
+            return
+        if not isinstance(self.focused, DataTable) or not self.current_item:
+            return
+
+        coord = self.focused.cursor_coordinate
+        row_id_str = list(self.focused.rows.values())[coord.row].key.value
+        row_key = self.row_keys.get(row_id_str)
+        raw_doc = self.raw_docs.get(row_id_str)
+        if row_key is None or raw_doc is None:
+            self.notify("Cannot edit this row", severity="error")
+            return
+
+        def save_document(new_json_text):
+            if new_json_text:
+                try:
+                    self.provider.update_row_json(self.current_item, self.current_type, row_key, new_json_text)
+                    self.notify("Document updated")
+                    self.load_item(self.current_item, self.current_type)
+                except Exception as e:
+                    self.notify(f"Update failed: {e}", severity="error")
+
+        doc_id = row_key.value.get("_id") if isinstance(row_key.value, dict) else row_id_str
+        self.push_screen(
+            EditTextScreen(f"Edit Document: {doc_id}", json.dumps(raw_doc, indent=2), language="json"),
+            save_document,
+        )
+
     def action_edit_sql(self):
         if self.current_type != "view":
             self.notify("Can only edit SQL of Views", severity="error")
             return
-        
-        current_sql = self.get_sql_data(self.current_item)
-        
+        if not self.provider.capabilities.create_definition:
+            self.notify("Editing definitions is not available for this provider", severity="error")
+            return
+
+        current_sql = self.provider.get_definition(self.current_item, self.current_type)
+
         def execute_sql(new_sql):
             if new_sql:
                 try:
-                    with self.engine.connect() as conn:
-                        # SQLite specific DROP then CREATE
-                        if self.current_type == "view" and self.engine.dialect.name == "sqlite":
-                             conn.execute(text(f"DROP VIEW IF EXISTS {self.current_item}"))
-                        
-                        conn.execute(text(new_sql))
-                        conn.commit()
-                        self.notify("SQL Executed Successfully")
-                        self.refresh_sidebar()
-                        self.load_item(self.current_item, self.current_type)
+                    self.provider.update_view_definition(self.current_item, new_sql)
+                    self.notify("SQL Executed Successfully")
+                    self.refresh_sidebar()
+                    self.load_item(self.current_item, self.current_type)
                 except Exception as e:
                     self.notify(f"SQL Error: {e}", severity="error")
         
-        self.push_screen(EditSqlScreen(f"Edit View: {self.current_item}", current_sql), execute_sql)
+        language = self.provider.definition_language(self.current_type)
+        self.push_screen(EditTextScreen(f"Edit View: {self.current_item}", current_sql, language=language), execute_sql)
 
     def action_create_view(self):
-        default_sql = "CREATE VIEW new_view AS\nSELECT * FROM table_name"
+        if not self.provider.capabilities.create_definition:
+            self.notify("Creating views is not available for this provider", severity="error")
+            return
+        default_sql = self.provider.default_definition_template()
         def execute_create(new_sql):
             if new_sql:
                 try:
-                    with self.engine.connect() as conn:
-                        conn.execute(text(new_sql))
-                        conn.commit()
-                        self.notify("View Created")
-                        self.refresh_sidebar()
+                    self.provider.create_view(new_sql)
+                    self.notify("View Created")
+                    self.refresh_sidebar()
                 except Exception as e:
                     self.notify(f"Creation failed: {e}", severity="error")
-        self.push_screen(EditSqlScreen("Create New View", default_sql), execute_create)
+        language = self.provider.definition_language("view")
+        self.push_screen(EditTextScreen("Create New View", default_sql, language=language), execute_create)
 
     def action_export_csv(self):
         if not self.current_item:
@@ -1346,7 +1442,12 @@ class DbMan(App):
         def do_export(filename):
             if filename:
                 try:
-                    columns, rows, _ = self.get_item_data(self.current_item, self.current_type, limit=None)
+                    if self.current_type == "plugin":
+                        columns, rows = self.get_plugin_data(self.current_item)
+                    else:
+                        page = self.provider.get_page(self.current_item, self.current_type, self.filters, cursor=None, page_size=None)
+                        columns = [c.name for c in page.columns]
+                        rows = page.rows
                     with open(filename, 'w', newline='') as f:
                         writer = csv.writer(f)
                         writer.writerow(columns)
@@ -1366,20 +1467,19 @@ class DbMan(App):
         if self.current_type == "view":
             self.notify("Cannot truncate Views directly", severity="error")
             return
+        if not self.provider.capabilities.truncate_column:
+            self.notify("Truncate is not available for this provider", severity="error")
+            return
         coord = self.focused.cursor_coordinate
         column_name = self.focused.ordered_columns[coord.column].key.value
-        
+
         try:
-            with self.engine.connect() as conn:
-                metadata = MetaData()
-                t = Table(self.current_item, metadata, autoload_with=self.engine)
-                col = t.c[column_name]
-                max_len = conn.execute(select(func.max(func.length(col)))).scalar() or 0
-                suggested = 50 if max_len > 50 else max_len
+            max_len = self.provider.get_max_length(self.current_item, column_name)
+            suggested = 50 if max_len > 50 else max_len
         except Exception as e:
             self.notify(f"Error checking column: {e}", severity="error")
             return
-            
+
         def perform_truncate(target_len_str):
             if target_len_str is not None:
                 try:
@@ -1390,20 +1490,50 @@ class DbMan(App):
                 def do_it(confirm):
                     if confirm:
                         try:
-                            with self.engine.connect() as conn:
-                                metadata = MetaData()
-                                t = Table(self.current_item, metadata, autoload_with=self.engine)
-                                col = t.c[column_name]
-                                # SQLite specific substr for now, but SQLAlchemy can abstract it
-                                stmt = update(t).values({column_name: func.substr(col, 1, target_len)})
-                                conn.execute(stmt)
-                                conn.commit()
+                            self.provider.truncate_column(self.current_item, column_name, target_len)
                             self.notify(f"Truncated column to {target_len} chars")
                             self.load_item(self.current_item, self.current_type)
                         except Exception as e:
                             self.notify(f"Truncate failed: {e}", severity="error")
                 self.push_screen(ConfirmScreen(f"Truncate ALL values in '{column_name}' to {target_len}?", "Apply"), do_it)
-        self.push_screen(TruncateColumnScreen(self.current_item, column_name, max_len, suggested, self.engine), perform_truncate)
+        self.push_screen(TruncateColumnScreen(self.current_item, column_name, max_len, suggested, self.provider), perform_truncate)
+
+    def action_set_column_width(self):
+        """Pin (or clear) a display-only column width, persisted via
+        ViewSettingsStore. Distinct from action_truncate_column, which
+        mutates the underlying data rather than just how it's displayed."""
+        if self.mode != "view":
+            self.notify("Column width only allowed in View mode", severity="error")
+            return
+        if not isinstance(self.focused, DataTable) or not self.current_item:
+            return
+        coord = self.focused.cursor_coordinate
+        column_name = self.focused.ordered_columns[coord.column].key.value
+
+        settings = self.view_settings.get(self.current_item)
+        current_override = settings.widths.get(column_name)
+        auto_width = self.column_widths.get(column_name, current_override or 20)
+
+        def apply_width(value):
+            if value is None:
+                return
+            value = value.strip()
+            settings = self.view_settings.get(self.current_item)
+            if value == "":
+                settings.widths.pop(column_name, None)
+            else:
+                try:
+                    width = int(value)
+                    if width < 1:
+                        raise ValueError
+                except ValueError:
+                    self.notify("Width must be a positive integer", severity="error")
+                    return
+                settings.widths[column_name] = width
+            self.view_settings.save(self.current_item, settings)
+            self.load_item(self.current_item, self.current_type)
+
+        self.push_screen(ColumnWidthScreen(column_name, current_override, auto_width), apply_width)
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
