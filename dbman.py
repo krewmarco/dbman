@@ -7,7 +7,7 @@ import csv
 import json
 from sqlalchemy import text
 from textual.app import App, ComposeResult
-from textual.widgets import Header, Footer, DataTable, ListView, ListItem, Label, Static, Button, Input, ContentSwitcher, TextArea
+from textual.widgets import Header, Footer, DataTable, ListView, ListItem, Label, Static, Button, Input, ContentSwitcher, TextArea, Select
 from textual.containers import Horizontal, Vertical, Center, VerticalScroll
 from textual.binding import Binding
 from textual.screen import ModalScreen
@@ -159,7 +159,9 @@ class ShortcutsScreen(ModalScreen):
                 " ctrl+x: Delete selected table/view\n\n"
                 " [bold]Select Mode (View mode only)[/]\n"
                 " s: Rotate select mode: field -> row -> column -> field\n"
-                " option+left / option+right: Reorder selected column (column mode)\n",
+                " option+left / option+right: Reorder selected column (column mode)\n"
+                " z: Hide selected column (column mode)\n"
+                " u: Unhide a column (pick from hidden list)\n",
                 id="shortcuts-content"
             )
             yield Button("Close", variant="primary", id="close-button")
@@ -447,6 +449,59 @@ class ColumnWidthScreen(ModalScreen):
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         self.dismiss(event.value)
+
+class UnhideColumnScreen(ModalScreen):
+    """A modal screen for picking a hidden column to bring back. Mode-
+    independent (unlike hiding, which is column-select-mode-scoped) since a
+    hidden column isn't reachable via column-mode cursor selection."""
+    CSS = """
+    UnhideColumnScreen {
+        background: rgba(0, 0, 0, 0.5);
+        align: center middle;
+    }
+    #unhide-dialog {
+        background: $panel;
+        border: thick $primary;
+        padding: 1 2;
+        width: 50;
+        height: auto;
+    }
+    Label {
+        margin-bottom: 1;
+        text-style: bold;
+    }
+    Select {
+        margin-bottom: 1;
+    }
+    #unhide-buttons {
+        align: right middle;
+    }
+    Button {
+        margin-left: 1;
+    }
+    """
+
+    def __init__(self, hidden_columns: list[str]):
+        super().__init__()
+        self.hidden_columns = hidden_columns
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="unhide-dialog"):
+            yield Label("Unhide column")
+            yield Select(
+                [(c, c) for c in self.hidden_columns],
+                value=self.hidden_columns[0],
+                id="unhide-select",
+            )
+            with Horizontal(id="unhide-buttons"):
+                yield Button("Cancel", id="cancel-unhide")
+                yield Button("Unhide", variant="success", id="apply-unhide")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "apply-unhide":
+            self.dismiss(self.query_one(Select).value)
+        else:
+            self.dismiss(None)
 
 class EditTextScreen(ModalScreen):
     """A modal screen for editing a block of text: SQL, a CouchDB view's
@@ -880,6 +935,8 @@ class DbMan(App):
         Binding("t", "truncate_column", "Shorten Column"),
         Binding("w", "set_column_width", "Column Width"),
         Binding("s", "rotate_select_mode", "Select Mode"),
+        Binding("z", "hide_column", "Hide Column"),
+        Binding("u", "unhide_column", "Unhide Column"),
         Binding("alt+left", "reorder_column(-1)", "Move Column Left", show=False),
         Binding("alt+right", "reorder_column(1)", "Move Column Right", show=False),
         Binding("]", "next_page", "Next Page", show=False),
@@ -1209,6 +1266,55 @@ class DbMan(App):
         self.view_settings.save(self.current_item, settings)
         self.load_item(self.current_item, self.current_type)
         self.query_one("#data-table", DataTable).move_cursor(row=coord.row, column=new_idx)
+
+    def action_hide_column(self):
+        """'z' in column select mode: hide the column-mode-selected column
+        from the rendered DataTable (it stays in the underlying RowPage/model
+        and is unaffected in any other select mode). Persisted per table/view
+        via ViewSettingsStore. See issue #2."""
+        if self.mode != "view":
+            self.notify("Hide column only allowed in View mode", severity="error")
+            return
+        if self.select_mode != "column":
+            self.notify("Hide column only allowed in column select mode (press 's' to rotate)", severity="error")
+            return
+        if not isinstance(self.focused, DataTable) or not self.current_item:
+            return
+        if len(self.focused.ordered_columns) <= 1:
+            self.notify("Cannot hide the last visible column", severity="error")
+            return
+        coord = self.focused.cursor_coordinate
+        column_name = self.focused.ordered_columns[coord.column].key.value
+
+        settings = self.view_settings.get(self.current_item)
+        if column_name not in settings.hidden:
+            settings.hidden.append(column_name)
+        self.view_settings.save(self.current_item, settings)
+        self.notify(f"Hid column '{column_name}'")
+        self.load_item(self.current_item, self.current_type)
+
+    def action_unhide_column(self):
+        """'u', mode-independent: pick a previously hidden column to bring
+        back. See issue #2."""
+        if self.mode != "view" or not self.current_item:
+            self.notify("Unhide only allowed in View mode", severity="error")
+            return
+
+        settings = self.view_settings.get(self.current_item)
+        if not settings.hidden:
+            self.notify("No hidden columns")
+            return
+
+        def do_unhide(column_name):
+            if column_name:
+                settings = self.view_settings.get(self.current_item)
+                if column_name in settings.hidden:
+                    settings.hidden.remove(column_name)
+                    self.view_settings.save(self.current_item, settings)
+                    self.notify(f"Unhid column '{column_name}'")
+                    self.load_item(self.current_item, self.current_type)
+
+        self.push_screen(UnhideColumnScreen(list(settings.hidden)), do_unhide)
 
     def action_change_mode_diagram(self):
         if not self.provider.capabilities.diagram:
