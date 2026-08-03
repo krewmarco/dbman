@@ -20,7 +20,10 @@ from rich.text import Text
 # Import LookupPlugin from plugins folder
 from plugins.lookup import LookupPlugin, LookupSelectScreen, LookupConfigScreen
 from providers import create_provider
-from view_settings import ViewSettingsStore, derive_db_name, apply_view_settings
+from view_settings import (
+    ViewSettingsStore, derive_db_name, apply_view_settings,
+    compute_column_widths, truncate_rows,
+)
 
 # ... (rest of imports unchanged) ...
 
@@ -152,6 +155,7 @@ class ShortcutsScreen(ModalScreen):
                 " f: Filter selected column (View mode only)\n"
                 " F: Clear all filters for current table\n"
                 " t: Truncate/Shorten Column data (View mode only)\n"
+                " w: Set/clear column display width (View mode only)\n"
                 " ctrl+x: Delete selected table/view\n",
                 id="shortcuts-content"
             )
@@ -367,6 +371,73 @@ class TruncateColumnScreen(ModalScreen):
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "apply-truncate":
+            self.dismiss(self.query_one(Input).value)
+        else:
+            self.dismiss(None)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value)
+
+class ColumnWidthScreen(ModalScreen):
+    """A modal screen for pinning (or clearing) a column's display width."""
+    CSS = """
+    ColumnWidthScreen {
+        background: rgba(0, 0, 0, 0.5);
+        align: center middle;
+    }
+    #width-dialog {
+        background: $panel;
+        border: thick $primary;
+        padding: 1 2;
+        width: 50;
+        height: auto;
+    }
+    Label {
+        margin-bottom: 1;
+        text-style: bold;
+    }
+    Input {
+        margin-bottom: 1;
+    }
+    #width-hint {
+        color: $text-muted;
+        margin-bottom: 1;
+    }
+    #width-buttons {
+        align: right middle;
+    }
+    Button {
+        margin-left: 1;
+    }
+    """
+
+    def __init__(self, column: str, current_width, auto_width: int):
+        super().__init__()
+        self.column = column
+        self.current_width = current_width
+        self.auto_width = auto_width
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="width-dialog"):
+            yield Label(f"Width for '{self.column}'")
+            yield Input(
+                value=str(self.current_width) if self.current_width is not None else "",
+                placeholder=str(self.auto_width),
+                id="width-input",
+            )
+            yield Static(
+                f"Auto width would be {self.auto_width}. Clear the field to remove the override.",
+                id="width-hint",
+            )
+            with Horizontal(id="width-buttons"):
+                yield Button("Cancel", id="cancel-width")
+                yield Button("Apply", variant="success", id="apply-width")
+
+    def on_mount(self):
+        self.query_one(Input).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "apply-width":
             self.dismiss(self.query_one(Input).value)
         else:
             self.dismiss(None)
@@ -804,6 +875,7 @@ class DbMan(App):
         Binding("f", "filter_column", "Filter Column"),
         Binding("F", "clear_filters", "Clear Filters"),
         Binding("t", "truncate_column", "Shorten Column"),
+        Binding("w", "set_column_width", "Column Width"),
         Binding("]", "next_page", "Next Page", show=False),
         Binding("[", "prev_page", "Prev Page", show=False),
     ]
@@ -816,6 +888,8 @@ class DbMan(App):
         self.rows_editable = False
         self.row_keys = {}
         self.raw_docs = {}
+        self.row_values = {}
+        self.column_widths = {}
         self.mode = "view"
         self.filters = {}
         self.page_size = 500
@@ -939,6 +1013,7 @@ class DbMan(App):
             if item_type == "plugin":
                 self.row_keys = {}
                 self.raw_docs = {}
+                self.row_values = {}
                 self.rows_editable = False
                 self.page_has_more = False
                 columns, rows = self.get_plugin_data(name)
@@ -953,19 +1028,23 @@ class DbMan(App):
                 self._next_cursor = page.next_cursor
                 self.row_keys = {}
                 self.raw_docs = {}
+                self.row_values = {}
                 self.rows_editable = bool(page.row_keys) and page.row_keys[0].value is not None
 
                 view_settings = self.view_settings.get(name)
                 display_columns, display_rows = apply_view_settings(page.columns, page.rows, view_settings)
+                column_widths = compute_column_widths(display_columns, display_rows, view_settings)
+                self.column_widths = column_widths
+                rendered_rows = truncate_rows(display_columns, display_rows, column_widths)
 
                 for i, col in enumerate(display_columns):
                     color = COLORS[i % len(COLORS)]
                     label = f"[{color}]{col.name}[/]"
                     if col.name in self.filters:
                         label = f"[reverse]{label} (F)[/]"
-                    table_widget.add_column(label, key=col.name, width=view_settings.widths.get(col.name))
+                    table_widget.add_column(label, key=col.name, width=column_widths[col.name])
 
-                for i, (row, row_key) in enumerate(zip(display_rows, page.row_keys)):
+                for i, (row, rendered_row, row_key) in enumerate(zip(display_rows, rendered_rows, page.row_keys)):
                     if row_key.value is None:
                         key_str = str(i)
                     elif isinstance(row_key.value, dict):
@@ -973,13 +1052,15 @@ class DbMan(App):
                     else:
                         key_str = str(row_key.value)
                     self.row_keys[key_str] = row_key
+                    self.row_values[key_str] = dict(zip((c.name for c in display_columns), row))
                     if page.raw_rows is not None:
                         self.raw_docs[key_str] = page.raw_rows[i]
-                    table_widget.add_row(*row, key=key_str)
+                    table_widget.add_row(*rendered_row, key=key_str)
             else:
                 # Schema mode
                 self.row_keys = {}
                 self.raw_docs = {}
+                self.row_values = {}
                 self.rows_editable = False
                 self.page_has_more = False
                 schema_cols = self.provider.get_schema(name, item_type)
@@ -1237,7 +1318,9 @@ class DbMan(App):
         column_name = self.focused.ordered_columns[coord.column].key.value
         row_id_str = list(self.focused.rows.values())[coord.row].key.value
         row_key = self.row_keys.get(row_id_str)
-        current_value = self.focused.get_cell_at(coord)
+        # Prefer the untruncated value: the DataTable cell may hold a
+        # display-only ".."-truncated string (see view_settings.truncate_rows).
+        current_value = self.row_values.get(row_id_str, {}).get(column_name, self.focused.get_cell_at(coord))
 
         if row_key is None or row_key.value is None:
             self.notify("Cannot edit tables without identifiable rows (yet)", severity="error")
@@ -1414,6 +1497,43 @@ class DbMan(App):
                             self.notify(f"Truncate failed: {e}", severity="error")
                 self.push_screen(ConfirmScreen(f"Truncate ALL values in '{column_name}' to {target_len}?", "Apply"), do_it)
         self.push_screen(TruncateColumnScreen(self.current_item, column_name, max_len, suggested, self.provider), perform_truncate)
+
+    def action_set_column_width(self):
+        """Pin (or clear) a display-only column width, persisted via
+        ViewSettingsStore. Distinct from action_truncate_column, which
+        mutates the underlying data rather than just how it's displayed."""
+        if self.mode != "view":
+            self.notify("Column width only allowed in View mode", severity="error")
+            return
+        if not isinstance(self.focused, DataTable) or not self.current_item:
+            return
+        coord = self.focused.cursor_coordinate
+        column_name = self.focused.ordered_columns[coord.column].key.value
+
+        settings = self.view_settings.get(self.current_item)
+        current_override = settings.widths.get(column_name)
+        auto_width = self.column_widths.get(column_name, current_override or 20)
+
+        def apply_width(value):
+            if value is None:
+                return
+            value = value.strip()
+            settings = self.view_settings.get(self.current_item)
+            if value == "":
+                settings.widths.pop(column_name, None)
+            else:
+                try:
+                    width = int(value)
+                    if width < 1:
+                        raise ValueError
+                except ValueError:
+                    self.notify("Width must be a positive integer", severity="error")
+                    return
+                settings.widths[column_name] = width
+            self.view_settings.save(self.current_item, settings)
+            self.load_item(self.current_item, self.current_type)
+
+        self.push_screen(ColumnWidthScreen(column_name, current_override, auto_width), apply_width)
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:

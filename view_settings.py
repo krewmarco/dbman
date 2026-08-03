@@ -67,3 +67,41 @@ def apply_view_settings(columns: list, rows: list[list], settings: ViewSettings)
     indices = [columns.index(c) for c in display_columns]
     display_rows = [[row[i] for i in indices] for row in rows]
     return display_columns, display_rows
+
+
+def compute_column_widths(
+    display_columns: list, display_rows: list[list], settings: ViewSettings,
+    padding: int = 2, min_width: int = 6, max_width: int = 40,
+) -> dict[str, int]:
+    """Width per column: an explicit override from `settings.widths` if set,
+    otherwise the average string length of the currently-loaded page's
+    values for that column (+ padding), clamped to [min_width, max_width]
+    and never narrower than the header label. Using the average rather than
+    the longest value is the point: one huge outlier value shouldn't blow
+    out the whole column."""
+    widths = {}
+    for i, col in enumerate(display_columns):
+        if col.name in settings.widths:
+            widths[col.name] = settings.widths[col.name]
+            continue
+        lengths = [len(str(row[i])) for row in display_rows if row[i] is not None]
+        avg = (sum(lengths) / len(lengths)) if lengths else 0
+        widths[col.name] = max(min_width, len(col.name), min(max_width, round(avg) + padding))
+    return widths
+
+
+def truncate_display_value(value, width: Optional[int]):
+    """Shorten an overlong string value to fit `width`, marked with a
+    trailing '..'. Only `str` values are touched — dict/list cells (e.g.
+    CouchDB nested fields) must stay as raw Python objects so action_edit_cell
+    can keep detecting them; other scalar types are left alone too."""
+    if width is None or not isinstance(value, str) or len(value) <= width:
+        return value
+    return value[:max(width - 2, 1)] + ".."
+
+
+def truncate_rows(display_columns: list, display_rows: list[list], widths: dict[str, int]) -> list[list]:
+    return [
+        [truncate_display_value(value, widths.get(col.name)) for col, value in zip(display_columns, row)]
+        for row in display_rows
+    ]
