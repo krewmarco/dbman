@@ -138,7 +138,7 @@ class ShortcutsScreen(ModalScreen):
                 " tab: Cycle focus (Sidebar -> Main Area)\n"
                 " shift+tab: Jump to next sidebar section\n"
                 " m: Toggle View/Schema/SQL/Diag mode\n"
-                " d / ctrl+d: Switch to Diagram mode\n"
+                " ctrl+d: Switch to Diagram mode\n"
                 " ?: Toggle this Shortcuts panel\n"
                 " ctrl+p: Toggle this Shortcuts panel\n\n"
                 " [bold]Navigation[/]\n"
@@ -150,18 +150,19 @@ class ShortcutsScreen(ModalScreen):
                 " [bold]Editing & Filtering[/]\n"
                 " e: Edit selected cell (View mode) or SQL (SQL mode)\n"
                 " E: Edit whole document as JSON (document DB providers)\n"
+                " a: Add a new row/document (where supported)\n"
+                " d: Delete selected table/view\n"
                 " v: Create new View\n"
                 " x: Export current Table/View to CSV\n"
-                " f: Filter selected column (View mode only)\n"
+                " f: Filter selected column (column select mode)\n"
                 " F: Clear all filters for current table\n"
                 " t: Truncate/Shorten Column data (View mode only)\n"
-                " w: Set/clear column display width (View mode only)\n"
-                " ctrl+x: Delete selected table/view\n\n"
+                " w: Set/clear column display width (column select mode)\n\n"
                 " [bold]Select Mode (View mode only)[/]\n"
                 " s: Rotate select mode: field -> row -> column -> field\n"
                 " option+left / option+right: Reorder selected column (column mode)\n"
                 " z: Hide selected column (column mode)\n"
-                " u: Unhide a column (pick from hidden list)\n",
+                " u: Unhide a column (column mode, pick from hidden list)\n",
                 id="shortcuts-content"
             )
             yield Button("Close", variant="primary", id="close-button")
@@ -998,14 +999,14 @@ class DbMan(App):
         Binding("tab", "switch_focus", "Sidebar/Main"),
         Binding("shift+tab", "jump_section", "Jump Section"),
         Binding("m", "toggle_mode", "View/Schema/SQL/Diag Mode"),
-        Binding("d", "change_mode_diagram", "Diagram Mode"),
-        Binding("ctrl+d", "change_mode_diagram", "Diagram Mode", show=False),
+        Binding("ctrl+d", "change_mode_diagram", "Diagram Mode"),
         Binding("command+d", "change_mode_diagram", "Diagram Mode", show=False),
-        Binding("ctrl+x", "delete_item", "Delete"),
+        Binding("d", "delete_item", "Delete"),
         Binding("?", "toggle_shortcuts", "Shortcuts", show=False),
         Binding("ctrl+p", "toggle_shortcuts", "Shortcuts"),
         Binding("e", "edit_cell", "Edit Cell"),
         Binding("E", "edit_document", "Edit Document", show=False),
+        Binding("a", "add_row", "Add Row"),
         Binding("v", "create_view", "Create View"),
         Binding("x", "export_csv", "Export CSV"),
         Binding("f", "filter_column", "Filter Column"),
@@ -1042,6 +1043,7 @@ class DbMan(App):
         "change_mode_diagram": _ctx(capability="diagram"),
         "create_view": _ctx(capability="create_definition"),
         "export_csv": _export_csv_ctx,
+        "add_row": _ctx(modes={"view"}, item_types={"table"}, capability="add_row"),
     }
 
     def check_action(self, action, parameters):
@@ -1668,7 +1670,12 @@ class DbMan(App):
         if row_key is None or raw_doc is None:
             self.notify("Cannot edit this row", severity="error")
             return
+        self._open_document_editor(row_key, raw_doc)
 
+    def _open_document_editor(self, row_key, raw_doc):
+        """Shared by action_edit_document (existing row) and action_add_row
+        (freshly-created row, opened immediately so a freeform document is
+        filled in right away)."""
         def save_document(new_json_text):
             if new_json_text:
                 try:
@@ -1678,11 +1685,39 @@ class DbMan(App):
                 except Exception as e:
                     self.notify(f"Update failed: {e}", severity="error")
 
-        doc_id = row_key.value.get("_id") if isinstance(row_key.value, dict) else row_id_str
+        doc_id = row_key.value.get("_id") if isinstance(row_key.value, dict) else row_key.value
         self.push_screen(
             EditTextScreen(f"Edit Document: {doc_id}", json.dumps(raw_doc, indent=2), language="json"),
             save_document,
         )
+
+    def action_add_row(self):
+        """'a': create a new row/document and immediately open it for
+        editing. Only implemented where a provider can create a sensible
+        blank row without a schema-aware form — currently CouchDB's freeform
+        documents (capabilities.add_row). SqlAlchemyProvider tables need
+        typed defaults for NOT NULL columns, deferred to a future dynamic-
+        forms/business-logic layer. See issue #10."""
+        if self.mode != "view" or self.current_type != "table":
+            self.notify("Add only allowed in View mode, on a table", severity="error")
+            return
+        if not self.provider.capabilities.add_row:
+            self.notify("Adding rows is not available for this provider yet", severity="error")
+            return
+        try:
+            row_key = self.provider.add_row(self.current_item, self.current_type)
+        except Exception as e:
+            self.notify(f"Add failed: {e}", severity="error")
+            return
+        self.notify("Row added")
+        self.load_item(self.current_item, self.current_type)
+        if isinstance(row_key.value, dict):
+            key_str = json.dumps(row_key.value, sort_keys=True)
+        else:
+            key_str = str(row_key.value)
+        raw_doc = self.raw_docs.get(key_str)
+        if raw_doc is not None:
+            self._open_document_editor(row_key, raw_doc)
 
     def action_edit_sql(self):
         if self.current_type != "view":
