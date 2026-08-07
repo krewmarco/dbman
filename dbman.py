@@ -146,23 +146,22 @@ class ShortcutsScreen(ModalScreen):
                 " h / l: Move left / right (Table only)\n"
                 " pgup / pgdn: Page Up / Down (Mac: fn + up / fn + down)\n"
                 " g / G: Home / End\n"
-                " ] / [: Next / Previous page of rows (View mode)\n\n"
+                " \\] / \\[: Next / Previous page of rows (View mode)\n\n"
                 " [bold]Editing & Filtering[/]\n"
-                " e: Edit selected cell (View mode) or SQL (SQL mode)\n"
+                " e: Edit selected cell/row (View mode) or SQL (SQL mode)\n"
                 " E: Edit whole document as JSON (document DB providers)\n"
-                " a: Add a new row/document (where supported)\n"
+                " a: Add a new row (table) or create a new View (where supported)\n"
                 " d: Delete selected table/view\n"
-                " v: Create new View\n"
                 " x: Export current Table/View to CSV\n"
                 " f: Filter selected column (column select mode)\n"
-                " F: Clear all filters for current table\n"
+                " F: Clear all filters for current table (column select mode)\n"
                 " t: Truncate/Shorten Column data (View mode only)\n"
                 " w: Set/clear column display width (column select mode)\n\n"
                 " [bold]Select Mode (View mode only)[/]\n"
                 " s: Rotate select mode: field -> row -> column -> field\n"
-                " option+left / option+right: Reorder selected column (column mode)\n"
+                " H / L: Move selected column left / right (column mode; option+left/right also works on some terminals)\n"
                 " z: Hide selected column (column mode)\n"
-                " u: Unhide a column (column mode, pick from hidden list)\n",
+                " Z: Unhide a column (column mode, pick from hidden list)\n",
                 id="shortcuts-content"
             )
             yield Button("Close", variant="primary", id="close-button")
@@ -920,6 +919,26 @@ def _export_csv_ctx(app):
     return app.current_type in ("table", "view")
 
 
+def _add_ctx(app):
+    """'a' is polymorphic like 'e': add a row on a Table, create a new View
+    on a View. OR-of-branches, not a plain _ctx() AND."""
+    if app.mode != "view" or not app.current_item:
+        return False
+    if app.current_type == "table":
+        return app.provider.capabilities.add_row
+    if app.current_type == "view":
+        return app.provider.capabilities.create_definition
+    return False
+
+
+def _clear_filters_ctx(app):
+    """Column-select-mode-scoped, paired with 'f' like unhide is paired with
+    hide. Greys out (rather than hides) 'F' when there's nothing to clear."""
+    if app.mode != "view" or app.select_mode != "column" or not app.current_item:
+        return False
+    return True if app.filters else None
+
+
 class DbMan(App):
     """A vim-like database browser powered by SQLAlchemy."""
 
@@ -1004,20 +1023,21 @@ class DbMan(App):
         Binding("d", "delete_item", "Delete"),
         Binding("?", "toggle_shortcuts", "Shortcuts", show=False),
         Binding("ctrl+p", "toggle_shortcuts", "Shortcuts"),
-        Binding("e", "edit_cell", "Edit Cell"),
+        Binding("e", "edit_cell", "Edit"),
         Binding("E", "edit_document", "Edit Document", show=False),
-        Binding("a", "add_row", "Add Row"),
-        Binding("v", "create_view", "Create View"),
-        Binding("x", "export_csv", "Export CSV"),
+        Binding("a", "add", "Add"),
+        Binding("x", "export_csv", "Export CSV", show=False),
         Binding("f", "filter_column", "Filter Column"),
         Binding("F", "clear_filters", "Clear Filters"),
         Binding("t", "truncate_column", "Shorten Column"),
         Binding("w", "set_column_width", "Column Width"),
         Binding("s", "rotate_select_mode", "Select Mode"),
         Binding("z", "hide_column", "Hide Column"),
-        Binding("u", "unhide_column", "Unhide Column"),
+        Binding("Z", "unhide_column", "Unhide Column"),
         Binding("alt+left", "reorder_column(-1)", "Move Column Left", show=False),
         Binding("alt+right", "reorder_column(1)", "Move Column Right", show=False),
+        Binding("H", "reorder_column(-1)", "Move Column Left"),
+        Binding("L", "reorder_column(1)", "Move Column Right"),
         Binding("]", "next_page", "Next Page", show=False),
         Binding("[", "prev_page", "Prev Page", show=False),
     ]
@@ -1041,9 +1061,9 @@ class DbMan(App):
         "delete_item": _delete_item_ctx,
         "toggle_mode": _toggle_mode_ctx,
         "change_mode_diagram": _ctx(capability="diagram"),
-        "create_view": _ctx(capability="create_definition"),
         "export_csv": _export_csv_ctx,
-        "add_row": _ctx(modes={"view"}, item_types={"table"}, capability="add_row"),
+        "add": _add_ctx,
+        "clear_filters": _clear_filters_ctx,
     }
 
     def check_action(self, action, parameters):
@@ -1351,13 +1371,21 @@ class DbMan(App):
         self.focused.cursor_type = self._cursor_type_for_select_mode()
         self.update_title()
         self.refresh_bindings()
-        self.notify(f"Select mode: {self.select_mode}")
 
     def action_reorder_column(self, direction: int):
-        """option+left/right (alt+left/right) in column select mode: swap the
-        selected column with its neighbor and persist the new order via
-        ViewSettingsStore. Uses alt, not ctrl, because macOS reserves
-        ctrl+left/right for Mission Control space-switching by default."""
+        """Shift+H/Shift+L (primary) or alt+left/alt+right (secondary,
+        hidden from the footer) in column select mode: swap the selected
+        column with its neighbor and persist the new order via
+        ViewSettingsStore. H/L reuse the app's own h/l = left/right cursor
+        mnemonic (shift = "move the column instead of the cursor"), which
+        also sidesteps two dead ends: alt+left/right relies on macOS
+        terminals sending the xterm modified-arrow CSI sequence, but they
+        commonly send Option+Left/Right as the readline word-jump escape
+        instead (Esc+b/Esc+f -> "alt+b"/"alt+f"), so it silently never fired
+        for most users; and '<'/'>' (tried first) required Shift+,/Shift+.,
+        which is easy to mis-key by visual identification of the unshifted
+        comma/period glyphs. ctrl+left/right was avoided from the start
+        since macOS reserves those for Mission Control space-switching."""
         if self.mode != "view" or self.select_mode != "column":
             return
         if not isinstance(self.focused, DataTable) or not self.current_item:
@@ -1471,6 +1499,12 @@ class DbMan(App):
         self.push_screen(FilterColumnScreen(column_name, current_filter), apply_filter)
 
     def action_clear_filters(self):
+        if self.mode != "view":
+            self.notify("Filtering only allowed in View mode", severity="error")
+            return
+        if self.select_mode != "column":
+            self.notify("Filtering only allowed in column select mode (press 's' to rotate)", severity="error")
+            return
         self.filters = {}
         self.reset_paging()
         if self.current_item:
@@ -1673,7 +1707,7 @@ class DbMan(App):
         self._open_document_editor(row_key, raw_doc)
 
     def _open_document_editor(self, row_key, raw_doc):
-        """Shared by action_edit_document (existing row) and action_add_row
+        """Shared by action_edit_document (existing row) and _add_row
         (freshly-created row, opened immediately so a freeform document is
         filled in right away)."""
         def save_document(new_json_text):
@@ -1691,16 +1725,27 @@ class DbMan(App):
             save_document,
         )
 
-    def action_add_row(self):
-        """'a': create a new row/document and immediately open it for
-        editing. Only implemented where a provider can create a sensible
-        blank row without a schema-aware form — currently CouchDB's freeform
-        documents (capabilities.add_row). SqlAlchemyProvider tables need
-        typed defaults for NOT NULL columns, deferred to a future dynamic-
-        forms/business-logic layer. See issue #10."""
-        if self.mode != "view" or self.current_type != "table":
-            self.notify("Add only allowed in View mode, on a table", severity="error")
+    def action_add(self):
+        """'a': context-sensitive "create new thing". On a Table, add a new
+        row/document and immediately open it for editing — only implemented
+        where a provider can create a sensible blank row without a
+        schema-aware form (currently CouchDB's freeform documents,
+        capabilities.add_row; SqlAlchemyProvider tables need typed defaults
+        for NOT NULL columns, deferred to a future dynamic-forms/
+        business-logic layer). On a View, create a new view (formerly the
+        standalone 'v' key — folded in here since it's the same "add a new
+        thing" gesture, just for a different item type). See issue #10."""
+        if self.mode != "view" or not self.current_item:
+            self.notify("Add only allowed in View mode, on a Table or View", severity="error")
             return
+        if self.current_type == "table":
+            self._add_row()
+        elif self.current_type == "view":
+            self._add_view()
+        else:
+            self.notify("Add only allowed on a Table or View", severity="error")
+
+    def _add_row(self):
         if not self.provider.capabilities.add_row:
             self.notify("Adding rows is not available for this provider yet", severity="error")
             return
@@ -1718,6 +1763,22 @@ class DbMan(App):
         raw_doc = self.raw_docs.get(key_str)
         if raw_doc is not None:
             self._open_document_editor(row_key, raw_doc)
+
+    def _add_view(self):
+        if not self.provider.capabilities.create_definition:
+            self.notify("Creating views is not available for this provider", severity="error")
+            return
+        default_sql = self.provider.default_definition_template()
+        def execute_create(new_sql):
+            if new_sql:
+                try:
+                    self.provider.create_view(new_sql)
+                    self.notify("View Created")
+                    self.refresh_sidebar()
+                except Exception as e:
+                    self.notify(f"Creation failed: {e}", severity="error")
+        language = self.provider.definition_language("view")
+        self.push_screen(EditTextScreen("Create New View", default_sql, language=language), execute_create)
 
     def action_edit_sql(self):
         if self.current_type != "view":
@@ -1741,22 +1802,6 @@ class DbMan(App):
         
         language = self.provider.definition_language(self.current_type)
         self.push_screen(EditTextScreen(f"Edit View: {self.current_item}", current_sql, language=language), execute_sql)
-
-    def action_create_view(self):
-        if not self.provider.capabilities.create_definition:
-            self.notify("Creating views is not available for this provider", severity="error")
-            return
-        default_sql = self.provider.default_definition_template()
-        def execute_create(new_sql):
-            if new_sql:
-                try:
-                    self.provider.create_view(new_sql)
-                    self.notify("View Created")
-                    self.refresh_sidebar()
-                except Exception as e:
-                    self.notify(f"Creation failed: {e}", severity="error")
-        language = self.provider.definition_language("view")
-        self.push_screen(EditTextScreen("Create New View", default_sql, language=language), execute_create)
 
     def action_export_csv(self):
         if not self.current_item:
