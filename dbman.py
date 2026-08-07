@@ -159,7 +159,7 @@ class ShortcutsScreen(ModalScreen):
                 " w: Set/clear column display width (column select mode)\n\n"
                 " [bold]Select Mode (View mode only)[/]\n"
                 " s: Rotate select mode: field -> row -> column -> field\n"
-                " option+left / option+right: Reorder selected column (column mode)\n"
+                " < / >: Reorder selected column (column mode; option+left/right also works on some terminals)\n"
                 " z: Hide selected column (column mode)\n"
                 " Z: Unhide a column (column mode, pick from hidden list)\n",
                 id="shortcuts-content"
@@ -1034,8 +1034,10 @@ class DbMan(App):
         Binding("s", "rotate_select_mode", "Select Mode"),
         Binding("z", "hide_column", "Hide Column"),
         Binding("Z", "unhide_column", "Unhide Column"),
-        Binding("alt+left", "reorder_column(-1)", "Move Column Left"),
-        Binding("alt+right", "reorder_column(1)", "Move Column Right"),
+        Binding("alt+left", "reorder_column(-1)", "Move Column Left", show=False),
+        Binding("alt+right", "reorder_column(1)", "Move Column Right", show=False),
+        Binding("<", "reorder_column(-1)", "Move Column Left"),
+        Binding(">", "reorder_column(1)", "Move Column Right"),
         Binding("]", "next_page", "Next Page", show=False),
         Binding("[", "prev_page", "Prev Page", show=False),
     ]
@@ -1371,10 +1373,17 @@ class DbMan(App):
         self.refresh_bindings()
 
     def action_reorder_column(self, direction: int):
-        """option+left/right (alt+left/right) in column select mode: swap the
-        selected column with its neighbor and persist the new order via
-        ViewSettingsStore. Uses alt, not ctrl, because macOS reserves
-        ctrl+left/right for Mission Control space-switching by default."""
+        """'<'/'>' (primary) or alt+left/alt+right (secondary, hidden from
+        the footer) in column select mode: swap the selected column with its
+        neighbor and persist the new order via ViewSettingsStore. Originally
+        alt+left/right only (ctrl+left/right was avoided since macOS
+        reserves those for Mission Control space-switching), but macOS
+        terminals commonly send Option+Left/Right as the readline word-jump
+        sequence (Esc+b/Esc+f -> "alt+b"/"alt+f") rather than the xterm
+        modified-arrow CSI sequence Textual expects for "alt+left"/
+        "alt+right" — so it silently never fired for most users. '<'/'>'
+        are plain printable keys and don't depend on terminal Meta-key
+        config, so they're the reliable primary binding now."""
         if self.mode != "view" or self.select_mode != "column":
             return
         if not isinstance(self.focused, DataTable) or not self.current_item:
