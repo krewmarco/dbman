@@ -159,7 +159,7 @@ class ShortcutsScreen(ModalScreen):
                 " w: Set/clear column display width (column select mode)\n\n"
                 " [bold]Select Mode (View mode only)[/]\n"
                 " s: Rotate select mode: field -> row -> column -> field\n"
-                " < / >: Reorder selected column (column mode; option+left/right also works on some terminals)\n"
+                " H / L: Move selected column left / right (column mode; option+left/right also works on some terminals)\n"
                 " z: Hide selected column (column mode)\n"
                 " Z: Unhide a column (column mode, pick from hidden list)\n",
                 id="shortcuts-content"
@@ -1036,8 +1036,8 @@ class DbMan(App):
         Binding("Z", "unhide_column", "Unhide Column"),
         Binding("alt+left", "reorder_column(-1)", "Move Column Left", show=False),
         Binding("alt+right", "reorder_column(1)", "Move Column Right", show=False),
-        Binding("<", "reorder_column(-1)", "Move Column Left"),
-        Binding(">", "reorder_column(1)", "Move Column Right"),
+        Binding("H", "reorder_column(-1)", "Move Column Left"),
+        Binding("L", "reorder_column(1)", "Move Column Right"),
         Binding("]", "next_page", "Next Page", show=False),
         Binding("[", "prev_page", "Prev Page", show=False),
     ]
@@ -1373,17 +1373,19 @@ class DbMan(App):
         self.refresh_bindings()
 
     def action_reorder_column(self, direction: int):
-        """'<'/'>' (primary) or alt+left/alt+right (secondary, hidden from
-        the footer) in column select mode: swap the selected column with its
-        neighbor and persist the new order via ViewSettingsStore. Originally
-        alt+left/right only (ctrl+left/right was avoided since macOS
-        reserves those for Mission Control space-switching), but macOS
-        terminals commonly send Option+Left/Right as the readline word-jump
-        sequence (Esc+b/Esc+f -> "alt+b"/"alt+f") rather than the xterm
-        modified-arrow CSI sequence Textual expects for "alt+left"/
-        "alt+right" — so it silently never fired for most users. '<'/'>'
-        are plain printable keys and don't depend on terminal Meta-key
-        config, so they're the reliable primary binding now."""
+        """Shift+H/Shift+L (primary) or alt+left/alt+right (secondary,
+        hidden from the footer) in column select mode: swap the selected
+        column with its neighbor and persist the new order via
+        ViewSettingsStore. H/L reuse the app's own h/l = left/right cursor
+        mnemonic (shift = "move the column instead of the cursor"), which
+        also sidesteps two dead ends: alt+left/right relies on macOS
+        terminals sending the xterm modified-arrow CSI sequence, but they
+        commonly send Option+Left/Right as the readline word-jump escape
+        instead (Esc+b/Esc+f -> "alt+b"/"alt+f"), so it silently never fired
+        for most users; and '<'/'>' (tried first) required Shift+,/Shift+.,
+        which is easy to mis-key by visual identification of the unshifted
+        comma/period glyphs. ctrl+left/right was avoided from the start
+        since macOS reserves those for Mission Control space-switching."""
         if self.mode != "view" or self.select_mode != "column":
             return
         if not isinstance(self.focused, DataTable) or not self.current_item:
