@@ -80,6 +80,7 @@ class CouchDBProvider(Provider):
             truncate_column=False,
             whole_row_edit=True,
             delete_item=False,
+            add_row=True,
         )
 
     # -- helpers -----------------------------------------------------------
@@ -280,6 +281,11 @@ class CouchDBProvider(Provider):
         doc[column] = value
         resp = self._put(f"/{doc_id}", doc)
         return RowKey({"_id": doc_id, "_rev": resp["rev"]})
+
+    def add_row(self, name, item_type) -> RowKey:
+        """Create a new, empty freeform document. CouchDB assigns the _id."""
+        resp = self._post("", {})
+        return RowKey({"_id": resp["id"], "_rev": resp["rev"]})
 
     def update_row_json(self, name, item_type, row_key: RowKey, new_json_text) -> RowKey:
         doc_id = row_key.value["_id"]

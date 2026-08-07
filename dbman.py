@@ -7,7 +7,7 @@ import csv
 import json
 from sqlalchemy import text
 from textual.app import App, ComposeResult
-from textual.widgets import Header, Footer, DataTable, ListView, ListItem, Label, Static, Button, Input, ContentSwitcher, TextArea
+from textual.widgets import Header, Footer, DataTable, ListView, ListItem, Label, Static, Button, Input, ContentSwitcher, TextArea, Select
 from textual.containers import Horizontal, Vertical, Center, VerticalScroll
 from textual.binding import Binding
 from textual.screen import ModalScreen
@@ -138,7 +138,7 @@ class ShortcutsScreen(ModalScreen):
                 " tab: Cycle focus (Sidebar -> Main Area)\n"
                 " shift+tab: Jump to next sidebar section\n"
                 " m: Toggle View/Schema/SQL/Diag mode\n"
-                " d / ctrl+d: Switch to Diagram mode\n"
+                " ctrl+d: Switch to Diagram mode\n"
                 " ?: Toggle this Shortcuts panel\n"
                 " ctrl+p: Toggle this Shortcuts panel\n\n"
                 " [bold]Navigation[/]\n"
@@ -150,16 +150,19 @@ class ShortcutsScreen(ModalScreen):
                 " [bold]Editing & Filtering[/]\n"
                 " e: Edit selected cell (View mode) or SQL (SQL mode)\n"
                 " E: Edit whole document as JSON (document DB providers)\n"
+                " a: Add a new row/document (where supported)\n"
+                " d: Delete selected table/view\n"
                 " v: Create new View\n"
                 " x: Export current Table/View to CSV\n"
-                " f: Filter selected column (View mode only)\n"
+                " f: Filter selected column (column select mode)\n"
                 " F: Clear all filters for current table\n"
                 " t: Truncate/Shorten Column data (View mode only)\n"
-                " w: Set/clear column display width (View mode only)\n"
-                " ctrl+x: Delete selected table/view\n\n"
+                " w: Set/clear column display width (column select mode)\n\n"
                 " [bold]Select Mode (View mode only)[/]\n"
                 " s: Rotate select mode: field -> row -> column -> field\n"
-                " option+left / option+right: Reorder selected column (column mode)\n",
+                " option+left / option+right: Reorder selected column (column mode)\n"
+                " z: Hide selected column (column mode)\n"
+                " u: Unhide a column (column mode, pick from hidden list)\n",
                 id="shortcuts-content"
             )
             yield Button("Close", variant="primary", id="close-button")
@@ -447,6 +450,59 @@ class ColumnWidthScreen(ModalScreen):
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         self.dismiss(event.value)
+
+class UnhideColumnScreen(ModalScreen):
+    """A modal screen for picking a hidden column to bring back. Mode-
+    independent (unlike hiding, which is column-select-mode-scoped) since a
+    hidden column isn't reachable via column-mode cursor selection."""
+    CSS = """
+    UnhideColumnScreen {
+        background: rgba(0, 0, 0, 0.5);
+        align: center middle;
+    }
+    #unhide-dialog {
+        background: $panel;
+        border: thick $primary;
+        padding: 1 2;
+        width: 50;
+        height: auto;
+    }
+    Label {
+        margin-bottom: 1;
+        text-style: bold;
+    }
+    Select {
+        margin-bottom: 1;
+    }
+    #unhide-buttons {
+        align: right middle;
+    }
+    Button {
+        margin-left: 1;
+    }
+    """
+
+    def __init__(self, hidden_columns: list[str]):
+        super().__init__()
+        self.hidden_columns = hidden_columns
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="unhide-dialog"):
+            yield Label("Unhide column")
+            yield Select(
+                [(c, c) for c in self.hidden_columns],
+                value=self.hidden_columns[0],
+                id="unhide-select",
+            )
+            with Horizontal(id="unhide-buttons"):
+                yield Button("Cancel", id="cancel-unhide")
+                yield Button("Unhide", variant="success", id="apply-unhide")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "apply-unhide":
+            self.dismiss(self.query_one(Select).value)
+        else:
+            self.dismiss(None)
 
 class EditTextScreen(ModalScreen):
     """A modal screen for editing a block of text: SQL, a CouchDB view's
@@ -786,6 +842,84 @@ class DiagramView(VerticalScroll, can_focus=True):
             else:
                 self.mount(Static(f"Error generating diagram: {e}", classes="diagram-bg"))
 
+def _ctx(modes=None, select_modes=None, item_types=None, capability=None):
+    """Build a check_action predicate for the common case: an AND of
+    mode/select_mode/item_type/capability checks. `None` for any parameter
+    means "any value is fine" on that axis. See issue #10."""
+    modes = frozenset(modes) if modes is not None else None
+    select_modes = frozenset(select_modes) if select_modes is not None else None
+    item_types = frozenset(item_types) if item_types is not None else None
+
+    def predicate(app):
+        if modes is not None and app.mode not in modes:
+            return False
+        if select_modes is not None and app.select_mode not in select_modes:
+            return False
+        if item_types is not None and app.current_type not in item_types:
+            return False
+        if capability is not None and not getattr(app.provider.capabilities, capability, False):
+            return False
+        return True
+
+    return predicate
+
+
+def _edit_cell_ctx(app):
+    """'e' is polymorphic: SQL mode edits the View's SQL, the lookup plugin
+    edits its own config, and in View mode what it edits depends on
+    select_mode (field: the cell, row: the whole row/document, column: n/a).
+    Too many cross-cutting branches to express as a plain _ctx() AND."""
+    if app.mode == "sql":
+        return app.current_type == "view" and app.provider.capabilities.create_definition
+    if app.current_type == "plugin":
+        return app.current_item == "lookup" and app.lookup_plugin is not None
+    if app.mode != "view":
+        return False
+    if app.select_mode == "row":
+        return app.provider.capabilities.whole_row_edit
+    if app.select_mode == "column":
+        return False
+    return app.current_type == "table" and app.rows_editable
+
+
+def _filter_column_ctx(app):
+    return (
+        app.mode == "view"
+        and app.select_mode == "column"
+        and bool(app.current_item)
+        and app.provider.is_filterable(app.current_type)
+    )
+
+
+def _truncate_column_ctx(app):
+    return (
+        app.mode == "view"
+        and app.current_type == "table"
+        and bool(app.current_item)
+        and app.provider.capabilities.truncate_column
+    )
+
+
+def _delete_item_ctx(app):
+    return bool(app.current_type) and app.current_type != "plugin" and app.provider.capabilities.delete_item
+
+
+def _toggle_mode_ctx(app):
+    return app.current_type != "plugin"
+
+
+def _unhide_column_ctx(app):
+    """Column-select-mode-scoped, like hiding. Greys out (rather than hides)
+    'u' when there's nothing to unhide."""
+    if app.mode != "view" or app.select_mode != "column" or not app.current_item:
+        return False
+    return True if app.view_settings.get(app.current_item).hidden else None
+
+
+def _export_csv_ctx(app):
+    return app.current_type in ("table", "view")
+
+
 class DbMan(App):
     """A vim-like database browser powered by SQLAlchemy."""
 
@@ -865,14 +999,14 @@ class DbMan(App):
         Binding("tab", "switch_focus", "Sidebar/Main"),
         Binding("shift+tab", "jump_section", "Jump Section"),
         Binding("m", "toggle_mode", "View/Schema/SQL/Diag Mode"),
-        Binding("d", "change_mode_diagram", "Diagram Mode"),
-        Binding("ctrl+d", "change_mode_diagram", "Diagram Mode", show=False),
+        Binding("ctrl+d", "change_mode_diagram", "Diagram Mode"),
         Binding("command+d", "change_mode_diagram", "Diagram Mode", show=False),
-        Binding("ctrl+x", "delete_item", "Delete"),
+        Binding("d", "delete_item", "Delete"),
         Binding("?", "toggle_shortcuts", "Shortcuts", show=False),
         Binding("ctrl+p", "toggle_shortcuts", "Shortcuts"),
         Binding("e", "edit_cell", "Edit Cell"),
         Binding("E", "edit_document", "Edit Document", show=False),
+        Binding("a", "add_row", "Add Row"),
         Binding("v", "create_view", "Create View"),
         Binding("x", "export_csv", "Export CSV"),
         Binding("f", "filter_column", "Filter Column"),
@@ -880,6 +1014,8 @@ class DbMan(App):
         Binding("t", "truncate_column", "Shorten Column"),
         Binding("w", "set_column_width", "Column Width"),
         Binding("s", "rotate_select_mode", "Select Mode"),
+        Binding("z", "hide_column", "Hide Column"),
+        Binding("u", "unhide_column", "Unhide Column"),
         Binding("alt+left", "reorder_column(-1)", "Move Column Left", show=False),
         Binding("alt+right", "reorder_column(1)", "Move Column Right", show=False),
         Binding("]", "next_page", "Next Page", show=False),
@@ -888,6 +1024,33 @@ class DbMan(App):
 
     SELECT_MODES = ["field", "row", "column"]
     CURSOR_TYPE_BY_SELECT_MODE = {"field": "cell", "row": "row", "column": "column"}
+
+    # Per-action visibility/enablement predicates for the footer, keyed by
+    # action name (not by key — see _ctx/_edit_cell_ctx etc. above). Actions
+    # not listed here are always shown+enabled. See issue #10.
+    ACTION_CONTEXTS = {
+        "edit_cell": _edit_cell_ctx,
+        "edit_document": _ctx(modes={"view"}, capability="whole_row_edit"),
+        "filter_column": _filter_column_ctx,
+        "truncate_column": _truncate_column_ctx,
+        "set_column_width": _ctx(modes={"view"}, select_modes={"column"}),
+        "rotate_select_mode": _ctx(modes={"view"}),
+        "reorder_column": _ctx(modes={"view"}, select_modes={"column"}),
+        "hide_column": _ctx(modes={"view"}, select_modes={"column"}),
+        "unhide_column": _unhide_column_ctx,
+        "delete_item": _delete_item_ctx,
+        "toggle_mode": _toggle_mode_ctx,
+        "change_mode_diagram": _ctx(capability="diagram"),
+        "create_view": _ctx(capability="create_definition"),
+        "export_csv": _export_csv_ctx,
+        "add_row": _ctx(modes={"view"}, item_types={"table"}, capability="add_row"),
+    }
+
+    def check_action(self, action, parameters):
+        ctx = self.ACTION_CONTEXTS.get(action)
+        if ctx is None:
+            return True
+        return ctx(self)
 
     def __init__(self, db_url):
         super().__init__()
@@ -1103,6 +1266,7 @@ class DbMan(App):
                 sql_widget.focus()
                 
         self.update_title()
+        self.refresh_bindings()
 
     def _cursor_type_for_select_mode(self):
         return self.CURSOR_TYPE_BY_SELECT_MODE[self.select_mode]
@@ -1163,6 +1327,7 @@ class DbMan(App):
             modes = [m for m in modes if m != "diagram"]
         idx = modes.index(self.mode)
         self.mode = modes[(idx + 1) % len(modes)]
+        self.refresh_bindings()
         self.refresh_sidebar()
         sidebar_list = self.query_one("#sidebar-list", ListView)
         for i, child in enumerate(sidebar_list.children):
@@ -1185,6 +1350,7 @@ class DbMan(App):
         self.select_mode = self.SELECT_MODES[(idx + 1) % len(self.SELECT_MODES)]
         self.focused.cursor_type = self._cursor_type_for_select_mode()
         self.update_title()
+        self.refresh_bindings()
         self.notify(f"Select mode: {self.select_mode}")
 
     def action_reorder_column(self, direction: int):
@@ -1210,11 +1376,64 @@ class DbMan(App):
         self.load_item(self.current_item, self.current_type)
         self.query_one("#data-table", DataTable).move_cursor(row=coord.row, column=new_idx)
 
+    def action_hide_column(self):
+        """'z' in column select mode: hide the column-mode-selected column
+        from the rendered DataTable (it stays in the underlying RowPage/model
+        and is unaffected in any other select mode). Persisted per table/view
+        via ViewSettingsStore. See issue #2."""
+        if self.mode != "view":
+            self.notify("Hide column only allowed in View mode", severity="error")
+            return
+        if self.select_mode != "column":
+            self.notify("Hide column only allowed in column select mode (press 's' to rotate)", severity="error")
+            return
+        if not isinstance(self.focused, DataTable) or not self.current_item:
+            return
+        if len(self.focused.ordered_columns) <= 1:
+            self.notify("Cannot hide the last visible column", severity="error")
+            return
+        coord = self.focused.cursor_coordinate
+        column_name = self.focused.ordered_columns[coord.column].key.value
+
+        settings = self.view_settings.get(self.current_item)
+        if column_name not in settings.hidden:
+            settings.hidden.append(column_name)
+        self.view_settings.save(self.current_item, settings)
+        self.notify(f"Hid column '{column_name}'")
+        self.load_item(self.current_item, self.current_type)
+
+    def action_unhide_column(self):
+        """'u', column-select-mode-scoped like hiding: pick a previously
+        hidden column to bring back. See issue #2."""
+        if self.mode != "view" or not self.current_item:
+            self.notify("Unhide only allowed in View mode", severity="error")
+            return
+        if self.select_mode != "column":
+            self.notify("Unhide only allowed in column select mode (press 's' to rotate)", severity="error")
+            return
+
+        settings = self.view_settings.get(self.current_item)
+        if not settings.hidden:
+            self.notify("No hidden columns")
+            return
+
+        def do_unhide(column_name):
+            if column_name:
+                settings = self.view_settings.get(self.current_item)
+                if column_name in settings.hidden:
+                    settings.hidden.remove(column_name)
+                    self.view_settings.save(self.current_item, settings)
+                    self.notify(f"Unhid column '{column_name}'")
+                    self.load_item(self.current_item, self.current_type)
+
+        self.push_screen(UnhideColumnScreen(list(settings.hidden)), do_unhide)
+
     def action_change_mode_diagram(self):
         if not self.provider.capabilities.diagram:
             self.notify("Diagram not available for this provider", severity="error")
             return
         self.mode = "diagram"
+        self.refresh_bindings()
         self.refresh_sidebar()
         if self.current_item:
             self.load_item(self.current_item, self.current_type, should_focus=True)
@@ -1229,6 +1448,9 @@ class DbMan(App):
     def action_filter_column(self):
         if self.mode != "view":
             self.notify("Filtering only allowed in View mode", severity="error")
+            return
+        if self.select_mode != "column":
+            self.notify("Filtering only allowed in column select mode (press 's' to rotate)", severity="error")
             return
         if not isinstance(self.focused, DataTable) or not self.current_item:
             return
@@ -1448,7 +1670,12 @@ class DbMan(App):
         if row_key is None or raw_doc is None:
             self.notify("Cannot edit this row", severity="error")
             return
+        self._open_document_editor(row_key, raw_doc)
 
+    def _open_document_editor(self, row_key, raw_doc):
+        """Shared by action_edit_document (existing row) and action_add_row
+        (freshly-created row, opened immediately so a freeform document is
+        filled in right away)."""
         def save_document(new_json_text):
             if new_json_text:
                 try:
@@ -1458,11 +1685,39 @@ class DbMan(App):
                 except Exception as e:
                     self.notify(f"Update failed: {e}", severity="error")
 
-        doc_id = row_key.value.get("_id") if isinstance(row_key.value, dict) else row_id_str
+        doc_id = row_key.value.get("_id") if isinstance(row_key.value, dict) else row_key.value
         self.push_screen(
             EditTextScreen(f"Edit Document: {doc_id}", json.dumps(raw_doc, indent=2), language="json"),
             save_document,
         )
+
+    def action_add_row(self):
+        """'a': create a new row/document and immediately open it for
+        editing. Only implemented where a provider can create a sensible
+        blank row without a schema-aware form — currently CouchDB's freeform
+        documents (capabilities.add_row). SqlAlchemyProvider tables need
+        typed defaults for NOT NULL columns, deferred to a future dynamic-
+        forms/business-logic layer. See issue #10."""
+        if self.mode != "view" or self.current_type != "table":
+            self.notify("Add only allowed in View mode, on a table", severity="error")
+            return
+        if not self.provider.capabilities.add_row:
+            self.notify("Adding rows is not available for this provider yet", severity="error")
+            return
+        try:
+            row_key = self.provider.add_row(self.current_item, self.current_type)
+        except Exception as e:
+            self.notify(f"Add failed: {e}", severity="error")
+            return
+        self.notify("Row added")
+        self.load_item(self.current_item, self.current_type)
+        if isinstance(row_key.value, dict):
+            key_str = json.dumps(row_key.value, sort_keys=True)
+        else:
+            key_str = str(row_key.value)
+        raw_doc = self.raw_docs.get(key_str)
+        if raw_doc is not None:
+            self._open_document_editor(row_key, raw_doc)
 
     def action_edit_sql(self):
         if self.current_type != "view":
@@ -1574,6 +1829,9 @@ class DbMan(App):
         mutates the underlying data rather than just how it's displayed."""
         if self.mode != "view":
             self.notify("Column width only allowed in View mode", severity="error")
+            return
+        if self.select_mode != "column":
+            self.notify("Column width only allowed in column select mode (press 's' to rotate)", severity="error")
             return
         if not isinstance(self.focused, DataTable) or not self.current_item:
             return

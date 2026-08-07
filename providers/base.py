@@ -42,6 +42,7 @@ class Capabilities:
     truncate_column: bool = True
     whole_row_edit: bool = False
     delete_item: bool = True
+    add_row: bool = False
 
 
 @dataclass
@@ -127,6 +128,14 @@ class Provider(ABC):
     def update_row_json(
         self, name: str, item_type: str, row_key: RowKey, new_json_text: str
     ) -> RowKey:
+        raise NotImplementedError
+
+    def add_row(self, name: str, item_type: str) -> RowKey:
+        """Create a new, minimal row/document. Only relevant/implemented for
+        providers with capabilities.add_row = True — currently CouchDB's
+        freeform documents. SQL tables need a schema-aware form (typed
+        defaults for NOT NULL columns), deferred to a future dynamic-forms
+        layer rather than implemented here."""
         raise NotImplementedError
 
     @abstractmethod
