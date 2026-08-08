@@ -24,6 +24,7 @@ from view_settings import (
     ViewSettingsStore, derive_db_name, apply_view_settings,
     compute_column_widths, truncate_rows,
 )
+from workspace import WorkspaceStore, ConnectionSession
 
 # ... (rest of imports unchanged) ...
 
@@ -1072,9 +1073,11 @@ class DbMan(App):
             return True
         return ctx(self)
 
-    def __init__(self, db_url):
+    def __init__(self, db_url, workspace=None, workspace_name=None):
         super().__init__()
         self.db_url = db_url
+        self.workspace = workspace
+        self.workspace_name = workspace_name
         self.current_item = None
         self.current_type = None
         self.rows_editable = False
@@ -1097,6 +1100,8 @@ class DbMan(App):
                 if self.provider.capabilities.lookup_plugin else None
             )
             self.view_settings = ViewSettingsStore(derive_db_name(db_url))
+            if self.workspace is not None:
+                self.workspace.upsert_connection(self.workspace_name, db_url)
         except Exception as e:
             print(f"Error connecting to database: {e}")
             sys.exit(1)
@@ -1152,10 +1157,68 @@ class DbMan(App):
             sidebar_list.append(DbItem(p, "plugin"))
             
         if not self.current_item:
-            if views:
-                self.load_item(views[0], "view")
-            elif tables:
-                self.load_item(tables[0], "table")
+            restored = self._restore_workspace_session(views, tables)
+            if not restored:
+                if views:
+                    self.load_item(views[0], "view")
+                elif tables:
+                    self.load_item(tables[0], "table")
+
+    def _restore_workspace_session(self, views, tables) -> bool:
+        """On first load, re-open the item/mode/select_mode/cursor this
+        connection was left on last time it quit cleanly. Returns False
+        (falling through to the default first-item selection) if there's
+        no saved session or the saved item no longer exists."""
+        if self.workspace is None:
+            return False
+        session = self.workspace.get_session(self.workspace_name)
+        if session is None or session.item_name is None:
+            return False
+        available = {"view": views, "table": tables, "plugin": ["lookup"] if self.lookup_plugin else []}
+        if session.item_name not in available.get(session.item_type, []):
+            return False
+
+        self.mode = session.mode
+        self.select_mode = session.select_mode
+        self.load_item(session.item_name, session.item_type)
+
+        sidebar_list = self.query_one("#sidebar-list", ListView)
+        for i, child in enumerate(sidebar_list.children):
+            if isinstance(child, DbItem) and child.item_name == session.item_name and child.item_type == session.item_type:
+                sidebar_list.index = i
+                break
+
+        if session.cursor_row is not None and session.cursor_column is not None:
+            try:
+                self.query_one("#data-table", DataTable).move_cursor(
+                    row=session.cursor_row, column=session.cursor_column
+                )
+            except Exception:
+                pass
+        return True
+
+    async def action_quit(self) -> None:
+        self._save_workspace_session()
+        await super().action_quit()
+
+    def _save_workspace_session(self):
+        if self.workspace is None or self.current_item is None:
+            return
+        cursor_row = cursor_col = None
+        if self.mode == "view":
+            try:
+                coord = self.query_one("#data-table", DataTable).cursor_coordinate
+                cursor_row, cursor_col = coord.row, coord.column
+            except Exception:
+                pass
+        self.workspace.save_session(self.workspace_name, ConnectionSession(
+            item_name=self.current_item,
+            item_type=self.current_type,
+            mode=self.mode,
+            select_mode=self.select_mode,
+            cursor_row=cursor_row,
+            cursor_column=cursor_col,
+        ))
 
     def reset_paging(self):
         self.page_cursor = None
@@ -1909,8 +1972,12 @@ class DbMan(App):
         self.push_screen(ColumnWidthScreen(column_name, current_override, auto_width), apply_width)
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: dbman <database_url_or_file>")
+    workspace = WorkspaceStore()
+    resolved = workspace.resolve(sys.argv[1] if len(sys.argv) > 1 else None)
+    if resolved is None:
+        print("Usage: dbman <database_url_or_file_or_saved_connection_name>")
+        print("(bare 'dbman' works once a connection has been saved to ./dbman.json)")
         sys.exit(1)
-    app = DbMan(sys.argv[1])
+    url, name = resolved
+    app = DbMan(url, workspace=workspace, workspace_name=name)
     app.run()
