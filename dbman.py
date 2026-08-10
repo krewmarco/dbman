@@ -139,15 +139,14 @@ class ShortcutsScreen(ModalScreen):
                 " tab: Cycle focus (Sidebar -> Main Area)\n"
                 " shift+tab: Jump to next sidebar section\n"
                 " m: Toggle View/Schema/SQL/Diag mode\n"
-                " ctrl+d: Switch to Diagram mode\n"
                 " ?: Toggle this Shortcuts panel\n"
                 " ctrl+p: Toggle this Shortcuts panel\n\n"
                 " [bold]Navigation[/]\n"
                 " j / k: Move down / up\n"
                 " h / l: Move left / right (Table only)\n"
-                " pgup / pgdn: Page Up / Down (Mac: fn + up / fn + down)\n"
+                " pgup / pgdn or ctrl+d / ctrl+u: Scroll one screen down / up (Mac: fn + up / fn + down)\n"
                 " g / G: Home / End\n"
-                " \\] / \\[: Next / Previous page of rows (View mode)\n\n"
+                " \\] / \\[: Fetch next / previous page of rows from the DB (View mode)\n\n"
                 " [bold]Editing & Filtering[/]\n"
                 " e: Edit selected cell/row (View mode) or SQL (SQL mode)\n"
                 " E: Edit whole document as JSON (document DB providers)\n"
@@ -1014,13 +1013,13 @@ class DbMan(App):
         Binding("l", "cursor_right", "Right", show=False),
         Binding("pageup", "page_up", "PgUp", show=False),
         Binding("pagedown", "page_down", "PgDn", show=False),
+        Binding("ctrl+u", "page_up", "PgUp", show=False),
+        Binding("ctrl+d", "page_down", "PgDn", show=False),
         Binding("g", "scroll_home", "Home", show=False),
         Binding("G", "scroll_end", "End", show=False),
         Binding("tab", "switch_focus", "Sidebar/Main"),
         Binding("shift+tab", "jump_section", "Jump Section"),
         Binding("m", "toggle_mode", "View/Schema/SQL/Diag Mode"),
-        Binding("ctrl+d", "change_mode_diagram", "Diagram Mode"),
-        Binding("command+d", "change_mode_diagram", "Diagram Mode", show=False),
         Binding("d", "delete_item", "Delete"),
         Binding("?", "toggle_shortcuts", "Shortcuts", show=False),
         Binding("ctrl+p", "toggle_shortcuts", "Shortcuts"),
@@ -1061,7 +1060,6 @@ class DbMan(App):
         "unhide_column": _unhide_column_ctx,
         "delete_item": _delete_item_ctx,
         "toggle_mode": _toggle_mode_ctx,
-        "change_mode_diagram": _ctx(capability="diagram"),
         "export_csv": _export_csv_ctx,
         "add": _add_ctx,
         "clear_filters": _clear_filters_ctx,
@@ -1518,23 +1516,6 @@ class DbMan(App):
                     self.load_item(self.current_item, self.current_type)
 
         self.push_screen(UnhideColumnScreen(list(settings.hidden)), do_unhide)
-
-    def action_change_mode_diagram(self):
-        if not self.provider.capabilities.diagram:
-            self.notify("Diagram not available for this provider", severity="error")
-            return
-        self.mode = "diagram"
-        self.refresh_bindings()
-        self.refresh_sidebar()
-        if self.current_item:
-            self.load_item(self.current_item, self.current_type, should_focus=True)
-        else:
-            self.query_one("#sidebar").display = False
-            switcher = self.query_one(ContentSwitcher)
-            switcher.current = "diagram-view"
-            diag_widget = self.query_one("#diagram-view", DiagramView)
-            diag_widget.refresh_diagram()
-            diag_widget.focus()
 
     def action_filter_column(self):
         if self.mode != "view":
