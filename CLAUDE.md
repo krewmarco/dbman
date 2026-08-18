@@ -11,7 +11,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 ./dbman <path-to-sqlite-file-or-db-url>          # e.g. ./dbman garden.sqlite
 ./dbman couchdb://user:pass@host:5984/dbname     # CouchDB, one database per invocation
-./dbman notion://<integration-token>@<page-id>   # Notion, one page's child databases per invocation
+./dbman notion://<integration-token>@notion.so/<page-id>  # Notion, one page's child databases per invocation
 ./dbman                                          # bare: reconnect to the last-used connection saved in ./dbman.json
 ./dbman <saved-connection-name>                  # reconnect to a specific saved connection by name
 ```
@@ -60,7 +60,7 @@ There's also no automated coverage of the app itself — verify changes by actua
 
 ### `NotionProvider` (Notion databases-as-tables) — see issue #16
 
-- **Concept mapping**: a `notion://<integration-token>@<page-id>` URL names exactly one Notion page (auth token embedded in the URL, gitignored in `dbman.json`, matching CouchDB's convention). Each `child_database` block that lives directly under that page becomes one dbman "table" — confirmed against a real page that this works for both inline and full-page-view child databases. There is no separate "view" concept yet (`list_views()` always returns `[]`); a database row is a Notion page (`RowKey` = page id).
+- **Concept mapping**: a `notion://<integration-token>@notion.so/<page-id>` URL names exactly one Notion page (auth token embedded in the URL, gitignored in `dbman.json`, matching CouchDB's convention). The page id deliberately lives in the URL *path*, not the host, mirroring CouchDB's `couchdb://user:pass@host/dbname` shape — `derive_db_name()` (`view_settings.py`) extracts a connection name from the path, and a host-only shape would leave the path empty and fall back to hashing the whole URL (token included) into the saved connection name and a `.dbman/*.json` filename on disk. The host segment itself (`notion.so` above) is a readable placeholder — the provider never actually connects to it, every request goes to `api.notion.com`. Each `child_database` block that lives directly under that page becomes one dbman "table" — confirmed against a real page that this works for both inline and full-page-view child databases. There is no separate "view" concept yet (`list_views()` always returns `[]`); a database row is a Notion page (`RowKey` = page id).
 - **Schema is declared, not inferred** (unlike CouchDB): `get_schema` reads `GET /databases/{id}`'s `properties` map directly — one HTTP call, no document sampling. Pinned to `Notion-Version: 2022-06-28` deliberately, since Notion's newer multi-data-source database model (2025-09-03+) would require picking a data source per database; out of scope until a database on a real workspace actually needs it.
 - **Editable vs. read-only columns**: `_EDITABLE_TYPES` in `notion_provider.py` covers the flat scalar property types (`title`, `rich_text`, `number`, `checkbox`, `url`, `email`, `phone_number`, `date`, `select`) — these map onto dbman's plain-text `EditCellScreen` the same way SQL columns do. Everything else (`relation`, `multi_select`, `people`, `files`, `formula`, `rollup`, `status`, `created_time`/`last_edited_time`/`created_by`/`last_edited_by`, `unique_id`, and any unrecognized type) is flattened to a display string by `_read_property` but marked `Column.read_only = True`; `_write_property` raises for these, so an attempted edit surfaces as a normal `"Update failed: ..."` notification rather than crashing.
 - **Paging** is a direct fit, unlike SQL's offset-simulation or CouchDB's bookmark/skip-duplicate dance: Notion's `POST /databases/{id}/query` is natively cursor-based (`start_cursor` in, `next_cursor`/`has_more` out), passed straight through to `RowPage`.
@@ -124,7 +124,7 @@ There's no fixture setup for this either — it needs a real Notion integration 
 1. Create an internal integration at https://www.notion.so/my-integrations and copy its secret (`ntn_...` or `secret_...`).
 2. Open the target Notion page in the browser, use "..." → "Connections" → add the integration, so it can see the page and its child databases.
 3. Copy the page ID from the page's URL (the trailing 32-char hex string, with or without dashes).
-4. `./dbman notion://<token>@<page-id>`
+4. `./dbman notion://<token>@notion.so/<page-id>`
 
 Seed at least one database with a mix of editable property types (`title`, `select`, `checkbox`, `date`, ...) and at least one read-only type (`relation`, `multi_select`, or `formula`) to exercise both `_write_property` and the read-only error path.
 

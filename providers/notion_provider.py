@@ -125,11 +125,18 @@ class NotionProvider(Provider):
 
         parts = urlsplit(db_url)
         token = parts.username
-        page_id = parts.hostname
-        if not token or not page_id:
+        path_segments = [p for p in parts.path.split("/") if p]
+        # Page id lives in the URL *path* (like CouchDB's dbname), not the
+        # host, specifically so derive_db_name() (view_settings.py) can pull
+        # a secret-free name from it - a bare host+userinfo shape would leave
+        # the path empty and fall back to hashing the whole URL, token
+        # included, into both the saved connection name and a .dbman/*.json
+        # filename on disk.
+        if not token or len(path_segments) != 1:
             raise ValueError(
-                "Notion URL must be notion://<integration-token>@<page-id>"
+                "Notion URL must be notion://<integration-token>@notion.so/<page-id>"
             )
+        page_id = path_segments[0]
         self.page_id = page_id
 
         self.session = requests.Session()
