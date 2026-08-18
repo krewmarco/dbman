@@ -141,6 +141,7 @@ class ShortcutsScreen(ModalScreen):
                 " tab: Cycle focus (Sidebar -> Main Area)\n"
                 " shift+tab: Jump to next sidebar section\n"
                 " m: Toggle View/Schema/SQL/Diag mode\n"
+                " r: Reload current table/view from the database\n"
                 " ?: Toggle this Shortcuts panel\n"
                 " ctrl+p: Toggle this Shortcuts panel\n\n"
                 " [bold]Navigation[/]\n"
@@ -1023,6 +1024,7 @@ class DbMan(App):
         Binding("tab", "switch_focus", "Sidebar/Main"),
         Binding("shift+tab", "jump_section", "Jump Section"),
         Binding("m", "toggle_mode", "View/Schema/SQL/Diag Mode"),
+        Binding("r", "reload", "Reload"),
         Binding("d", "delete_item", "Delete"),
         Binding("?", "toggle_shortcuts", "Shortcuts", show=False),
         Binding("ctrl+p", "toggle_shortcuts", "Shortcuts"),
@@ -1149,6 +1151,19 @@ class DbMan(App):
         same-item cursor restore keeps this from disrupting position."""
         if self.mode == "view" and self.current_item:
             self.load_item(self.current_item, self.current_type)
+
+    def action_reload(self):
+        """Manual, terminal-independent fallback for on_app_focus: that
+        auto-refresh only fires if the terminal actually reports xterm
+        FocusIn/FocusOut (e.g. Terminal.app on macOS doesn't), so 'r' is the
+        reliable way to pick up an external edit (a Notion row edited via
+        'e', a change made outside dbman entirely, ...). Unlike
+        on_app_focus, this isn't restricted to View mode - reload whatever's
+        currently shown."""
+        if not self.current_item:
+            return
+        self.load_item(self.current_item, self.current_type)
+        self.notify("Reloaded")
 
     def refresh_sidebar(self):
         sidebar_list = self.query_one("#sidebar-list", ListView)
