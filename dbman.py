@@ -1235,28 +1235,26 @@ class DbMan(App):
         views = self.get_views()
         tables = self.get_tables()
         plugins = ["lookup"] if self.lookup_plugin else []
-        
-        mode_suffix = f" ({self.mode.upper()})"
-        
-        sidebar_list.append(SidebarHeader(f"VIEWS{mode_suffix}"))
-        for v in views:
-            sidebar_list.append(DbItem(v, "view"))
-            
-        sidebar_list.append(SidebarHeader(f"TABLES{mode_suffix}"))
+
+        sidebar_list.append(SidebarHeader("TABLES"))
         for t in tables:
             sidebar_list.append(DbItem(t, "table"))
 
-        sidebar_list.append(SidebarHeader(f"PLUGINS"))
+        sidebar_list.append(SidebarHeader("VIEWS"))
+        for v in views:
+            sidebar_list.append(DbItem(v, "view"))
+
+        sidebar_list.append(SidebarHeader("PLUGINS"))
         for p in plugins:
             sidebar_list.append(DbItem(p, "plugin"))
             
         if not self.current_item:
             restored = self._restore_workspace_session(views, tables)
             if not restored:
-                if views:
-                    self.load_item(views[0], "view")
-                elif tables:
+                if tables:
                     self.load_item(tables[0], "table")
+                elif views:
+                    self.load_item(views[0], "view")
 
     def _restore_workspace_session(self, views, tables) -> bool:
         """On first load, re-open the item/mode/select_mode/cursor this
