@@ -2,6 +2,7 @@
 import argparse
 import sys
 import traceback
+import webbrowser
 import math
 import random
 import csv
@@ -867,7 +868,8 @@ def _ctx(modes=None, select_modes=None, item_types=None, capability=None):
 def _edit_cell_ctx(app):
     """'e' is polymorphic: SQL mode edits the View's SQL, the lookup plugin
     edits its own config, and in View mode what it edits depends on
-    select_mode (field: the cell, row: the whole row/document, column: n/a).
+    select_mode (field: the cell, row: the whole row/document, or a hand-off
+    to an external app/page for providers with open_in_browser; column: n/a).
     Too many cross-cutting branches to express as a plain _ctx() AND."""
     if app.mode == "sql":
         return app.current_type == "view" and app.provider.capabilities.create_definition
@@ -876,7 +878,7 @@ def _edit_cell_ctx(app):
     if app.mode != "view":
         return False
     if app.select_mode == "row":
-        return app.provider.capabilities.whole_row_edit
+        return app.provider.capabilities.whole_row_edit or app.provider.capabilities.open_in_browser
     if app.select_mode == "column":
         return False
     return app.current_type == "table" and app.rows_editable
@@ -1674,6 +1676,8 @@ class DbMan(App):
         if self.select_mode == "row":
             if self.provider.capabilities.whole_row_edit:
                 self.action_edit_document()
+            elif self.provider.capabilities.open_in_browser:
+                self.action_open_in_browser()
             else:
                 self.notify("Row edit not supported for this provider — switch to field mode", severity="error")
             return
@@ -1753,6 +1757,26 @@ class DbMan(App):
             self.notify("Cannot edit this row", severity="error")
             return
         self._open_document_editor(row_key, raw_doc)
+
+    def action_open_in_browser(self):
+        if self.mode != "view" or not self.provider.capabilities.open_in_browser:
+            self.notify("Opening in browser is not available for this provider", severity="error")
+            return
+        if not isinstance(self.focused, DataTable) or not self.current_item:
+            return
+
+        coord = self.focused.cursor_coordinate
+        row_id_str = list(self.focused.rows.values())[coord.row].key.value
+        row_key = self.row_keys.get(row_id_str)
+        if row_key is None or row_key.value is None:
+            self.notify("Cannot open this row", severity="error")
+            return
+        try:
+            url = self.provider.get_row_url(self.current_item, self.current_type, row_key)
+            webbrowser.open(url)
+            self.notify("Opened in browser")
+        except Exception as e:
+            self.notify(f"Could not open in browser: {e}", severity="error")
 
     def _open_document_editor(self, row_key, raw_doc):
         """Shared by action_edit_document (existing row) and _add_row

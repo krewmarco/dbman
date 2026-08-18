@@ -42,6 +42,7 @@ class Capabilities:
     lookup_plugin: bool = False
     truncate_column: bool = True
     whole_row_edit: bool = False
+    open_in_browser: bool = False  # row edit hands off to an external app/page instead of an in-app modal
     delete_item: bool = True
     add_row: bool = False
 
@@ -124,6 +125,12 @@ class Provider(ABC):
     ) -> list[tuple[str, Any]]:
         """(display, key) pairs for a FK dropdown. Only relevant/implemented
         for providers with capabilities.lookup_plugin = True."""
+        raise NotImplementedError
+
+    def get_row_url(self, name: str, item_type: str, row_key: RowKey) -> str:
+        """A URL that opens this row for full viewing/editing in its native
+        app (e.g. a Notion page's own share link). Only relevant/implemented
+        for providers with capabilities.open_in_browser = True."""
         raise NotImplementedError
 
     def update_row_json(
