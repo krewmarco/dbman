@@ -45,6 +45,7 @@ class Capabilities:
     open_in_browser: bool = False  # row edit hands off to an external app/page instead of an in-app modal
     delete_item: bool = True
     add_row: bool = False
+    delete_row: bool = False
 
 
 @dataclass
@@ -148,6 +149,12 @@ class Provider(ABC):
 
     @abstractmethod
     def delete_item(self, name: str, item_type: str) -> None: ...
+
+    def delete_row(self, name: str, item_type: str, row_key: RowKey) -> None:
+        """Delete/archive a single row, distinct from delete_item's
+        table/view-level granularity. Only relevant/implemented for
+        providers with capabilities.delete_row = True."""
+        raise NotImplementedError
 
     def count_over_length(self, name: str, column: str, target_len: int) -> int:
         raise NotImplementedError

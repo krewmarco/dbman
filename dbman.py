@@ -959,7 +959,14 @@ def _truncate_column_ctx(app):
 
 
 def _delete_item_ctx(app):
-    return bool(app.current_type) and app.current_type != "plugin" and app.provider.capabilities.delete_item
+    """'d' is polymorphic like 'e': in View mode with the DataTable focused
+    in row-select mode, it deletes the currently selected row instead of the
+    whole table/view (gated on capabilities.delete_row, not delete_item)."""
+    if app.current_type == "plugin":
+        return False
+    if app.mode == "view" and isinstance(app.focused, DataTable) and app.select_mode == "row":
+        return bool(app.current_item) and app.rows_editable and app.provider.capabilities.delete_row
+    return bool(app.current_type) and app.provider.capabilities.delete_item
 
 
 def _toggle_mode_ctx(app):
@@ -1667,6 +1674,15 @@ class DbMan(App):
         if self.current_type == "plugin":
             self.notify("Cannot delete Plugins", severity="error")
             return
+        if (
+            self.mode == "view"
+            and isinstance(self.focused, DataTable)
+            and self.select_mode == "row"
+            and self.current_item
+            and self.rows_editable
+        ):
+            self._delete_row()
+            return
         if not self.provider.capabilities.delete_item:
             self.notify("Deleting is not available for this provider", severity="error")
             return
@@ -1692,6 +1708,33 @@ class DbMan(App):
                 except Exception as e:
                     self.notify(f"Delete failed: {e}", severity="error")
         msg = f"Delete {item_type} '{name}'?"
+        self.push_screen(ConfirmScreen(msg, "Delete"), on_confirm)
+
+    def _delete_row(self):
+        if not self.provider.capabilities.delete_row:
+            self.notify("Row delete not supported for this provider — switch to field mode", severity="error")
+            return
+        coord = self.focused.cursor_coordinate
+        row_id_str = list(self.focused.rows.values())[coord.row].key.value
+        row_key = self.row_keys.get(row_id_str)
+        if row_key is None or row_key.value is None:
+            self.notify("Cannot delete this row", severity="error")
+            return
+        name, item_type = self.current_item, self.current_type
+        # Best-effort label for the confirm dialog: the first visible
+        # column's value (title/PK-ish, since providers order that first).
+        row_vals = self.row_values.get(row_id_str, {})
+        label = next(iter(row_vals.values()), None) if row_vals else None
+        msg = f"Delete row '{label}'?" if label else "Delete this row?"
+
+        def on_confirm(do_delete):
+            if do_delete:
+                try:
+                    self.provider.delete_row(name, item_type, row_key)
+                    self.notify("Row deleted")
+                    self.load_item(self.current_item, self.current_type)
+                except Exception as e:
+                    self.notify(f"Delete failed: {e}", severity="error")
         self.push_screen(ConfirmScreen(msg, "Delete"), on_confirm)
 
     def action_cursor_down(self):

@@ -161,6 +161,7 @@ class NotionProvider(Provider):
             open_in_browser=True,
             delete_item=False,
             add_row=True,
+            delete_row=True,
         )
 
     # -- HTTP helpers ---------------------------------------------------------
@@ -279,6 +280,13 @@ class NotionProvider(Provider):
             "Deleting a Notion database isn't exposed from dbman - archive it "
             "in Notion directly"
         )
+
+    def delete_row(self, name, item_type, row_key: RowKey) -> None:
+        # Notion's API has no permanent-delete for pages - archiving is
+        # exactly what the "Delete" button in Notion's own UI does (moves it
+        # to Trash, recoverable there), so this is a faithful, non-destructive
+        # match rather than a workaround.
+        self._patch(f"/pages/{row_key.value}", {"archived": True})
 
     def update_cell(self, name, item_type, row_key: RowKey, column, value) -> RowKey:
         database_id = self._database_ids[name]
