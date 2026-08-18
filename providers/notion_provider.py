@@ -158,6 +158,7 @@ class NotionProvider(Provider):
             lookup_plugin=False,
             truncate_column=False,
             whole_row_edit=False,
+            open_in_browser=True,
             delete_item=False,
             add_row=True,
         )
@@ -263,6 +264,15 @@ class NotionProvider(Provider):
 
     def get_diagram_model(self) -> DiagramModel:
         return DiagramModel()
+
+    def get_row_url(self, name, item_type, row_key: RowKey) -> str:
+        # A row is a Notion page in its own right, and a bare no-dash page
+        # id resolves directly (no title slug needed) - verified against a
+        # real page. This opens in the Notion desktop app if it's installed
+        # and registered for notion.so links, else the web app in a browser
+        # - either way dbman hands the whole row (properties + body) off to
+        # Notion's own editor rather than trying to represent it itself.
+        return f"https://www.notion.so/{row_key.value.replace('-', '')}"
 
     def delete_item(self, name, item_type) -> None:
         raise NotImplementedError(
