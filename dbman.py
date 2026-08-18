@@ -28,6 +28,8 @@ from view_settings import (
 )
 from workspace import WorkspaceStore, ConnectionSession
 
+__version__ = "0.1.0"
+
 # ... (rest of imports unchanged) ...
 
 # ... (ShortcutsScreen, FilterColumnScreen, ConfirmScreen, EditCellScreen, TruncateColumnScreen, DbItem, SidebarHeader unchanged) ...
@@ -143,7 +145,8 @@ class ShortcutsScreen(ModalScreen):
                 " m: Toggle View/Schema/SQL/Diag mode\n"
                 " r: Reload current table/view from the database\n"
                 " ?: Toggle this Shortcuts panel\n"
-                " ctrl+p: Toggle this Shortcuts panel\n\n"
+                " ctrl+p: Toggle this Shortcuts panel\n"
+                " V: Show version/about screen\n\n"
                 " [bold]Navigation[/]\n"
                 " j / k: Move down / up\n"
                 " h / l: Move left / right (Table only)\n"
@@ -175,8 +178,60 @@ class ShortcutsScreen(ModalScreen):
 
     def key_question_mark(self) -> None:
         self.app.pop_screen()
-    
+
     def key_ctrl_p(self) -> None:
+        self.app.pop_screen()
+
+DBMAN_BANNER = (
+    "████   ████   █   █   ███   █   █\n"
+    "█   █  █   █  ██ ██  █   █  ██  █\n"
+    "█   █  ████   █ █ █  █████  █ █ █\n"
+    "█   █  █   █  █   █  █   █  █  ██\n"
+    "████   ████   █   █  █   █  █   █"
+)
+
+class VersionScreen(ModalScreen):
+    """A modal 'about' splash: ASCII banner, tagline, and version - see
+    issue #13. Scoped down from that issue's full superhero-mascot concept
+    to a plain block-letter banner, since hand-drawing a recognizable
+    figure in ASCII without visual iteration is a much bigger, more
+    failure-prone undertaking than a text banner."""
+    CSS = """
+    VersionScreen {
+        background: rgba(0, 0, 0, 0.5);
+        align: center middle;
+    }
+    #version-dialog {
+        background: $panel;
+        border: thick $primary;
+        padding: 1 2;
+        width: auto;
+        height: auto;
+    }
+    #version-content {
+        margin-bottom: 1;
+        text-align: center;
+        width: 100%;
+    }
+    Button {
+        width: 100%;
+    }
+    """
+    def compose(self) -> ComposeResult:
+        with Vertical(id="version-dialog"):
+            yield Static(
+                f"{DBMAN_BANNER}\n\n"
+                f"Master the data!\n\n"
+                f"v{__version__}  ·  github.com/krewmarco/dbman",
+                id="version-content",
+            )
+            yield Button("Close", variant="primary", id="close-button")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "close-button":
+            self.app.pop_screen()
+
+    def key_escape(self) -> None:
         self.app.pop_screen()
 
 class FilterColumnScreen(ModalScreen):
@@ -1028,6 +1083,7 @@ class DbMan(App):
         Binding("d", "delete_item", "Delete"),
         Binding("?", "toggle_shortcuts", "Shortcuts", show=False),
         Binding("ctrl+p", "toggle_shortcuts", "Shortcuts"),
+        Binding("V", "toggle_version", "Version"),
         Binding("e", "edit_cell", "Edit"),
         Binding("E", "edit_document", "Edit Document", show=False),
         Binding("a", "add", "Add"),
@@ -1676,6 +1732,12 @@ class DbMan(App):
         else:
             self.push_screen(ShortcutsScreen())
 
+    def action_toggle_version(self):
+        if isinstance(self.screen, VersionScreen):
+            self.pop_screen()
+        else:
+            self.push_screen(VersionScreen())
+
     def action_edit_cell(self):
         if self.mode == "sql":
             self.action_edit_sql()
@@ -2023,6 +2085,9 @@ def _build_arg_parser():
         help="Friendly name to save this connection under, e.g. 'couch' or 'notion' "
              "(so it can later be reopened with 'dbman <name>'). Only applies when "
              "CONNECTION is a fresh url/path, not when reconnecting by an existing name.",
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"dbman {__version__}",
     )
     return parser
 
