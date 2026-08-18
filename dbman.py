@@ -1771,9 +1771,12 @@ class DbMan(App):
         if row_key is None or row_key.value is None:
             self.notify("Cannot open this row", severity="error")
             return
-        url = self.provider.get_row_url(self.current_item, self.current_type, row_key)
-        webbrowser.open(url)
-        self.notify("Opened in browser")
+        try:
+            url = self.provider.get_row_url(self.current_item, self.current_type, row_key)
+            webbrowser.open(url)
+            self.notify("Opened in browser")
+        except Exception as e:
+            self.notify(f"Could not open in browser: {e}", severity="error")
 
     def _open_document_editor(self, row_key, raw_doc):
         """Shared by action_edit_document (existing row) and _add_row
