@@ -14,6 +14,7 @@ class Column:
     default: Optional[str] = None
     primary_key: bool = False
     inferred: bool = False  # True when sampled from data rather than a declared schema
+    read_only: bool = False  # True for computed/system columns (e.g. Notion formula/rollup)
 
 
 @dataclass(frozen=True)
