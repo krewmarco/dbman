@@ -1138,6 +1138,18 @@ class DbMan(App):
         self.refresh_sidebar()
         self.query_one("#sidebar-list").focus()
 
+    def on_app_focus(self):
+        """Fires when the terminal window regains OS focus (Textual enables
+        xterm FocusIn/FocusOut reporting automatically - not supported by
+        every terminal/multiplexer, e.g. tmux needs `focus-events on`).
+        Auto-refreshes the currently loaded item, since the most common
+        reason to tab back in is having just edited something externally -
+        e.g. a Notion row opened via `e`/action_open_in_browser. Harmless
+        no-op re-fetch if nothing actually changed; load_item's existing
+        same-item cursor restore keeps this from disrupting position."""
+        if self.mode == "view" and self.current_item:
+            self.load_item(self.current_item, self.current_type)
+
     def refresh_sidebar(self):
         sidebar_list = self.query_one("#sidebar-list", ListView)
         sidebar_list.clear()
