@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import sys
 import traceback
 import math
@@ -1097,7 +1098,10 @@ class DbMan(App):
                 LookupPlugin(self.provider.sqlalchemy_engine())
                 if self.provider.capabilities.lookup_plugin else None
             )
-            self.view_settings = ViewSettingsStore(derive_db_name(db_url))
+            # Prefer the friendly saved connection name (may be a --name
+            # override) over the raw url-derived one, so e.g. a notion://
+            # connection's view settings don't land in a page-id-UUID file.
+            self.view_settings = ViewSettingsStore(self.workspace_name or derive_db_name(db_url))
             if self.workspace is not None:
                 self.workspace.upsert_connection(self.workspace_name, db_url)
         except Exception as e:
@@ -1952,11 +1956,36 @@ class DbMan(App):
 
         self.push_screen(ColumnWidthScreen(column_name, current_override, auto_width), apply_width)
 
+def _build_arg_parser():
+    parser = argparse.ArgumentParser(
+        prog="dbman",
+        description="A vim-like terminal database browser.",
+    )
+    parser.add_argument(
+        "connection", nargs="?", default=None,
+        help="A sqlite path/URL, postgresql://, mysql://, couchdb://, or notion:// "
+             "connection string, or the name of a previously-saved connection. "
+             "Omit to reconnect to the last-used connection.",
+    )
+    parser.add_argument(
+        "-n", "--name",
+        help="Friendly name to save this connection under, e.g. 'couch' or 'notion' "
+             "(so it can later be reopened with 'dbman <name>'). Only applies when "
+             "CONNECTION is a fresh url/path, not when reconnecting by an existing name.",
+    )
+    return parser
+
+
 if __name__ == "__main__":
+    parser = _build_arg_parser()
+    args = parser.parse_args()
+    if args.name and args.connection is None:
+        parser.error("--name requires CONNECTION (nothing to name for a bare reconnect)")
+
     workspace = WorkspaceStore()
-    resolved = workspace.resolve(sys.argv[1] if len(sys.argv) > 1 else None)
+    resolved = workspace.resolve(args.connection, name_override=args.name)
     if resolved is None:
-        print("Usage: dbman <database_url_or_file_or_saved_connection_name>")
+        parser.print_usage()
         print("(bare 'dbman' works once a connection has been saved to ./dbman.json)")
         sys.exit(1)
     url, name = resolved

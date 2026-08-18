@@ -44,9 +44,16 @@ class WorkspaceStore:
                 pass
         self._data.setdefault("connections", {})
 
-    def resolve(self, arg: Optional[str]) -> Optional[tuple[str, str]]:
+    def resolve(self, arg: Optional[str], name_override: Optional[str] = None) -> Optional[tuple[str, str]]:
         """Returns (url, connection_name), or None if `arg` is None and
-        there's nothing saved yet to fall back to."""
+        there's nothing saved yet to fall back to.
+
+        `name_override` (dbman's `--name`/`-n`) only takes effect when `arg`
+        is a fresh url/path being saved for the first time -- it's a
+        friendly alternative to the auto-derived name (`derive_db_name`),
+        which for e.g. a `notion://` url is an unfriendly page-id UUID. It's
+        silently ignored when `arg` already names a saved connection, since
+        renaming an existing entry is a different operation than this."""
         connections = self._data["connections"]
 
         if arg is None:
@@ -62,10 +69,11 @@ class WorkspaceStore:
 
         # Not a saved connection name -- treat as a url/path exactly like
         # today, deriving a name to (maybe newly) save it under.
-        name = derive_db_name(arg)
+        base_name = name_override or derive_db_name(arg)
+        name = base_name
         suffix = 2
         while name in connections and connections[name]["url"] != arg:
-            name = f"{derive_db_name(arg)}-{suffix}"
+            name = f"{base_name}-{suffix}"
             suffix += 1
         return arg, name
 
