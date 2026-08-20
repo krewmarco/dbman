@@ -16,10 +16,10 @@ class SqlAlchemyProvider(Provider):
     def __init__(self, db_url: str):
         self.db_url = db_url
         self.engine = create_engine(db_url)
-        self.inspector = inspect(self.engine)
         self.capabilities = Capabilities(
             definition_pane=True,
             create_definition=True,
+            create_table=True,
             diagram=True,
             lookup_plugin=True,
             truncate_column=True,
@@ -29,6 +29,15 @@ class SqlAlchemyProvider(Provider):
 
     def sqlalchemy_engine(self):
         return self.engine
+
+    @property
+    def inspector(self):
+        # A fresh Inspector every access, not stored on self: SQLAlchemy's
+        # Inspector caches reflection results internally, which would mask
+        # tables/views created or dropped through the app (e.g. right after
+        # `a`-on-a-header creates one) until dbman restarts - contrary to
+        # the "reflected live" behavior the rest of this provider relies on.
+        return inspect(self.engine)
 
     def list_tables(self) -> list[str]:
         tables = self.inspector.get_table_names()
@@ -125,10 +134,16 @@ class SqlAlchemyProvider(Provider):
         except Exception as e:
             return f"Error fetching SQL: {e}"
 
-    def create_view(self, definition_text) -> None:
+    def _execute_ddl(self, definition_text) -> None:
         with self.engine.connect() as conn:
             conn.execute(text(definition_text))
             conn.commit()
+
+    def create_view(self, definition_text) -> None:
+        self._execute_ddl(definition_text)
+
+    def create_table_definition(self, definition_text) -> None:
+        self._execute_ddl(definition_text)
 
     def update_view_definition(self, name, definition_text) -> None:
         with self.engine.connect() as conn:

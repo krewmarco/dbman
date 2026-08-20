@@ -38,6 +38,7 @@ class RowPage:
 class Capabilities:
     definition_pane: bool = True
     create_definition: bool = True
+    create_table: bool = False
     diagram: bool = True
     lookup_plugin: bool = False
     truncate_column: bool = True
@@ -111,6 +112,12 @@ class Provider(ABC):
         return "CREATE VIEW new_view AS\nSELECT * FROM table_name"
 
     def create_view(self, definition_text: str) -> None:
+        raise NotImplementedError
+
+    def default_table_template(self) -> str:
+        return "CREATE TABLE new_table (\n    id INTEGER PRIMARY KEY,\n    name TEXT\n)"
+
+    def create_table_definition(self, definition_text: str) -> None:
         raise NotImplementedError
 
     def update_view_definition(self, name: str, definition_text: str) -> None:

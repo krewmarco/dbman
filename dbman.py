@@ -156,7 +156,8 @@ class ShortcutsScreen(ModalScreen):
                 " [bold]Editing & Filtering[/]\n"
                 " e: Edit selected cell/row (View mode) or SQL (SQL mode)\n"
                 " E: Edit whole document as JSON (document DB providers)\n"
-                " a: Add a new row (table) or create a new View (where supported)\n"
+                " a: Add a new row (table) or create a new Table/View (where supported;\n"
+                "    also works on a TABLES/VIEWS sidebar header, even when empty)\n"
                 " d: Delete selected table/view\n"
                 " x: Export current Table/View to CSV\n"
                 " f: Filter selected column (column select mode)\n"
@@ -674,10 +675,14 @@ class DbItem(ListItem):
         self.item_type = item_type # "table", "view", "plugin"
 
 class SidebarHeader(ListItem):
-    def __init__(self, title: str) -> None:
+    """Section header ('TABLES'/'VIEWS'/'PLUGINS'). Selectable like any other
+    sidebar item (arrow-key navigable) rather than disabled, so it's a
+    natural target for 'a' (Add) to create a new object of that section's
+    type even when the section is currently empty."""
+    def __init__(self, title: str, section_type: str) -> None:
         super().__init__(Label(f" {title} "))
         self.title = title
-        self.disabled = True 
+        self.section_type = section_type  # "table", "view", "plugin"
 
 class DiagramView(VerticalScroll, can_focus=True):
     """A container for displaying table diagrams using a force-directed layout."""
@@ -985,9 +990,29 @@ def _export_csv_ctx(app):
     return app.current_type in ("table", "view")
 
 
+def _highlighted_sidebar_header(app):
+    """The SidebarHeader currently highlighted in the sidebar ListView, if
+    any (headers are selectable so 'a' can create a new object of that
+    section's type even when the section is empty)."""
+    try:
+        sidebar_list = app.query_one("#sidebar-list", ListView)
+    except Exception:
+        return None
+    child = sidebar_list.highlighted_child
+    return child if isinstance(child, SidebarHeader) else None
+
+
 def _add_ctx(app):
     """'a' is polymorphic like 'e': add a row on a Table, create a new View
-    on a View. OR-of-branches, not a plain _ctx() AND."""
+    on a View, or - when a section header is highlighted - create a new
+    Table/View for that section. OR-of-branches, not a plain _ctx() AND."""
+    header = _highlighted_sidebar_header(app)
+    if header is not None:
+        if header.section_type == "table":
+            return app.provider.capabilities.create_table
+        if header.section_type == "view":
+            return app.provider.capabilities.create_definition
+        return False
     if app.mode != "view" or not app.current_item:
         return False
     if app.current_type == "table":
@@ -1023,12 +1048,12 @@ class DbMan(App):
         background: $panel;
     }
     SidebarHeader {
-        background: $primary;
+        background: $accent;
         color: $text;
         text-style: bold;
         padding: 0 1;
-        border-bottom: solid $primary;
-        border-top: solid $primary;
+        border-bottom: solid $accent;
+        border-top: solid $accent;
     }
     SidebarHeader:first-child {
         border-top: none;
@@ -1061,8 +1086,12 @@ class DbMan(App):
     ListItem {
         padding: 0 1;
     }
-    ListItem.--highlight {
-        background: $accent;
+    #sidebar-list > ListItem.-highlight {
+        background: $primary;
+        color: $text;
+    }
+    #sidebar-list:focus > ListItem.-highlight {
+        background: $primary;
         color: $text;
     }
     #small-label {
@@ -1236,15 +1265,15 @@ class DbMan(App):
         tables = self.get_tables()
         plugins = ["lookup"] if self.lookup_plugin else []
 
-        sidebar_list.append(SidebarHeader("TABLES"))
+        sidebar_list.append(SidebarHeader("TABLES", "table"))
         for t in tables:
             sidebar_list.append(DbItem(t, "table"))
 
-        sidebar_list.append(SidebarHeader("VIEWS"))
+        sidebar_list.append(SidebarHeader("VIEWS", "view"))
         for v in views:
             sidebar_list.append(DbItem(v, "view"))
 
-        sidebar_list.append(SidebarHeader("PLUGINS"))
+        sidebar_list.append(SidebarHeader("PLUGINS", "plugin"))
         for p in plugins:
             sidebar_list.append(DbItem(p, "plugin"))
             
@@ -1330,6 +1359,11 @@ class DbMan(App):
             self.filters = {}
             self.reset_paging()
             self.load_item(item.item_name, item.item_type, should_focus=False)
+        elif isinstance(item, SidebarHeader):
+            # Highlighting a header leaves the main view showing whatever
+            # was last loaded - just refresh the footer so 'Add' reflects
+            # this section's create capability.
+            self.refresh_bindings()
 
     def load_item(self, name, item_type, should_focus=False):
         saved_coord = None
@@ -1936,7 +1970,22 @@ class DbMan(App):
         for NOT NULL columns, deferred to a future dynamic-forms/
         business-logic layer). On a View, create a new view (formerly the
         standalone 'v' key — folded in here since it's the same "add a new
-        thing" gesture, just for a different item type). See issue #10."""
+        thing" gesture, just for a different item type). See issue #10.
+
+        On a section header (TABLES/VIEWS), creates a new Table/View for
+        that section via a raw-SQL text prompt — the same mechanism as
+        editing SQL on an existing View, just targeting a new object. This
+        is the only way to add a Table/View to an empty section, since
+        there's no existing item there to select first."""
+        header = _highlighted_sidebar_header(self)
+        if header is not None:
+            if header.section_type == "table":
+                self._add_table()
+            elif header.section_type == "view":
+                self._add_view()
+            else:
+                self.notify("Add only allowed on a Table or View", severity="error")
+            return
         if self.mode != "view" or not self.current_item:
             self.notify("Add only allowed in View mode, on a Table or View", severity="error")
             return
@@ -1946,6 +1995,22 @@ class DbMan(App):
             self._add_view()
         else:
             self.notify("Add only allowed on a Table or View", severity="error")
+
+    def _add_table(self):
+        if not self.provider.capabilities.create_table:
+            self.notify("Creating tables is not available for this provider", severity="error")
+            return
+        default_sql = self.provider.default_table_template()
+        def execute_create(new_sql):
+            if new_sql:
+                try:
+                    self.provider.create_table_definition(new_sql)
+                    self.notify("Table Created")
+                    self.refresh_sidebar()
+                except Exception as e:
+                    self.notify(f"Creation failed: {e}", severity="error")
+        language = self.provider.definition_language("table")
+        self.push_screen(EditTextScreen("Create New Table", default_sql, language=language), execute_create)
 
     def _add_row(self):
         if not self.provider.capabilities.add_row:
