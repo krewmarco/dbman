@@ -26,6 +26,18 @@ _EDITABLE_TYPES = {
     "phone_number", "date", "select",
 }
 
+# Notion's query API has no native "manual row order" - it can only sort by
+# a page's own properties. To support persistent shift+j/k reordering
+# (capabilities.reorder_row), dbman lazily adds this real `number` property
+# to the database the first time a reorder is attempted, and always sorts by
+# it once present. It's excluded from get_schema's returned columns so it
+# never shows up as a regular editable column - but unlike _dbman_layout for
+# SQLite, it can't be tucked away in a side table: Notion has no
+# join/sidecar concept, so this necessarily becomes a real, visible property
+# on the user's database (see CLAUDE.md's Notion provider notes).
+_ORDER_PROPERTY = "_dbman_order"
+_ORDER_STEP = 1000
+
 
 def _rich_text_to_str(rich_text: list) -> str:
     return "".join(t.get("plain_text", "") for t in (rich_text or []))
@@ -150,6 +162,10 @@ class NotionProvider(Provider):
         self._get(f"/pages/{page_id}")
 
         self._database_ids: dict = self._discover_databases(page_id)
+        # Per-database_id cache of whether _ORDER_PROPERTY exists yet -
+        # populated for free by get_schema's own database fetch, so a plain
+        # get_page doesn't need an extra round trip just to check.
+        self._order_ready: dict = {}
 
         self.capabilities = Capabilities(
             definition_pane=True,
@@ -162,6 +178,7 @@ class NotionProvider(Provider):
             delete_item=False,
             add_row=True,
             delete_row=True,
+            reorder_row=True,
         )
 
     # -- HTTP helpers ---------------------------------------------------------
@@ -216,8 +233,12 @@ class NotionProvider(Provider):
     def get_schema(self, name, item_type) -> list:
         database_id = self._database_ids[name]
         db = self._get(f"/databases/{database_id}")
+        properties = db.get("properties", {})
+        self._order_ready[database_id] = _ORDER_PROPERTY in properties
         columns = []
-        for prop_name, prop in db.get("properties", {}).items():
+        for prop_name, prop in properties.items():
+            if prop_name == _ORDER_PROPERTY:
+                continue  # dbman-owned sort ordinal, not a real column - see reorder_row
             ptype = prop.get("type")
             columns.append(Column(
                 name=prop_name,
@@ -240,6 +261,8 @@ class NotionProvider(Provider):
             payload["page_size"] = page_size
         if cursor:
             payload["start_cursor"] = cursor
+        if self._order_ready.get(database_id):
+            payload["sorts"] = [{"property": _ORDER_PROPERTY, "direction": "ascending"}]
 
         result = self._post(f"/databases/{database_id}/query", payload)
         pages = result.get("results", [])
@@ -302,8 +325,92 @@ class NotionProvider(Provider):
         database_id = self._database_ids[name]
         title_col = next((c for c in self.get_schema(name, item_type) if c.primary_key), None)
         properties = {title_col.name: _write_property("title", "")} if title_col else {}
+        if self._order_ready.get(database_id):
+            # Append past the current max so a freshly added row sorts last
+            # rather than landing with no ordinal (which would push it
+            # first/last unpredictably once _dbman_order is the sort key).
+            properties[_ORDER_PROPERTY] = {"number": self._max_order(database_id) + _ORDER_STEP}
         resp = self._post("/pages", {
             "parent": {"database_id": database_id},
             "properties": properties,
         })
         return RowKey(resp["id"])
+
+    # -- row reordering (capabilities.reorder_row) -----------------------------
+
+    def _ensure_order_property(self, database_id: str) -> None:
+        """Lazily add _ORDER_PROPERTY to the database and backfill existing
+        rows the first time a reorder is attempted against it. A no-op once
+        the property exists (cached in self._order_ready, or freshly
+        discovered via a schema fetch)."""
+        if self._order_ready.get(database_id):
+            return
+        db = self._get(f"/databases/{database_id}")
+        if _ORDER_PROPERTY not in db.get("properties", {}):
+            self._patch(f"/databases/{database_id}", {
+                "properties": {_ORDER_PROPERTY: {"number": {}}}
+            })
+            self._backfill_order(database_id)
+        self._order_ready[database_id] = True
+
+    def _backfill_order(self, database_id: str) -> None:
+        """One-time migration: assign every existing row a spaced ordinal
+        (1000, 2000, ...) in whatever order Notion's default query returns
+        them, so _dbman_order has a value to sort/swap against from then on.
+        N+1 PATCH calls, but this only ever runs once per database."""
+        order = 0
+        cursor = None
+        while True:
+            payload = {"page_size": 100}
+            if cursor:
+                payload["start_cursor"] = cursor
+            result = self._post(f"/databases/{database_id}/query", payload)
+            for page in result.get("results", []):
+                order += _ORDER_STEP
+                self._patch(f"/pages/{page['id']}", {
+                    "properties": {_ORDER_PROPERTY: {"number": order}}
+                })
+            if not result.get("has_more"):
+                break
+            cursor = result.get("next_cursor")
+
+    def _max_order(self, database_id: str) -> float:
+        result = self._post(f"/databases/{database_id}/query", {
+            "sorts": [{"property": _ORDER_PROPERTY, "direction": "descending"}],
+            "page_size": 1,
+        })
+        results = result.get("results", [])
+        if not results:
+            return 0
+        return results[0]["properties"][_ORDER_PROPERTY]["number"] or 0
+
+    def reorder_rows(self, name, item_type, ordered_row_keys: list) -> None:
+        """Batch counterpart to the (now-removed) single-step move: takes
+        the new desired sequence for a run of rows that moved locally and
+        reassigns exactly the order values those rows already hold, in
+        their new sequence - a pure permutation of known-fresh values read
+        once via point GETs (/pages/{id}, always read-your-writes
+        consistent), never re-derived from a query mid-batch. That query-
+        based neighbor lookup is what the original swap-based move_row used
+        internally, and it broke under rapid replay: Notion's
+        POST /databases/{id}/query index lagged behind very recent writes
+        by a couple of seconds in testing, so a second move issued right
+        after a first could still see the pre-first-move ordering and
+        silently redo the same swap instead of progressing. Point GETs on
+        /pages/{id} showed no such lag."""
+        database_id = self._database_ids[name]
+        self._ensure_order_property(database_id)
+        if len(ordered_row_keys) < 2:
+            return
+
+        current_order = {}
+        for row_key in ordered_row_keys:
+            page = self._get(f"/pages/{row_key.value}")
+            current_order[row_key.value] = page["properties"][_ORDER_PROPERTY]["number"] or 0
+
+        new_values = sorted(current_order.values())
+        for row_key, new_value in zip(ordered_row_keys, new_values):
+            if current_order[row_key.value] != new_value:
+                self._patch(f"/pages/{row_key.value}", {
+                    "properties": {_ORDER_PROPERTY: {"number": new_value}}
+                })

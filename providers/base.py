@@ -47,6 +47,7 @@ class Capabilities:
     delete_item: bool = True
     add_row: bool = False
     delete_row: bool = False
+    reorder_row: bool = False  # persistent manual row ordering (shift+j/k) - see Provider.move_row
 
 
 @dataclass
@@ -161,6 +162,33 @@ class Provider(ABC):
         """Delete/archive a single row, distinct from delete_item's
         table/view-level granularity. Only relevant/implemented for
         providers with capabilities.delete_row = True."""
+        raise NotImplementedError
+
+    def reorder_rows(self, name: str, item_type: str, ordered_row_keys: list) -> None:
+        """Persist a new relative order for a contiguous run of rows that
+        moved locally (shift+j/k in the UI), then survive a reload/
+        reconnect. `ordered_row_keys` is the new desired sequence for
+        exactly the rows whose position changed - dbman.py's
+        action_move_row moves the row locally and instantly with no network
+        call, debounces, and calls this once per settled burst rather than
+        once per keystroke (see _sync_row_order).
+
+        A correct implementation only needs to reassign the ordinals these
+        rows already have among themselves (a pure permutation) rather than
+        renumbering - that keeps it safe regardless of how the rest of the
+        table's rows are paginated/ordered, and avoids re-deriving each
+        row's position from a live query mid-batch, which can race against
+        a backend whose query/index layer is only eventually consistent
+        with recent writes (a real issue hit against Notion's query
+        endpoint when this was implemented and tested against a live page -
+        seconds-old writes could still read stale in a tight loop).
+
+        Only relevant/implemented for providers with
+        capabilities.reorder_row = True. No backend used by dbman has a
+        native "manual row order" concept, so each implementation
+        necessarily owns an explicit ordinal of its own (a sidecar table, a
+        real property, ...) - the specifics vary enough per backend that
+        there's no shared implementation here beyond this interface."""
         raise NotImplementedError
 
     def count_over_length(self, name: str, column: str, target_len: int) -> int:

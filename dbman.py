@@ -167,6 +167,7 @@ class ShortcutsScreen(ModalScreen):
                 " [bold]Select Mode (View mode only)[/]\n"
                 " s: Rotate select mode: field -> row -> column -> field\n"
                 " H / L: Move selected column left / right (column mode; option+left/right also works on some terminals)\n"
+                " J / K: Move selected row down / up, persisted (row mode; providers that support it)\n"
                 " z: Hide selected column (column mode)\n"
                 " Z: Unhide a column (column mode, pick from hidden list)\n",
                 id="shortcuts-content"
@@ -1135,6 +1136,8 @@ class DbMan(App):
         Binding("alt+right", "reorder_column(1)", "Move Column Right", show=False),
         Binding("H", "reorder_column(-1)", "Move Column Left"),
         Binding("L", "reorder_column(1)", "Move Column Right"),
+        Binding("K", "move_row(-1)", "Move Row Up"),
+        Binding("J", "move_row(1)", "Move Row Down"),
         Binding("]", "next_page", "Next Page", show=False),
         Binding("[", "prev_page", "Prev Page", show=False),
     ]
@@ -1153,6 +1156,7 @@ class DbMan(App):
         "set_column_width": _ctx(modes={"view"}, select_modes={"column"}),
         "rotate_select_mode": _ctx(modes={"view"}),
         "reorder_column": _ctx(modes={"view"}, select_modes={"column"}),
+        "move_row": _ctx(modes={"view"}, select_modes={"row"}, capability="reorder_row"),
         "hide_column": _ctx(modes={"view"}, select_modes={"column"}),
         "unhide_column": _unhide_column_ctx,
         "delete_item": _delete_item_ctx,
@@ -1188,6 +1192,20 @@ class DbMan(App):
         self.page_history = []
         self.page_has_more = False
         self._next_cursor = None
+        # Row-reorder batching (capabilities.reorder_row - see
+        # action_move_row): self.row_order/rendered_rows mirror the
+        # DataTable's current row sequence so J/K can reorder it locally and
+        # redraw instantly, without a network round trip per keystroke. Once
+        # the local order settles (_ROW_ORDER_SYNC_DELAY of no further
+        # moves), the touched rows' new sequence is sent to
+        # provider.reorder_rows in one batch call, in a background thread,
+        # so a burst of J/K presses feels instant and only pays the network
+        # cost once.
+        self.row_order = []
+        self.rendered_rows = {}
+        self._row_order_dirty = False
+        self._row_order_sync_target = None
+        self._row_order_timer = None
         try:
             self.provider = create_provider(db_url)
             self.lookup_plugin = (
@@ -1319,6 +1337,7 @@ class DbMan(App):
         return True
 
     async def action_quit(self) -> None:
+        self._flush_row_order_sync()
         self._save_workspace_session()
         await super().action_quit()
 
@@ -1391,11 +1410,18 @@ class DbMan(App):
             sidebar.display = True
             switcher.current = "data-table"
             table_widget.clear(columns=True)
-            
+            # A full rebuild is about to replace this table's rows - commit
+            # any not-yet-synced local reorder now rather than let it be
+            # silently discarded (or, worse, later replayed by a stale
+            # debounce against whatever ends up loaded next).
+            self._flush_row_order_sync()
+
             if item_type == "plugin":
                 self.row_keys = {}
                 self.raw_docs = {}
                 self.row_values = {}
+                self.row_order = []
+                self.rendered_rows = {}
                 self.rows_editable = False
                 self.page_has_more = False
                 columns, rows = self.get_plugin_data(name)
@@ -1411,6 +1437,8 @@ class DbMan(App):
                 self.row_keys = {}
                 self.raw_docs = {}
                 self.row_values = {}
+                self.row_order = []
+                self.rendered_rows = {}
                 self.rows_editable = bool(page.row_keys) and page.row_keys[0].value is not None
 
                 view_settings = self.view_settings.get(name)
@@ -1437,12 +1465,16 @@ class DbMan(App):
                     self.row_values[key_str] = dict(zip((c.name for c in display_columns), row))
                     if page.raw_rows is not None:
                         self.raw_docs[key_str] = page.raw_rows[i]
+                    self.row_order.append(key_str)
+                    self.rendered_rows[key_str] = rendered_row
                     table_widget.add_row(*rendered_row, key=key_str)
             else:
                 # Schema mode
                 self.row_keys = {}
                 self.raw_docs = {}
                 self.row_values = {}
+                self.row_order = []
+                self.rendered_rows = {}
                 self.rows_editable = False
                 self.page_has_more = False
                 schema_cols = self.provider.get_schema(name, item_type)
@@ -1592,6 +1624,135 @@ class DbMan(App):
         self.view_settings.save(self.current_item, settings)
         self.load_item(self.current_item, self.current_type)
         self.query_one("#data-table", DataTable).move_cursor(row=coord.row, column=new_idx)
+
+    # Quiet period after the last J/K before a settled burst of local moves
+    # is sent to the provider as one batch - long enough that repeated
+    # keystrokes coalesce into one network round trip, short enough that a
+    # deliberate pause reads as "done reordering."
+    _ROW_ORDER_SYNC_DELAY = 0.6
+
+    def action_move_row(self, direction: int):
+        """Shift+J/Shift+K in row select mode: move the selected row
+        up/down. The visual move happens immediately and entirely locally
+        (self.row_order/rendered_rows, no network call) so a burst of
+        keystrokes never blocks on round trips - every provider call so far
+        in this app runs synchronously on the UI thread, so waiting on one
+        per keystroke is what made this feel unresponsive. Once the local
+        order settles (_ROW_ORDER_SYNC_DELAY of no further moves), the
+        rows that actually changed position are sent to
+        provider.reorder_rows in a single batch call, in a background
+        thread (see _schedule_row_order_sync/_sync_row_order). An earlier
+        version replayed one provider.move_row call per keystroke instead;
+        that broke under a fast burst because each step re-derived the
+        moved row's neighbor from a live query, and Notion's query index
+        measurably lagged behind its own very recent writes - reorder_rows
+        sidesteps that by reassigning already-known order values in one
+        pass instead. Only reachable when capabilities.reorder_row is True
+        (currently just Notion), gated via ACTION_CONTEXTS."""
+        if self.mode != "view" or self.select_mode != "row":
+            return
+        if not isinstance(self.focused, DataTable) or not self.current_item:
+            return
+        if not self.provider.capabilities.reorder_row:
+            return
+        table_widget = self.focused
+        coord = table_widget.cursor_coordinate
+        row_id_str = list(table_widget.rows.values())[coord.row].key.value
+        if row_id_str not in self.row_order:
+            return
+
+        idx = self.row_order.index(row_id_str)
+        new_idx = idx + direction
+        if new_idx < 0 or new_idx >= len(self.row_order):
+            return  # already at the top/bottom locally - matches the
+                     # provider's own no-op behavior at the real boundary
+
+        if not self._row_order_dirty:
+            # Baseline snapshot for this burst, taken before the first move
+            # is applied - _sync_row_order diffs this against the settled
+            # self.row_order to find exactly which rows moved.
+            self._row_order_sync_target = (
+                self.current_item, self.current_type, dict(self.row_keys), list(self.row_order)
+            )
+            self._row_order_dirty = True
+        self.row_order[idx], self.row_order[new_idx] = self.row_order[new_idx], self.row_order[idx]
+
+        table_widget.clear(columns=False)
+        for key_str in self.row_order:
+            table_widget.add_row(*self.rendered_rows[key_str], key=key_str)
+        table_widget.move_cursor(row=new_idx, column=coord.column)
+
+        self._schedule_row_order_sync()
+
+    def _schedule_row_order_sync(self):
+        if self._row_order_timer is not None:
+            self._row_order_timer.stop()
+        self._row_order_timer = self.set_timer(self._ROW_ORDER_SYNC_DELAY, self._sync_row_order)
+
+    def _flush_row_order_sync(self):
+        """Commit any pending local row-order moves right away instead of
+        waiting out the debounce - called whenever the DataTable is about to
+        be rebuilt out from under the pending moves (navigating away,
+        quitting), so a reorder burst is never silently dropped."""
+        if self._row_order_timer is not None:
+            self._row_order_timer.stop()
+            self._row_order_timer = None
+        if self._row_order_dirty:
+            self._sync_row_order(blocking=True)
+
+    @staticmethod
+    def _touched_row_order_slice(baseline: list, settled: list) -> list:
+        """The minimal contiguous run of key-strings (by settled-order
+        index) that differs from baseline. A series of adjacent-swap moves
+        only ever perturbs a contiguous window around the row's path, so
+        this bounds the batch to just the rows that need a new order value
+        instead of the whole (possibly much larger) loaded page."""
+        if baseline == settled:
+            return []
+        lo = next(i for i in range(len(settled)) if settled[i] != baseline[i])
+        hi = next(i for i in range(len(settled) - 1, -1, -1) if settled[i] != baseline[i])
+        return settled[lo:hi + 1]
+
+    def _sync_row_order(self, blocking: bool = False):
+        if not self._row_order_dirty:
+            return
+        self._row_order_dirty = False
+        name, item_type, row_keys, baseline_order = self._row_order_sync_target
+        self._row_order_sync_target = None
+
+        touched = self._touched_row_order_slice(baseline_order, self.row_order)
+        ordered_keys = [row_keys[k] for k in touched if k in row_keys]
+        if len(ordered_keys) < 2:
+            return
+
+        def call_provider():
+            try:
+                self.provider.reorder_rows(name, item_type, ordered_keys)
+            except Exception as e:
+                return e
+            return None
+
+        if blocking:
+            # Used from _flush_row_order_sync when the table is about to be
+            # torn down anyway (navigating away, quitting) - nothing left to
+            # reconcile visually, so just persist and report failures.
+            error = call_provider()
+            if error:
+                self.notify(f"Row order sync failed: {error}", severity="error")
+            return
+
+        def worker():
+            error = call_provider()
+            def finish():
+                if error:
+                    self.notify(f"Row order sync failed: {error}", severity="error")
+                elif self.current_item == name and self.current_type == item_type:
+                    # Reconcile with the backend's authoritative order - also
+                    # self-heals if anything drifted (e.g. a stale row_key
+                    # from a concurrent external edit).
+                    self.load_item(name, item_type)
+            self.call_from_thread(finish)
+        self.run_worker(worker, thread=True)
 
     def action_hide_column(self):
         """'z' in column select mode: hide the column-mode-selected column
