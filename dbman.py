@@ -144,8 +144,9 @@ class ShortcutsScreen(ModalScreen):
                 " shift+tab: Jump to next sidebar section\n"
                 " m: Toggle View/Schema/SQL/Diag mode\n"
                 " r: Reload current table/view from the database\n"
+                " c: Switch connection (pick from dbman.json, j/k + enter)\n"
                 " ?: Toggle this Shortcuts panel\n"
-                " ctrl+p: Toggle this Shortcuts panel\n"
+                " ctrl+p: Open Textual's command palette\n"
                 " V: Show version/about screen\n\n"
                 " [bold]Navigation[/]\n"
                 " j / k: Move down / up\n"
@@ -160,7 +161,7 @@ class ShortcutsScreen(ModalScreen):
                 "    also works on a TABLES/VIEWS sidebar header, even when empty)\n"
                 " d: Delete selected table/view\n"
                 " x: Export current Table/View to CSV\n"
-                " f: Filter selected column (column select mode)\n"
+                " f: Filter selected column (press 's' first for column select mode)\n"
                 " F: Clear all filters for current table (column select mode)\n"
                 " t: Truncate/Shorten Column data (View mode only)\n"
                 " w: Set/clear column display width (column select mode)\n\n"
@@ -179,9 +180,6 @@ class ShortcutsScreen(ModalScreen):
             self.app.pop_screen()
 
     def key_question_mark(self) -> None:
-        self.app.pop_screen()
-
-    def key_ctrl_p(self) -> None:
         self.app.pop_screen()
 
 DBMAN_BANNER = (
@@ -562,6 +560,85 @@ class UnhideColumnScreen(ModalScreen):
             self.dismiss(self.query_one(Select).value)
         else:
             self.dismiss(None)
+
+class ConnectionListItem(ListItem):
+    def __init__(self, name: str, is_current: bool) -> None:
+        super().__init__(Label(f" {name} {'(current)' if is_current else ''}"))
+        self.connection_name = name
+
+class ConnectionSwitcherScreen(ModalScreen):
+    """A modal listing every connection saved in dbman.json (workspace.py),
+    for fast switching without restarting the app - see 'c'/action_switch_
+    connection. Enter (ListView's native binding) dismisses with the chosen
+    connection name; Escape cancels with None.
+
+    j/k need an explicit local BINDINGS entry here rather than relying on
+    DbMan's own app-level j/k -> focused-widget dispatch (the mechanism the
+    sidebar's ListView rides for free): Textual's ModalScreen deliberately
+    does not fall through to App-level bindings at all (confirmed live -
+    app.screen.active_bindings drops every App binding, including j/k, the
+    moment a ModalScreen is on top of the stack) - otherwise typing "d" into
+    a modal's Input would trigger DbMan's unrelated delete_item action.
+    ListView's own native up/down bindings still work (they're bound on the
+    focused widget itself, inside the modal's own DOM), just not j/k."""
+    BINDINGS = [
+        Binding("j", "cursor_down", "Down", show=False),
+        Binding("k", "cursor_up", "Up", show=False),
+    ]
+    CSS = """
+    ConnectionSwitcherScreen {
+        background: rgba(0, 0, 0, 0.5);
+        align: center middle;
+    }
+    #connection-dialog {
+        background: $panel;
+        border: thick $primary;
+        padding: 1 2;
+        width: 50;
+        height: auto;
+        max-height: 80%;
+    }
+    #connection-dialog Label {
+        margin-bottom: 1;
+        text-style: bold;
+    }
+    #connection-list {
+        height: auto;
+        max-height: 20;
+    }
+    """
+
+    def __init__(self, names: list[str], current_name: str) -> None:
+        super().__init__()
+        self.names = names
+        self.current_name = current_name
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="connection-dialog"):
+            yield Label("Switch connection")
+            with ListView(id="connection-list"):
+                for name in self.names:
+                    yield ConnectionListItem(name, name == self.current_name)
+
+    def on_mount(self):
+        list_view = self.query_one("#connection-list", ListView)
+        list_view.focus()
+        if self.current_name in self.names:
+            list_view.index = self.names.index(self.current_name)
+
+    def action_cursor_down(self):
+        self.query_one("#connection-list", ListView).action_cursor_down()
+
+    def action_cursor_up(self):
+        self.query_one("#connection-list", ListView).action_cursor_up()
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        event.stop()
+        if isinstance(event.item, ConnectionListItem):
+            self.dismiss(event.item.connection_name)
+
+    def key_escape(self) -> None:
+        self.dismiss(None)
 
 class EditTextScreen(ModalScreen):
     """A modal screen for editing a block of text: SQL, a CouchDB view's
@@ -947,12 +1024,17 @@ def _edit_cell_ctx(app):
 
 
 def _filter_column_ctx(app):
-    return (
-        app.mode == "view"
-        and app.select_mode == "column"
-        and bool(app.current_item)
-        and app.provider.is_filterable(app.current_type)
-    )
+    """Kept enabled across select modes and item types (unlike the
+    column-scoped z/w/H/L/F actions) since filtering is basic/core usage -
+    see the footer decluttering note. Only fully hidden when there's nothing
+    loaded to filter at all. check_action returning False/None doesn't just
+    grey out the footer, it blocks the keypress from ever reaching
+    action_filter_column (see Textual's App.run_action) - so this must stay
+    True whenever View mode has an item loaded, letting action_filter_column's
+    own notify() explain *why* filtering isn't available right now (wrong
+    select mode, or a non-filterable item like a CouchDB view) instead of the
+    key silently doing nothing."""
+    return app.mode == "view" and bool(app.current_item)
 
 
 def _truncate_column_ctx(app):
@@ -1024,11 +1106,24 @@ def _add_ctx(app):
 
 
 def _clear_filters_ctx(app):
-    """Column-select-mode-scoped, paired with 'f' like unhide is paired with
-    hide. Greys out (rather than hides) 'F' when there's nothing to clear."""
-    if app.mode != "view" or app.select_mode != "column" or not app.current_item:
+    """Paired with 'f' - see _filter_column_ctx for why this must stay
+    dispatchable outside column select mode too (action_clear_filters's own
+    "press 's' to rotate" notify would otherwise be dead code). Still greys
+    out (rather than hides) when there's genuinely nothing to clear."""
+    if app.mode != "view" or not bool(app.current_item):
         return False
+    if app.select_mode != "column":
+        return True
     return True if app.filters else None
+
+
+def _switch_connection_ctx(app):
+    """Hidden entirely with no workspace.json (e.g. programmatic use);
+    greyed out (rather than hidden) once a workspace exists but there's
+    nothing else saved yet to switch to."""
+    if app.workspace is None:
+        return False
+    return True if len(app.workspace.list_connections()) > 1 else None
 
 
 class DbMan(App):
@@ -1115,12 +1210,12 @@ class DbMan(App):
         Binding("G", "scroll_end", "End", show=False),
         Binding("tab", "switch_focus", "Sidebar/Main"),
         Binding("shift+tab", "jump_section", "Jump Section"),
-        Binding("m", "toggle_mode", "View/Schema/SQL/Diag Mode"),
-        Binding("r", "reload", "Reload"),
+        Binding("m", "toggle_mode", "View/Schema/SQL/Diag Mode", show=False),
+        Binding("r", "reload", "Reload", show=False),
+        Binding("c", "switch_connection", "Switch Connection"),
         Binding("d", "delete_item", "Delete"),
-        Binding("?", "toggle_shortcuts", "Shortcuts", show=False),
-        Binding("ctrl+p", "toggle_shortcuts", "Shortcuts"),
-        Binding("V", "toggle_version", "Version"),
+        Binding("?", "toggle_shortcuts", "Shortcuts"),
+        Binding("V", "toggle_version", "Version", show=False),
         Binding("e", "edit_cell", "Edit"),
         Binding("E", "edit_document", "Edit Document", show=False),
         Binding("a", "add", "Add"),
@@ -1164,6 +1259,7 @@ class DbMan(App):
         "export_csv": _export_csv_ctx,
         "add": _add_ctx,
         "clear_filters": _clear_filters_ctx,
+        "switch_connection": _switch_connection_ctx,
     }
 
     def check_action(self, action, parameters):
@@ -1218,6 +1314,7 @@ class DbMan(App):
             self.view_settings = ViewSettingsStore(self.workspace_name or derive_db_name(db_url))
             if self.workspace is not None:
                 self.workspace.upsert_connection(self.workspace_name, db_url)
+            self.sub_title = self.workspace_name or ""
         except Exception as e:
             print(f"Error connecting to database: {e}")
             sys.exit(1)
@@ -1274,6 +1371,73 @@ class DbMan(App):
             return
         self.load_item(self.current_item, self.current_type)
         self.notify("Reloaded")
+
+    def action_switch_connection(self):
+        if self.workspace is None:
+            return
+        names = self.workspace.list_connections()
+        if len(names) < 2:
+            self.notify("No other saved connections to switch to", severity="warning")
+            return
+        self.push_screen(
+            ConnectionSwitcherScreen(names, self.workspace_name),
+            self._on_switch_connection_selected,
+        )
+
+    def _on_switch_connection_selected(self, name):
+        if name is None or name == self.workspace_name:
+            return
+        resolved = self.workspace.resolve(name)
+        if resolved is None:
+            self.notify(f"Unknown connection '{name}'", severity="error")
+            return
+        new_url, new_name = resolved
+
+        # Build the new connection's provider/plugin/settings *before*
+        # touching any current state, so a failed connect (bad credentials,
+        # unreachable host) leaves the app exactly as it was.
+        try:
+            provider = create_provider(new_url)
+            lookup_plugin = (
+                LookupPlugin(provider.sqlalchemy_engine())
+                if provider.capabilities.lookup_plugin else None
+            )
+            view_settings = ViewSettingsStore(new_name)
+        except Exception as e:
+            self.notify(f"Connection failed: {e}", severity="error")
+            return
+
+        # Flush/save the *old* connection's pending state while self.provider
+        # and self.workspace_name still refer to it - same ordering as
+        # action_quit.
+        self._flush_row_order_sync()
+        self._save_workspace_session()
+
+        self.provider = provider
+        self.lookup_plugin = lookup_plugin
+        self.view_settings = view_settings
+        self.db_url = new_url
+        self.workspace_name = new_name
+        self.workspace.upsert_connection(new_name, new_url)
+        self.query_one("#diagram-view", DiagramView).provider = provider
+
+        self.current_item = None
+        self.current_type = None
+        self.mode = "view"
+        self.select_mode = "field"
+        self.filters = {}
+        self.reset_paging()
+        self.row_keys = {}
+        self.raw_docs = {}
+        self.row_values = {}
+        self.column_widths = {}
+        self.row_order = []
+        self.rendered_rows = {}
+
+        self.sub_title = new_name
+        self.refresh_sidebar()
+        self.refresh_bindings()
+        self.notify(f"Switched to '{new_name}'")
 
     def refresh_sidebar(self):
         sidebar_list = self.query_one("#sidebar-list", ListView)

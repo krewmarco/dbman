@@ -77,6 +77,9 @@ class WorkspaceStore:
             suffix += 1
         return arg, name
 
+    def list_connections(self) -> list[str]:
+        return list(self._data["connections"].keys())
+
     def upsert_connection(self, name: str, url: str) -> None:
         entry = self._data["connections"].setdefault(name, {})
         entry["url"] = url
