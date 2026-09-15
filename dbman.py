@@ -1431,43 +1431,51 @@ class DbMan(App):
                 for i, row in enumerate(rows):
                     table_widget.add_row(*row, key=str(i))
             elif self.mode == "view":
-                page = self.provider.get_page(name, item_type, self.filters, cursor=self.page_cursor, page_size=self.page_size)
-                self.page_has_more = page.has_more
-                self._next_cursor = page.next_cursor
                 self.row_keys = {}
                 self.raw_docs = {}
                 self.row_values = {}
                 self.row_order = []
                 self.rendered_rows = {}
-                self.rows_editable = bool(page.row_keys) and page.row_keys[0].value is not None
+                try:
+                    page = self.provider.get_page(name, item_type, self.filters, cursor=self.page_cursor, page_size=self.page_size)
+                except Exception as e:
+                    self.page_has_more = False
+                    self.rows_editable = False
+                    self.notify(f"Failed to load '{name}': {e}", severity="error")
+                    page = None
 
-                view_settings = self.view_settings.get(name)
-                display_columns, display_rows = apply_view_settings(page.columns, page.rows, view_settings)
-                column_widths = compute_column_widths(display_columns, display_rows, view_settings)
-                self.column_widths = column_widths
-                rendered_rows = truncate_rows(display_columns, display_rows, column_widths)
+                if page is not None:
+                    self.page_has_more = page.has_more
+                    self._next_cursor = page.next_cursor
+                    self.rows_editable = bool(page.row_keys) and page.row_keys[0].value is not None
 
-                for i, col in enumerate(display_columns):
-                    color = COLORS[i % len(COLORS)]
-                    label = f"[{color}]{col.name}[/]"
-                    if col.name in self.filters:
-                        label = f"[reverse]{label} (F)[/]"
-                    table_widget.add_column(label, key=col.name, width=column_widths[col.name])
+                    view_settings = self.view_settings.get(name)
+                    display_columns, display_rows = apply_view_settings(page.columns, page.rows, view_settings)
+                    column_widths = compute_column_widths(display_columns, display_rows, view_settings)
+                    self.column_widths = column_widths
+                    rendered_rows = truncate_rows(display_columns, display_rows, column_widths)
 
-                for i, (row, rendered_row, row_key) in enumerate(zip(display_rows, rendered_rows, page.row_keys)):
-                    if row_key.value is None:
-                        key_str = str(i)
-                    elif isinstance(row_key.value, dict):
-                        key_str = json.dumps(row_key.value, sort_keys=True)
-                    else:
-                        key_str = str(row_key.value)
-                    self.row_keys[key_str] = row_key
-                    self.row_values[key_str] = dict(zip((c.name for c in display_columns), row))
-                    if page.raw_rows is not None:
-                        self.raw_docs[key_str] = page.raw_rows[i]
-                    self.row_order.append(key_str)
-                    self.rendered_rows[key_str] = rendered_row
-                    table_widget.add_row(*rendered_row, key=key_str)
+                    for i, col in enumerate(display_columns):
+                        color = COLORS[i % len(COLORS)]
+                        label = f"[{color}]{col.name}[/]"
+                        if col.name in self.filters:
+                            label = f"[reverse]{label} (F)[/]"
+                        table_widget.add_column(label, key=col.name, width=column_widths[col.name])
+
+                    for i, (row, rendered_row, row_key) in enumerate(zip(display_rows, rendered_rows, page.row_keys)):
+                        if row_key.value is None:
+                            key_str = str(i)
+                        elif isinstance(row_key.value, dict):
+                            key_str = json.dumps(row_key.value, sort_keys=True)
+                        else:
+                            key_str = str(row_key.value)
+                        self.row_keys[key_str] = row_key
+                        self.row_values[key_str] = dict(zip((c.name for c in display_columns), row))
+                        if page.raw_rows is not None:
+                            self.raw_docs[key_str] = page.raw_rows[i]
+                        self.row_order.append(key_str)
+                        self.rendered_rows[key_str] = rendered_row
+                        table_widget.add_row(*rendered_row, key=key_str)
             else:
                 # Schema mode
                 self.row_keys = {}
