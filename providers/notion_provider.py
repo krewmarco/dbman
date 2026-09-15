@@ -38,6 +38,46 @@ _EDITABLE_TYPES = {
 _ORDER_PROPERTY = "_dbman_order"
 _ORDER_STEP = 1000
 
+# Notion's query filter API is per-property-type (the condition lives under
+# a key named after the type, e.g. {"rich_text": {"contains": ...}}), unlike
+# SqlAlchemyProvider/CouchDBProvider where one clause shape fits every
+# column. These two sets say which types accept a free-text substring/exact
+# match vs. only the is_empty/is_not_empty keywords.
+_TEXT_FILTER_TYPES = {"title", "rich_text", "url", "email", "phone_number"}
+_EMPTY_CAPABLE_TYPES = _TEXT_FILTER_TYPES | {
+    "number", "select", "status", "multi_select", "date", "people", "files", "relation",
+}
+
+
+def _notion_filter_condition(ptype: str, val: str):
+    """Build the type-specific inner filter condition for one column's
+    filter-box value, mirroring the null/not null/empty/not empty keyword
+    convention used by SqlAlchemyProvider._build_filter_clause and
+    CouchDBProvider._mango_selector. Returns None if this property type
+    can't express the given value - skipped rather than sent to the API and
+    guaranteed to error or never match (e.g. checkbox has no is_empty;
+    people/files/relation's "contains" needs a raw id, not the display name
+    dbman's filter box actually holds; dates have no substring match)."""
+    low = val.lower()
+    if low in ("null", "empty"):
+        return {"is_empty": True} if ptype in _EMPTY_CAPABLE_TYPES else None
+    if low in ("not null", "!null", "not empty"):
+        return {"is_not_empty": True} if ptype in _EMPTY_CAPABLE_TYPES else None
+    if ptype in _TEXT_FILTER_TYPES:
+        return {"contains": val}
+    if ptype in ("select", "status"):
+        return {"equals": val}
+    if ptype == "multi_select":
+        return {"contains": val}
+    if ptype == "number":
+        try:
+            return {"equals": float(val)}
+        except ValueError:
+            return None
+    if ptype == "checkbox":
+        return {"equals": low in ("1", "true", "yes", "y")}
+    return None
+
 
 def _rich_text_to_str(rich_text: list) -> str:
     return "".join(t.get("plain_text", "") for t in (rich_text or []))
@@ -89,7 +129,8 @@ def _read_property(prop: dict):
         number = body.get("number") if body else None
         if number is None:
             return None
-        return f"{body.get('prefix') or ''}{number}"
+        prefix = body.get("prefix") if body else None
+        return f"{prefix}-{number}" if prefix else str(number)
     # Unknown/rare type (verification, button, ...): fall back to raw JSON
     # rather than crashing the row fetch over one unrecognized property.
     return json.dumps(body)
@@ -251,6 +292,24 @@ class NotionProvider(Provider):
         columns.sort(key=lambda c: (not c.primary_key, c.name))
         return columns
 
+    def _build_notion_filter(self, columns: list, filters: dict):
+        """Translate dbman's {column_name: filter_text} map into a Notion
+        `filter` payload object, skipping any column/value combination
+        _notion_filter_condition can't express (see its docstring)."""
+        col_types = {c.name: c.type_name for c in columns}
+        conditions = []
+        for col_name, val in filters.items():
+            ptype = col_types.get(col_name)
+            if not ptype or not val:
+                continue
+            condition = _notion_filter_condition(ptype, val)
+            if condition is None:
+                continue
+            conditions.append({"property": col_name, ptype: condition})
+        if not conditions:
+            return None
+        return conditions[0] if len(conditions) == 1 else {"and": conditions}
+
     def get_page(self, name, item_type, filters, cursor, page_size) -> RowPage:
         database_id = self._database_ids[name]
         columns = self.get_schema(name, item_type)
@@ -263,6 +322,9 @@ class NotionProvider(Provider):
             payload["start_cursor"] = cursor
         if self._order_ready.get(database_id):
             payload["sorts"] = [{"property": _ORDER_PROPERTY, "direction": "ascending"}]
+        notion_filter = self._build_notion_filter(columns, filters)
+        if notion_filter:
+            payload["filter"] = notion_filter
 
         result = self._post(f"/databases/{database_id}/query", payload)
         pages = result.get("results", [])

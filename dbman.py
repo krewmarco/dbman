@@ -272,7 +272,7 @@ class FilterColumnScreen(ModalScreen):
     def compose(self) -> ComposeResult:
         with Vertical(id="filter-dialog"):
             yield Label(f"Filter Column: {self.column}")
-            yield Static("Enter search term (use 'null' for NULL, 'empty' for empty string):", id="small-label")
+            yield Static("Enter search term ('null'/'not null', 'empty'/'not empty', or free text):", id="small-label")
             yield Input(value=self.current_filter, id="filter-input", placeholder="Filter...")
             with Horizontal(id="filter-buttons"):
                 yield Button("Cancel", id="cancel-filter")

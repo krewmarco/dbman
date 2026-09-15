@@ -173,8 +173,12 @@ class CouchDBProvider(Provider):
         for col_name, val in filters.items():
             if val.lower() == "null":
                 selector[col_name] = None
+            elif val.lower() in ("not null", "!null"):
+                selector[col_name] = {"$ne": None}
             elif val.lower() == "empty":
                 selector["$or"] = [{col_name: None}, {col_name: ""}]
+            elif val.lower() == "not empty":
+                selector["$and"] = [{col_name: {"$ne": None}}, {col_name: {"$ne": ""}}]
             else:
                 selector[col_name] = {"$regex": val}
         return selector

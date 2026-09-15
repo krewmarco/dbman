@@ -66,8 +66,12 @@ class SqlAlchemyProvider(Provider):
             col = table_obj.c[col_name]
             if val.lower() == "null":
                 clauses.append(col.is_(None))
+            elif val.lower() in ("not null", "!null"):
+                clauses.append(col.is_not(None))
             elif val.lower() == "empty":
                 clauses.append((col.is_(None)) | (col == ""))
+            elif val.lower() == "not empty":
+                clauses.append((col.is_not(None)) & (col != ""))
             else:
                 clauses.append(col.like(f"%{val}%"))
         return clauses
