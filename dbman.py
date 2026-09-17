@@ -1589,7 +1589,6 @@ class DbMan(App):
         elif self.mode in ["view", "schema"] or item_type == "plugin":
             sidebar.display = True
             switcher.current = "data-table"
-            table_widget.clear(columns=True)
             # A full rebuild is about to replace this table's rows - commit
             # any not-yet-synced local reorder now rather than let it be
             # silently discarded (or, worse, later replayed by a stale
@@ -1597,6 +1596,7 @@ class DbMan(App):
             self._flush_row_order_sync()
 
             if item_type == "plugin":
+                table_widget.clear(columns=True)
                 self.row_keys = {}
                 self.raw_docs = {}
                 self.row_values = {}
@@ -1611,11 +1611,6 @@ class DbMan(App):
                 for i, row in enumerate(rows):
                     table_widget.add_row(*row, key=str(i))
             elif self.mode == "view":
-                self.row_keys = {}
-                self.raw_docs = {}
-                self.row_values = {}
-                self.row_order = []
-                self.rendered_rows = {}
                 # Seed from this table/view's persisted sort (ViewSettingsStore)
                 # only if nothing's been explicitly set yet this session (e.g.
                 # just switched to this item) - action_sort_column already
@@ -1631,12 +1626,24 @@ class DbMan(App):
                         page_size=self.page_size, sort=self.sort[0] if self.sort else None,
                     )
                 except Exception as e:
-                    self.page_has_more = False
-                    self.rows_editable = False
                     self.notify(f"Failed to load '{name}': {e}", severity="error")
                     page = None
 
+                # Only tear down the currently-displayed table once a new
+                # page has actually loaded successfully - otherwise (e.g. a
+                # filter value Notion's API rejects with a 400) the table is
+                # left with its previous, internally-consistent columns/rows
+                # intact rather than headerless, which used to crash any
+                # subsequent column-scoped action (filter/sort/hide/...) on
+                # an empty ordered_columns. See issue with 'f' on a Notion
+                # select/status column filtered with a non-matching value.
                 if page is not None:
+                    table_widget.clear(columns=True)
+                    self.row_keys = {}
+                    self.raw_docs = {}
+                    self.row_values = {}
+                    self.row_order = []
+                    self.rendered_rows = {}
                     self.page_has_more = page.has_more
                     self._next_cursor = page.next_cursor
                     self.rows_editable = bool(page.row_keys) and page.row_keys[0].value is not None
@@ -1672,6 +1679,7 @@ class DbMan(App):
                         table_widget.add_row(*rendered_row, key=key_str)
             else:
                 # Schema mode
+                table_widget.clear(columns=True)
                 self.row_keys = {}
                 self.raw_docs = {}
                 self.row_values = {}
