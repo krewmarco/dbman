@@ -48,6 +48,7 @@ class Capabilities:
     add_row: bool = False
     delete_row: bool = False
     reorder_row: bool = False  # persistent manual row ordering (shift+j/k) - see Provider.move_row
+    sort_column: bool = False  # single-column ORDER BY pushed into get_page - see Provider.is_sortable
 
 
 @dataclass
@@ -90,6 +91,12 @@ class Provider(ABC):
     def is_filterable(self, item_type: str) -> bool:
         return item_type == "table"
 
+    def is_sortable(self, item_type: str) -> bool:
+        """Same scope as is_filterable - sort and filter are both
+        query-modifying params pushed into get_page, not something that
+        makes sense on a schema pane or a synthetic plugin table."""
+        return item_type == "table"
+
     @abstractmethod
     def get_schema(self, name: str, item_type: str) -> list[Column]: ...
 
@@ -101,7 +108,15 @@ class Provider(ABC):
         filters: dict[str, str],
         cursor: Optional[str],
         page_size: Optional[int],
-    ) -> RowPage: ...
+        sort: Optional[tuple[str, str]] = None,
+    ) -> RowPage:
+        """`sort`, when given, is (column_name, "asc" | "desc") - a single
+        column, pushed into the underlying query/re-fetch rather than
+        applied client-side, so it composes correctly with paging. Only
+        meaningful for providers with capabilities.sort_column = True;
+        callers should not pass it otherwise (dbman.py gates the 'o'
+        keybinding on the capability, mirroring is_sortable/is_filterable)."""
+        ...
 
     @abstractmethod
     def get_definition(self, name: str, item_type: str) -> str: ...

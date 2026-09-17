@@ -23,6 +23,8 @@ class ViewSettings:
     hidden: list[str] = field(default_factory=list)
     widths: dict[str, int] = field(default_factory=dict)
     order: list[str] = field(default_factory=list)
+    sort_column: Optional[str] = None
+    sort_direction: Optional[str] = None  # "asc" | "desc", meaningless if sort_column is None
 
 
 class ViewSettingsStore:
@@ -44,6 +46,8 @@ class ViewSettingsStore:
             hidden=list(raw.get("hidden", [])),
             widths=dict(raw.get("widths", {})),
             order=list(raw.get("order", [])),
+            sort_column=raw.get("sort_column"),
+            sort_direction=raw.get("sort_direction"),
         )
 
     def save(self, item_name: str, settings: ViewSettings) -> None:
@@ -51,6 +55,8 @@ class ViewSettingsStore:
             "hidden": settings.hidden,
             "widths": settings.widths,
             "order": settings.order,
+            "sort_column": settings.sort_column,
+            "sort_direction": settings.sort_direction,
         }
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(self._data, indent=2, sort_keys=True))

@@ -163,7 +163,11 @@ class CouchDBProvider(Provider):
         docs = self._sample_docs()
         return self._infer_columns(docs)
 
-    def get_page(self, name, item_type, filters, cursor, page_size) -> RowPage:
+    def get_page(self, name, item_type, filters, cursor, page_size, sort=None) -> RowPage:
+        # capabilities.sort_column is False - CouchDB's Mango `sort` needs a
+        # matching index per sorted field, which dbman doesn't manage, so
+        # `sort` is accepted (for interface uniformity with the other
+        # providers) but never populated/passed here.
         if item_type == "view":
             return self._get_view_page(name, cursor, page_size)
         return self._get_documents_page(filters, cursor, page_size)

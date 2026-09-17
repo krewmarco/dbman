@@ -163,6 +163,7 @@ class ShortcutsScreen(ModalScreen):
                 " x: Export current Table/View to CSV\n"
                 " f: Filter selected column (press 's' first for column select mode)\n"
                 " F: Clear all filters for current table (column select mode)\n"
+                " o: Sort by selected column, cycling asc -> desc -> none (column select mode)\n"
                 " t: Truncate/Shorten Column data (View mode only)\n"
                 " w: Set/clear column display width (column select mode)\n\n"
                 " [bold]Select Mode (View mode only)[/]\n"
@@ -1037,6 +1038,15 @@ def _filter_column_ctx(app):
     return app.mode == "view" and bool(app.current_item)
 
 
+def _sort_column_ctx(app):
+    """Mirrors _filter_column_ctx: kept dispatchable across select modes/item
+    types whenever View mode has an item loaded, so action_sort_column's own
+    notify() can explain *why* sorting isn't available right now (wrong
+    select mode, or a non-sortable item/provider) instead of the key
+    silently doing nothing."""
+    return app.mode == "view" and bool(app.current_item)
+
+
 def _truncate_column_ctx(app):
     return (
         app.mode == "view"
@@ -1222,6 +1232,7 @@ class DbMan(App):
         Binding("x", "export_csv", "Export CSV", show=False),
         Binding("f", "filter_column", "Filter Column"),
         Binding("F", "clear_filters", "Clear Filters"),
+        Binding("o", "sort_column", "Sort Column"),
         Binding("t", "truncate_column", "Shorten Column"),
         Binding("w", "set_column_width", "Column Width"),
         Binding("s", "rotate_select_mode", "Select Mode"),
@@ -1247,6 +1258,7 @@ class DbMan(App):
         "edit_cell": _edit_cell_ctx,
         "edit_document": _ctx(modes={"view"}, capability="whole_row_edit"),
         "filter_column": _filter_column_ctx,
+        "sort_column": _sort_column_ctx,
         "truncate_column": _truncate_column_ctx,
         "set_column_width": _ctx(modes={"view"}, select_modes={"column"}),
         "rotate_select_mode": _ctx(modes={"view"}),
@@ -1283,6 +1295,7 @@ class DbMan(App):
         self.mode = "view"
         self.select_mode = "field"
         self.filters = {}
+        self.sort = []  # [(column_name, "asc" | "desc")] - single-column for now, see action_sort_column
         self.page_size = 500
         self.page_cursor = None
         self.page_history = []
@@ -1426,6 +1439,7 @@ class DbMan(App):
         self.mode = "view"
         self.select_mode = "field"
         self.filters = {}
+        self.sort = []
         self.reset_paging()
         self.row_keys = {}
         self.raw_docs = {}
@@ -1533,6 +1547,7 @@ class DbMan(App):
         item = event.item
         if isinstance(item, DbItem):
             self.filters = {}
+            self.sort = []
             self.reset_paging()
             self.load_item(item.item_name, item.item_type, should_focus=True)
 
@@ -1540,6 +1555,7 @@ class DbMan(App):
         item = event.item
         if isinstance(item, DbItem):
             self.filters = {}
+            self.sort = []
             self.reset_paging()
             self.load_item(item.item_name, item.item_type, should_focus=False)
         elif isinstance(item, SidebarHeader):
@@ -1600,8 +1616,20 @@ class DbMan(App):
                 self.row_values = {}
                 self.row_order = []
                 self.rendered_rows = {}
+                # Seed from this table/view's persisted sort (ViewSettingsStore)
+                # only if nothing's been explicitly set yet this session (e.g.
+                # just switched to this item) - action_sort_column already
+                # keeps self.sort authoritative for the rest of the session,
+                # including an explicit clear, so this must not clobber that.
+                if not self.sort and self.provider.capabilities.sort_column and self.provider.is_sortable(item_type):
+                    saved_settings = self.view_settings.get(name)
+                    if saved_settings.sort_column:
+                        self.sort = [(saved_settings.sort_column, saved_settings.sort_direction or "asc")]
                 try:
-                    page = self.provider.get_page(name, item_type, self.filters, cursor=self.page_cursor, page_size=self.page_size)
+                    page = self.provider.get_page(
+                        name, item_type, self.filters, cursor=self.page_cursor,
+                        page_size=self.page_size, sort=self.sort[0] if self.sort else None,
+                    )
                 except Exception as e:
                     self.page_has_more = False
                     self.rows_editable = False
@@ -1624,6 +1652,8 @@ class DbMan(App):
                         label = f"[{color}]{col.name}[/]"
                         if col.name in self.filters:
                             label = f"[reverse]{label} (F)[/]"
+                        if self.sort and self.sort[0][0] == col.name:
+                            label = f"{label} {'▲' if self.sort[0][1] == 'asc' else '▼'}"
                         table_widget.add_column(label, key=col.name, width=column_widths[col.name])
 
                     for i, (row, rendered_row, row_key) in enumerate(zip(display_rows, rendered_rows, page.row_keys)):
@@ -1693,7 +1723,11 @@ class DbMan(App):
         select_indicator = (
             f" [{self.select_mode.upper()}]" if self.mode == "view" and self.select_mode != "field" else ""
         )
-        self.title = f"dbman - {self.current_item} ({self.mode.upper()}){page_indicator}{select_indicator}"
+        sort_indicator = ""
+        if self.mode == "view" and self.sort:
+            col_name, direction = self.sort[0]
+            sort_indicator = f" [sort: {col_name} {'asc' if direction == 'asc' else 'desc'}]"
+        self.title = f"dbman - {self.current_item} ({self.mode.upper()}){page_indicator}{select_indicator}{sort_indicator}"
 
     def action_switch_focus(self):
         if self.query_one("#sidebar").display:
@@ -2002,6 +2036,44 @@ class DbMan(App):
                 self.reset_paging()
                 self.load_item(self.current_item, self.current_type)
         self.push_screen(FilterColumnScreen(column_name, current_filter), apply_filter)
+
+    def action_sort_column(self):
+        if self.mode != "view":
+            self.notify("Sorting only allowed in View mode", severity="error")
+            return
+        if self.select_mode != "column":
+            self.notify("Sorting only allowed in column select mode (press 's' to rotate)", severity="error")
+            return
+        if not isinstance(self.focused, DataTable) or not self.current_item:
+            return
+        if not self.provider.capabilities.sort_column or not self.provider.is_sortable(self.current_type):
+            self.notify("Sorting not available for this item", severity="error")
+            return
+        coord = self.focused.cursor_coordinate
+        column_name = self.focused.ordered_columns[coord.column].key.value
+        current = self.sort[0] if self.sort else None
+        if current is not None and current[0] == column_name:
+            # Single column, cycling asc -> desc -> none. self.sort is a
+            # list so multi-column later is a keybinding change, not a
+            # data-shape migration.
+            if current[1] == "asc":
+                self.sort = [(column_name, "desc")]
+            else:
+                self.sort = []
+        else:
+            self.sort = [(column_name, "asc")]
+
+        settings = self.view_settings.get(self.current_item)
+        settings.sort_column, settings.sort_direction = (self.sort[0] if self.sort else (None, None))
+        self.view_settings.save(self.current_item, settings)
+
+        self.reset_paging()
+        self.load_item(self.current_item, self.current_type)
+        if self.sort:
+            direction = "ascending" if self.sort[0][1] == "asc" else "descending"
+            self.notify(f"Sorting '{column_name}' {direction}")
+        else:
+            self.notify(f"Cleared sort on '{column_name}'")
 
     def action_clear_filters(self):
         if self.mode != "view":
@@ -2415,7 +2487,10 @@ class DbMan(App):
                     if self.current_type == "plugin":
                         columns, rows = self.get_plugin_data(self.current_item)
                     else:
-                        page = self.provider.get_page(self.current_item, self.current_type, self.filters, cursor=None, page_size=None)
+                        page = self.provider.get_page(
+                            self.current_item, self.current_type, self.filters, cursor=None,
+                            page_size=None, sort=self.sort[0] if self.sort else None,
+                        )
                         columns = [c.name for c in page.columns]
                         rows = page.rows
                     with open(filename, 'w', newline='') as f:

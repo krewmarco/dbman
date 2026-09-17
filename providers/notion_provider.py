@@ -220,6 +220,7 @@ class NotionProvider(Provider):
             add_row=True,
             delete_row=True,
             reorder_row=True,
+            sort_column=True,
         )
 
     # -- HTTP helpers ---------------------------------------------------------
@@ -310,7 +311,7 @@ class NotionProvider(Provider):
             return None
         return conditions[0] if len(conditions) == 1 else {"and": conditions}
 
-    def get_page(self, name, item_type, filters, cursor, page_size) -> RowPage:
+    def get_page(self, name, item_type, filters, cursor, page_size, sort=None) -> RowPage:
         database_id = self._database_ids[name]
         columns = self.get_schema(name, item_type)
         col_names = [c.name for c in columns]
@@ -320,7 +321,16 @@ class NotionProvider(Provider):
             payload["page_size"] = page_size
         if cursor:
             payload["start_cursor"] = cursor
-        if self._order_ready.get(database_id):
+        if sort:
+            col_name, direction = sort
+            payload["sorts"] = [{
+                "property": col_name,
+                "direction": "ascending" if direction != "desc" else "descending",
+            }]
+        elif self._order_ready.get(database_id):
+            # No explicit column sort requested - fall back to dbman's own
+            # manual row-order property (see reorder_row) rather than
+            # Notion's default (creation-time) ordering.
             payload["sorts"] = [{"property": _ORDER_PROPERTY, "direction": "ascending"}]
         notion_filter = self._build_notion_filter(columns, filters)
         if notion_filter:

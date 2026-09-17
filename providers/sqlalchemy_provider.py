@@ -25,6 +25,7 @@ class SqlAlchemyProvider(Provider):
             truncate_column=True,
             whole_row_edit=False,
             delete_item=True,
+            sort_column=True,
         )
 
     def sqlalchemy_engine(self):
@@ -76,7 +77,14 @@ class SqlAlchemyProvider(Provider):
                 clauses.append(col.like(f"%{val}%"))
         return clauses
 
-    def get_page(self, name, item_type, filters, cursor, page_size) -> RowPage:
+    def _apply_sort(self, stmt, table, sort):
+        if not sort:
+            return stmt
+        col_name, direction = sort
+        col = table.c[col_name]
+        return stmt.order_by(col.desc() if direction == "desc" else col.asc())
+
+    def get_page(self, name, item_type, filters, cursor, page_size, sort=None) -> RowPage:
         metadata = MetaData()
         table = Table(name, metadata, autoload_with=self.engine)
         col_objs = [Column(name=c.name, type_name=str(c.type)) for c in table.columns]
@@ -92,6 +100,7 @@ class SqlAlchemyProvider(Provider):
                     rowid_stmt = select(text("rowid"), table)
                     if filter_clauses:
                         rowid_stmt = rowid_stmt.where(*filter_clauses)
+                    rowid_stmt = self._apply_sort(rowid_stmt, table, sort)
                     if fetch_limit:
                         rowid_stmt = rowid_stmt.limit(fetch_limit)
                     if offset:
@@ -111,6 +120,7 @@ class SqlAlchemyProvider(Provider):
             stmt = select(table)
             if filter_clauses:
                 stmt = stmt.where(*filter_clauses)
+            stmt = self._apply_sort(stmt, table, sort)
             if fetch_limit:
                 stmt = stmt.limit(fetch_limit)
             if offset:
