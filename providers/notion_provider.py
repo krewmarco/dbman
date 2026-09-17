@@ -9,6 +9,7 @@ out of scope for now: this provider assumes each discovered database has
 exactly one implicit data source, true for every database that hasn't been
 explicitly split into multiple sources.
 """
+import fnmatch
 import json
 from urllib.parse import urlsplit
 
@@ -77,6 +78,25 @@ def _notion_filter_condition(ptype: str, val: str):
     if ptype == "checkbox":
         return {"equals": low in ("1", "true", "yes", "y")}
     return None
+
+
+def _row_matches_wildcards(row: list, col_names: list, wildcard_filters: dict) -> bool:
+    """Glob-match a wildcard filter box value (e.g. "*Timeline*") against a
+    row's already-flattened display values (the same strings the DataTable
+    renders) - a filter shape Notion's per-type filter API can't express
+    server-side, see _build_notion_filter. Case-insensitive, consistent
+    with SQL's default LIKE behavior on SQLite. A None value (empty cell)
+    never matches a wildcard - use the existing 'empty'/'not empty'
+    keywords for that instead."""
+    for col_name, pattern in wildcard_filters.items():
+        try:
+            idx = col_names.index(col_name)
+        except ValueError:
+            continue
+        value = row[idx]
+        if value is None or not fnmatch.fnmatch(str(value).lower(), pattern.lower()):
+            return False
+    return True
 
 
 def _rich_text_to_str(rich_text: list) -> str:
@@ -296,12 +316,22 @@ class NotionProvider(Provider):
     def _build_notion_filter(self, columns: list, filters: dict):
         """Translate dbman's {column_name: filter_text} map into a Notion
         `filter` payload object, skipping any column/value combination
-        _notion_filter_condition can't express (see its docstring)."""
+        _notion_filter_condition can't express (see its docstring), and any
+        wildcard ('*' in the value) filter - those are applied client-side
+        in get_page instead (see _row_matches_wildcards) since Notion's
+        per-type filter API has no glob/pattern concept: select/status only
+        accept an exact `equals` against one of the property's predefined
+        options (typing "*Timeline*" against "8. Timeline" would 400, the
+        same failure that used to crash the DataTable - see load_item),
+        and even the text types' `contains` is a plain substring, not a
+        glob (no prefix/suffix-anchoring, no multiple wildcards)."""
         col_types = {c.name: c.type_name for c in columns}
         conditions = []
         for col_name, val in filters.items():
+            if not val or "*" in val:
+                continue
             ptype = col_types.get(col_name)
-            if not ptype or not val:
+            if not ptype:
                 continue
             condition = _notion_filter_condition(ptype, val)
             if condition is None:
@@ -335,6 +365,7 @@ class NotionProvider(Provider):
         notion_filter = self._build_notion_filter(columns, filters)
         if notion_filter:
             payload["filter"] = notion_filter
+        wildcard_filters = {c: v for c, v in filters.items() if v and "*" in v}
 
         result = self._post(f"/databases/{database_id}/query", payload)
         pages = result.get("results", [])
@@ -343,9 +374,19 @@ class NotionProvider(Provider):
         row_keys = []
         for page in pages:
             props = page.get("properties", {})
-            rows.append([_read_property(props[c]) if c in props else None for c in col_names])
+            row = [_read_property(props[c]) if c in props else None for c in col_names]
+            if wildcard_filters and not _row_matches_wildcards(row, col_names, wildcard_filters):
+                continue
+            rows.append(row)
             row_keys.append(RowKey(page["id"]))
 
+        # Applying wildcard_filters here (after the page's already been
+        # fetched) means has_more/next_cursor still reflect Notion's
+        # unfiltered pagination, not this narrowed row count - a page can
+        # come back with fewer rows than page_size, but repeatedly paging
+        # forward still converges on every match. Acceptable given
+        # page_size is 500 and most Notion databases browsed here are far
+        # smaller than that.
         has_more = bool(result.get("has_more"))
         next_cursor = result.get("next_cursor") if has_more else None
         return RowPage(columns, rows, row_keys, next_cursor=next_cursor, has_more=has_more)
