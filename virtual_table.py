@@ -181,9 +181,12 @@ class OptionPickerTable(VirtualTable):
         elif self.multi:
             self.selected.symmetric_difference_update({key})
         else:
-            # Re-picking the highlighted option clears it, so a single-select
-            # cell can be emptied without reaching for the (none) row.
-            self.selected = set() if self.selected == {key} else {key}
+            # Always select, never toggle off. Re-picking used to clear the
+            # value, which made space-to-confirm on the already-selected
+            # option silently empty the property - on Notion, a real write.
+            # The (none) row is the way to empty a single-select, and it's
+            # right there.
+            self.selected = {key}
         return True
 
     def clear(self) -> None:
@@ -211,6 +214,12 @@ class VirtualTableScreen(ModalScreen):
         Binding("k", "cursor_up", "Up", show=False),
         Binding("space", "open_row", "Toggle", show=False),
         Binding("f", "focus_filter", "Filter", show=False),
+        # '/' is the app's search key, and in a modal list the two verbs
+        # collapse: there's one list, entirely on screen, so narrowing it
+        # *is* finding in it. The filter/search split exists in the main
+        # table because filtering there costs a provider round trip and
+        # changes which rows exist; neither is true here.
+        Binding("slash", "focus_filter", "Search", show=False),
         Binding("escape", "cancel", "Cancel", show=False),
     ]
 
@@ -359,7 +368,13 @@ class VirtualTableScreen(ModalScreen):
             self.table.clear()
             self.dismiss(self.table.result())
         else:
-            self.dismiss(None)
+            # Through action_cancel, not a bare dismiss(None): on a
+            # commits_immediately table the work is already done, and
+            # dismissing None told the caller nothing changed - so the
+            # settings were written and the display never refreshed.
+            # Escape went through action_cancel and worked; the Close
+            # button didn't, which is a confusing way for it to differ.
+            self.action_cancel()
 
     def key_escape(self) -> None:
         self.action_cancel()
