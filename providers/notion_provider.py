@@ -13,19 +13,30 @@ import fnmatch
 import json
 from urllib.parse import urlsplit
 
-from .base import Provider, Column, RowKey, RowPage, Capabilities, DiagramModel
+from .base import (
+    Provider, Column, ColumnOption, RowKey, RowPage, Capabilities, DiagramModel,
+    FILTER_EMPTY, FILTER_NOT_EMPTY,
+)
 
 API_BASE = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
 
-# Property types dbman can both display and write back as a plain scalar
-# cell. Everything else (relation, multi_select, people, files, formula,
-# rollup, status, created/last_edited_*, unique_id, ...) is display-only for
-# now - see _read_property/_write_property.
+# Property types dbman can display and write back. Everything else
+# (relation, people, files, formula, rollup, created/last_edited_*,
+# unique_id, ...) is display-only - see _read_property/_write_property.
 _EDITABLE_TYPES = {
     "title", "rich_text", "number", "checkbox", "url", "email",
-    "phone_number", "date", "select",
+    "phone_number", "date", "select", "status", "multi_select",
 }
+
+# Enum-like property types: their schema declares a fixed option set (with a
+# per-option color), which get_schema surfaces as Column.options so the UI
+# can offer a picker rather than a free-text box. That's a correctness fix,
+# not just ergonomics - writing an arbitrary name to a `select` or
+# `multi_select` silently *creates* a new option on the user's real
+# database, while the same on a `status` 400s (Notion's API can't create
+# status options at all). Picking from the declared set can do neither.
+_CHOICE_TYPES = {"select", "status", "multi_select"}
 
 # Notion's query API has no native "manual row order" - it can only sort by
 # a page's own properties. To support persistent shift+j/k reordering
@@ -80,6 +91,41 @@ def _notion_filter_condition(ptype: str, val: str):
     return None
 
 
+def _notion_choice_condition(ptype: str, val: str):
+    """The inner condition for one entry of a *list* filter value - the
+    picker path for enum-like columns (Column.options). Unlike the free-text
+    path this is always an exact match, because the entry came from the
+    property's own declared option set."""
+    if val == FILTER_EMPTY:
+        return {"is_empty": True} if ptype in _EMPTY_CAPABLE_TYPES else None
+    if val == FILTER_NOT_EMPTY:
+        return {"is_not_empty": True} if ptype in _EMPTY_CAPABLE_TYPES else None
+    if ptype == "multi_select":
+        # A multi_select cell holds several options, so "has this one" is
+        # `contains`, not `equals`.
+        return {"contains": val}
+    if ptype in ("select", "status"):
+        return {"equals": val}
+    return None
+
+
+def _wildcard_filters(col_types: dict, filters: dict) -> dict:
+    """The filter entries routed around Notion's server-side filter and
+    matched client-side with fnmatch instead (see _row_matches_wildcards).
+
+    Restricted to _TEXT_FILTER_TYPES on purpose. Globbing only earns its
+    keep where the server-side alternative is a plain substring `contains`
+    with no anchoring; an enum-like column is picked from a dropdown now, so
+    a glob there is neither producible from the UI nor meaningful - Notion's
+    select/status filter is an exact `equals` against a predefined option.
+    Shared by _build_notion_filter and get_page so the two can't disagree
+    about which entries the server is handling."""
+    return {
+        c: v for c, v in filters.items()
+        if isinstance(v, str) and "*" in v and col_types.get(c) in _TEXT_FILTER_TYPES
+    }
+
+
 def _row_matches_wildcards(row: list, col_names: list, wildcard_filters: dict) -> bool:
     """Glob-match a wildcard filter box value (e.g. "*Timeline*") against a
     row's already-flattened display values (the same strings the DataTable
@@ -107,6 +153,15 @@ def _rich_text_payload(value) -> list:
     if not value:
         return []
     return [{"type": "text", "text": {"content": str(value)}}]
+
+
+def _split_multi(value) -> list:
+    """Inverse of _read_property's multi_select join. Only a fallback for a
+    plain-string write - an option name containing ", " wouldn't survive the
+    round trip, which is why the picker passes a list instead."""
+    if value in (None, ""):
+        return []
+    return [part.strip() for part in str(value).split(",") if part.strip()]
 
 
 def _read_property(prop: dict):
@@ -171,8 +226,14 @@ def _write_property(ptype: str, value) -> dict:
         return {ptype: value or None}
     if ptype == "date":
         return {"date": {"start": value} if value else None}
-    if ptype == "select":
-        return {"select": {"name": value} if value else None}
+    if ptype in ("select", "status"):
+        return {ptype: {"name": value} if value else None}
+    if ptype == "multi_select":
+        # The UI's multi-choice picker hands over a real list; the string
+        # fallback mirrors _read_property's ", " join so a value that came
+        # back out of a cell can go straight back in.
+        names = value if isinstance(value, (list, tuple)) else _split_multi(value)
+        return {"multi_select": [{"name": n} for n in names if n]}
     raise ValueError(f"Notion property type {ptype!r} is read-only in dbman")
 
 
@@ -302,11 +363,22 @@ class NotionProvider(Provider):
             if prop_name == _ORDER_PROPERTY:
                 continue  # dbman-owned sort ordinal, not a real column - see reorder_row
             ptype = prop.get("type")
+            # The option set (and each option's color) is already in this
+            # same GET /databases response - surfacing it costs no extra
+            # round trip, and get_schema is called on every get_page.
+            options = ()
+            if ptype in _CHOICE_TYPES:
+                options = tuple(
+                    ColumnOption(o.get("name", ""), o.get("color"))
+                    for o in (prop.get(ptype) or {}).get("options", [])
+                )
             columns.append(Column(
                 name=prop_name,
                 type_name=ptype,
                 primary_key=(ptype == "title"),
                 read_only=(ptype not in _EDITABLE_TYPES),
+                options=options,
+                multi_value=(ptype == "multi_select"),
             ))
         # Notion doesn't guarantee properties are returned in display order;
         # put title first since it's the row's de facto identity, like a PK.
@@ -314,24 +386,37 @@ class NotionProvider(Provider):
         return columns
 
     def _build_notion_filter(self, columns: list, filters: dict):
-        """Translate dbman's {column_name: filter_text} map into a Notion
-        `filter` payload object, skipping any column/value combination
-        _notion_filter_condition can't express (see its docstring), and any
-        wildcard ('*' in the value) filter - those are applied client-side
-        in get_page instead (see _row_matches_wildcards) since Notion's
-        per-type filter API has no glob/pattern concept: select/status only
-        accept an exact `equals` against one of the property's predefined
-        options (typing "*Timeline*" against "8. Timeline" would 400, the
-        same failure that used to crash the DataTable - see load_item),
-        and even the text types' `contains` is a plain substring, not a
-        glob (no prefix/suffix-anchoring, no multiple wildcards)."""
+        """Translate dbman's filter map into a Notion `filter` payload
+        object. Two value shapes, per get_page's contract in base.py:
+
+          * a list - an enum-like column's picker selection, OR'd together
+            via _notion_choice_condition. An `and` of `or`s is two levels,
+            which is exactly the 2022-06-28 compound-filter API's maximum
+            nesting depth; don't nest further.
+          * a str - the free-text path, via _notion_filter_condition.
+
+        Skipped entirely: any column/value combination
+        _notion_filter_condition can't express (see its docstring), and the
+        text-column wildcard filters _wildcard_filters claims, which get_page
+        applies client-side instead - Notion's text `contains` is a plain
+        substring with no anchoring, so a glob has to be matched here."""
         col_types = {c.name: c.type_name for c in columns}
+        handled_client_side = _wildcard_filters(col_types, filters)
         conditions = []
         for col_name, val in filters.items():
-            if not val or "*" in val:
+            if not val or col_name in handled_client_side:
                 continue
             ptype = col_types.get(col_name)
             if not ptype:
+                continue
+            if isinstance(val, list):
+                subs = [
+                    {"property": col_name, ptype: cond}
+                    for cond in (_notion_choice_condition(ptype, v) for v in val)
+                    if cond is not None
+                ]
+                if subs:
+                    conditions.append(subs[0] if len(subs) == 1 else {"or": subs})
                 continue
             condition = _notion_filter_condition(ptype, val)
             if condition is None:
@@ -365,7 +450,7 @@ class NotionProvider(Provider):
         notion_filter = self._build_notion_filter(columns, filters)
         if notion_filter:
             payload["filter"] = notion_filter
-        wildcard_filters = {c: v for c, v in filters.items() if v and "*" in v}
+        wildcard_filters = _wildcard_filters({c.name: c.type_name for c in columns}, filters)
 
         result = self._post(f"/databases/{database_id}/query", payload)
         pages = result.get("results", [])

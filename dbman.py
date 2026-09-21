@@ -9,7 +9,8 @@ import csv
 import json
 from sqlalchemy import text
 from textual.app import App, ComposeResult
-from textual.widgets import Header, Footer, DataTable, ListView, ListItem, Label, Static, Button, Input, ContentSwitcher, TextArea, Select
+from textual.widgets import Header, Footer, DataTable, ListView, ListItem, Label, Static, Button, Input, ContentSwitcher, TextArea, Select, SelectionList
+from textual.widgets.selection_list import Selection
 from textual.containers import Horizontal, Vertical, Center, VerticalScroll
 from textual.binding import Binding
 from textual.screen import ModalScreen
@@ -26,6 +27,8 @@ from view_settings import (
     ViewSettingsStore, derive_db_name, apply_view_settings,
     compute_column_widths, truncate_rows,
 )
+from cell_render import option_text, stylize_row
+from providers.base import FILTER_EMPTY, FILTER_NOT_EMPTY
 from workspace import WorkspaceStore, ConnectionSession
 
 __version__ = "0.1.0"
@@ -156,12 +159,14 @@ class ShortcutsScreen(ModalScreen):
                 " \\] / \\[: Fetch next / previous page of rows from the DB (View mode)\n\n"
                 " [bold]Editing & Filtering[/]\n"
                 " e: Edit selected cell/row (View mode) or SQL (SQL mode)\n"
+                "    Columns with a fixed option set open a picker, not a text box\n"
                 " E: Edit whole document as JSON (document DB providers)\n"
                 " a: Add a new row (table) or create a new Table/View (where supported;\n"
                 "    also works on a TABLES/VIEWS sidebar header, even when empty)\n"
                 " d: Delete selected table/view\n"
                 " x: Export current Table/View to CSV\n"
                 " f: Filter selected column (press 's' first for column select mode)\n"
+                "    Option columns offer a multi-pick list; text columns accept '*' wildcards\n"
                 " F: Clear all filters for current table (column select mode)\n"
                 " o: Sort by selected column, cycling asc -> desc -> none (column select mode)\n"
                 " t: Truncate/Shorten Column data (View mode only)\n"
@@ -256,6 +261,12 @@ class FilterColumnScreen(ModalScreen):
     Input {
         margin-bottom: 1;
     }
+    SelectionList {
+        margin-bottom: 1;
+        height: auto;
+        max-height: 20;
+        border: tall $primary-darken-2;
+    }
     #filter-buttons {
         align: right middle;
     }
@@ -263,34 +274,72 @@ class FilterColumnScreen(ModalScreen):
         margin-left: 1;
     }
     """
-    def __init__(self, column, current_filter=""):
+    def __init__(self, column_name, current_filter="", column=None):
         super().__init__()
+        self.column_name = column_name
+        # `column` is the provider Column, when the UI has one cached (see
+        # DbMan.columns_by_name). An enum-like column (Column.options) gets a
+        # multi-pick list of its real options instead of a free-text box:
+        # for a dropdown-backed property, picking is the expected gesture,
+        # and on Notion a typed value is an exact-`equals` that mostly can't
+        # match anything anyway.
         self.column = column
+        self.options = tuple(getattr(column, "options", ()) or ())
         self.current_filter = current_filter
 
     def compose(self) -> ComposeResult:
         with Vertical(id="filter-dialog"):
-            yield Label(f"Filter Column: {self.column}")
-            yield Static("Enter search term ('null'/'not null', 'empty'/'not empty', or free text):", id="small-label")
-            yield Input(value=self.current_filter, id="filter-input", placeholder="Filter...")
+            yield Label(f"Filter Column: {self.column_name}")
+            if self.options:
+                yield Static("Select one or more values (space toggles):", id="small-label")
+                yield SelectionList(*self._selections(), id="filter-choices")
+            else:
+                yield Static(
+                    "Enter search term ('null'/'not null', 'empty'/'not empty', "
+                    "'*' wildcards, or free text):",
+                    id="small-label",
+                )
+                yield Input(value=self._current_text(), id="filter-input", placeholder="Filter...")
             with Horizontal(id="filter-buttons"):
                 yield Button("Cancel", id="cancel-filter")
                 yield Button("Clear", variant="warning", id="clear-filter")
                 yield Button("Apply", variant="success", id="apply-filter")
 
+    def _current_text(self) -> str:
+        return self.current_filter if isinstance(self.current_filter, str) else ""
+
+    def _selections(self):
+        selected = self.current_filter if isinstance(self.current_filter, list) else []
+        for opt in self.options:
+            yield Selection(option_text(opt.name, opt.color), opt.name, opt.name in selected)
+        yield Selection("(empty)", FILTER_EMPTY, FILTER_EMPTY in selected)
+        yield Selection("(not empty)", FILTER_NOT_EMPTY, FILTER_NOT_EMPTY in selected)
+
     def on_mount(self):
-        self.query_one(Input).focus()
+        self.query_one("#filter-choices" if self.options else "#filter-input").focus()
+
+    def _value(self):
+        """The filter value for this column, in whichever shape it takes -
+        a list for an enum-like column, a str otherwise. See get_page's
+        `filters` contract in providers/base.py."""
+        if self.options:
+            return list(self.query_one(SelectionList).selected)
+        return self.query_one(Input).value
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "apply-filter":
-            self.dismiss(self.query_one(Input).value)
+            self.dismiss(self._value())
         elif event.button.id == "clear-filter":
-            self.dismiss("")
+            # Falsy-but-not-None: clear this column's filter. None is cancel.
+            self.dismiss([] if self.options else "")
         else:
             self.dismiss(None)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         self.dismiss(event.value)
+
+    def key_escape(self) -> None:
+        self.dismiss(None)
 
 class ConfirmScreen(ModalScreen):
     """A modal screen for confirmation."""
@@ -364,6 +413,160 @@ class EditCellScreen(ModalScreen):
 
     def key_escape(self) -> None:
         self.dismiss(None)
+
+class ChoiceSelectScreen(ModalScreen):
+    """Pick one option for an enum-like column (Column.options) - a Notion
+    select or status property.
+
+    Replaces EditCellScreen's free-text Input for these columns, which is
+    the point: a typed value doesn't just risk a typo, it silently *creates*
+    a new option on the user's real Notion database (or, for a status
+    property, 400s, since Notion's API can't create status options at all).
+    Picking from the declared set can do neither.
+
+    Dismisses the chosen option name, "" to clear the property, or None to
+    cancel."""
+    CSS = """
+    ChoiceSelectScreen {
+        background: rgba(0, 0, 0, 0.5);
+        align: center middle;
+    }
+    #choice-dialog {
+        background: $panel;
+        border: thick $primary;
+        padding: 1 2;
+        width: 60;
+        height: auto;
+    }
+    Label {
+        margin-bottom: 1;
+        text-style: bold;
+    }
+    Select {
+        margin-bottom: 1;
+    }
+    #choice-buttons {
+        align: right middle;
+    }
+    Button {
+        margin-left: 1;
+    }
+    """
+
+    CLEAR = "\x00clear"
+
+    def __init__(self, column_name, options, current_value):
+        super().__init__()
+        self.column_name = column_name
+        self.options = tuple(options)
+        self.current_value = None if current_value is None else str(current_value)
+
+    def compose(self) -> ComposeResult:
+        choices = [(option_text(o.name, o.color), o.name) for o in self.options]
+        choices.append(("(none)", self.CLEAR))
+        # An option deleted in Notion since this page loaded would still be
+        # sitting in the cell; Textual's Select raises on a value that isn't
+        # among its options, so fall back to blank rather than crashing.
+        names = {o.name for o in self.options}
+        value = self.current_value if self.current_value in names else Select.BLANK
+        with Vertical(id="choice-dialog"):
+            yield Label(f"Set {self.column_name}")
+            yield Select(choices, value=value, id="choice-select")
+            with Horizontal(id="choice-buttons"):
+                yield Button("Cancel", id="cancel-choice")
+                yield Button("Save", variant="success", id="save-choice")
+
+    def on_mount(self):
+        self.query_one(Select).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id != "save-choice":
+            self.dismiss(None)
+            return
+        value = self.query_one(Select).value
+        if value is Select.BLANK:
+            self.dismiss(None)
+        else:
+            self.dismiss("" if value == self.CLEAR else value)
+
+    def key_escape(self) -> None:
+        self.dismiss(None)
+
+
+class MultiChoiceScreen(ModalScreen):
+    """Pick any number of options for a multi-valued enum column
+    (Column.multi_value) - a Notion multi_select property. Dismisses a list
+    of option names (possibly empty, which clears the property) or None to
+    cancel."""
+    CSS = """
+    MultiChoiceScreen {
+        background: rgba(0, 0, 0, 0.5);
+        align: center middle;
+    }
+    #multi-dialog {
+        background: $panel;
+        border: thick $primary;
+        padding: 1 2;
+        width: 60;
+        height: auto;
+    }
+    Label {
+        margin-bottom: 1;
+        text-style: bold;
+    }
+    SelectionList {
+        margin-bottom: 1;
+        height: auto;
+        max-height: 20;
+        border: tall $primary-darken-2;
+    }
+    #multi-buttons {
+        align: right middle;
+    }
+    Button {
+        margin-left: 1;
+    }
+    """
+
+    def __init__(self, column_name, options, current_value):
+        super().__init__()
+        self.column_name = column_name
+        self.options = tuple(options)
+        # The cell holds the ", "-joined display string built by the
+        # provider's read path; split it back into names to preselect.
+        if isinstance(current_value, (list, tuple)):
+            self.current = [str(v) for v in current_value]
+        elif current_value in (None, ""):
+            self.current = []
+        else:
+            self.current = [p.strip() for p in str(current_value).split(",") if p.strip()]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="multi-dialog"):
+            yield Label(f"Set {self.column_name}")
+            yield SelectionList(
+                *[
+                    Selection(option_text(o.name, o.color), o.name, o.name in self.current)
+                    for o in self.options
+                ],
+                id="multi-choices",
+            )
+            with Horizontal(id="multi-buttons"):
+                yield Button("Cancel", id="cancel-multi")
+                yield Button("Save", variant="success", id="save-multi")
+
+    def on_mount(self):
+        self.query_one(SelectionList).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "save-multi":
+            self.dismiss(list(self.query_one(SelectionList).selected))
+        else:
+            self.dismiss(None)
+
+    def key_escape(self) -> None:
+        self.dismiss(None)
+
 
 class TruncateColumnScreen(ModalScreen):
     """A modal screen for truncating a column with live row count."""
@@ -1292,6 +1495,14 @@ class DbMan(App):
         self.raw_docs = {}
         self.row_values = {}
         self.column_widths = {}
+        self._sidebar_rows = []  # see _rebuild_sidebar/_highlight_sidebar_item
+        self._sidebar_rebuilding = False
+        self._sidebar_rebuild_id = 0
+        # name -> provider Column for the page on screen. The DataTable
+        # only carries column name strings, but action_edit_cell and
+        # action_filter_column need the column's options/read_only, and
+        # re-reading the schema is a network call for Notion.
+        self.columns_by_name = {}
         self.mode = "view"
         self.select_mode = "field"
         self.filters = {}
@@ -1445,6 +1656,7 @@ class DbMan(App):
         self.raw_docs = {}
         self.row_values = {}
         self.column_widths = {}
+        self.columns_by_name = {}
         self.row_order = []
         self.rendered_rows = {}
 
@@ -1454,32 +1666,100 @@ class DbMan(App):
         self.notify(f"Switched to '{new_name}'")
 
     def refresh_sidebar(self):
+        """Rebuild the sidebar. Fire-and-forget from the caller's point of
+        view, but the rebuild itself has to be async: see _rebuild_sidebar.
+
+        The suppression flag is raised here, synchronously, rather than
+        inside the coroutine - a Highlighted queued against the outgoing
+        contents would otherwise be delivered in the gap before the worker
+        starts, which on a connection switch meant adopting an item that
+        belongs to the connection being left."""
+        # Generation token, not a plain bool: the worker is exclusive, so a
+        # second refresh cancels the first, and the cancelled one still runs
+        # its finally - which would otherwise lower the flag out from under
+        # the rebuild that superseded it.
+        self._sidebar_rebuild_id += 1
+        self._sidebar_rebuilding = True
+        self.run_worker(
+            self._rebuild_sidebar(self._sidebar_rebuild_id),
+            exclusive=True, group="sidebar-rebuild",
+        )
+
+    async def _rebuild_sidebar(self, rebuild_id):
         sidebar_list = self.query_one("#sidebar-list", ListView)
-        sidebar_list.clear()
-        
-        views = self.get_views()
-        tables = self.get_tables()
-        plugins = ["lookup"] if self.lookup_plugin else []
+        # _sidebar_rebuilding is already True (set in refresh_sidebar):
+        # rows coming and going make the ListView emit Highlighted for
+        # whatever it lands on mid-teardown, including the outgoing
+        # connection's rows. Every load that legitimately happens during a
+        # rebuild is an explicit load_item call below, so the event is pure
+        # noise here. See on_list_view_highlighted.
+        try:
+            # Awaiting the clear is the whole reason this is async. ListView.
+            # clear() removes its children *asynchronously* (it returns an
+            # AwaitRemove) while append() lands synchronously, so repopulating
+            # without awaiting leaves the widget holding the previous contents
+            # followed by the new ones. Anything that then resolves a row
+            # position against it - and assigning .index emits Highlighted,
+            # which on_list_view_highlighted turns into a load_item - is
+            # working against a list that is about to shrink underneath it.
+            #
+            # Two separate crashes came from that. Switching connections landed
+            # .index past the end of the settled list, so the next up/k raised
+            # IndexError out of ListView.action_cursor_up; and an index that
+            # happened to fall on a *stale* row loaded an item belonging to the
+            # previous connection, which the new provider has never heard of
+            # (KeyError out of NotionProvider.get_schema). It only looked
+            # correct for a same-content refresh (m-cycling), where the stale
+            # half is identical to the new one and so any offset into it
+            # coincidentally names the right item.
+            await sidebar_list.clear()
 
-        sidebar_list.append(SidebarHeader("TABLES", "table"))
-        for t in tables:
-            sidebar_list.append(DbItem(t, "table"))
+            views = self.get_views()
+            tables = self.get_tables()
+            plugins = ["lookup"] if self.lookup_plugin else []
 
-        sidebar_list.append(SidebarHeader("VIEWS", "view"))
-        for v in views:
-            sidebar_list.append(DbItem(v, "view"))
+            # One ordered description of the sidebar, recorded as it's built,
+            # so a row's position is derived from the same source of truth that
+            # produced it rather than scanned back out of the widget. `None`
+            # marks a section header; everything else is (name, type).
+            self._sidebar_rows = []
+            for header, item_type, names in (
+                ("TABLES", "table", tables),
+                ("VIEWS", "view", views),
+                ("PLUGINS", "plugin", plugins),
+            ):
+                sidebar_list.append(SidebarHeader(header, item_type))
+                self._sidebar_rows.append(None)
+                for name in names:
+                    sidebar_list.append(DbItem(name, item_type))
+                    self._sidebar_rows.append((name, item_type))
 
-        sidebar_list.append(SidebarHeader("PLUGINS", "plugin"))
-        for p in plugins:
-            sidebar_list.append(DbItem(p, "plugin"))
-            
-        if not self.current_item:
-            restored = self._restore_workspace_session(views, tables)
-            if not restored:
-                if tables:
-                    self.load_item(tables[0], "table")
-                elif views:
-                    self.load_item(views[0], "view")
+            if self.current_item:
+                # A rebuild that kept its item (m-cycling, a create/delete)
+                # must put the highlight back on it - the clear dropped it.
+                self._highlight_sidebar_item(self.current_item, self.current_type)
+            else:
+                restored = self._restore_workspace_session(views, tables)
+                if not restored:
+                    if tables:
+                        self.load_item(tables[0], "table")
+                    elif views:
+                        self.load_item(views[0], "view")
+        finally:
+            if rebuild_id == self._sidebar_rebuild_id:
+                self._sidebar_rebuilding = False
+
+    def _highlight_sidebar_item(self, name, item_type):
+        """Move the sidebar highlight onto one item's row. Safe to call only
+        once the sidebar has settled - i.e. from inside _rebuild_sidebar,
+        after its awaited clear, or any time no rebuild is in flight."""
+        try:
+            index = self._sidebar_rows.index((name, item_type))
+        except ValueError:
+            return
+        sidebar_list = self.query_one("#sidebar-list", ListView)
+        if index < len(sidebar_list.children):
+            sidebar_list.index = index
 
     def _restore_workspace_session(self, views, tables) -> bool:
         """On first load, re-open the item/mode/select_mode/cursor this
@@ -1499,11 +1779,7 @@ class DbMan(App):
         self.select_mode = session.select_mode
         self.load_item(session.item_name, session.item_type)
 
-        sidebar_list = self.query_one("#sidebar-list", ListView)
-        for i, child in enumerate(sidebar_list.children):
-            if isinstance(child, DbItem) and child.item_name == session.item_name and child.item_type == session.item_type:
-                sidebar_list.index = i
-                break
+        self._highlight_sidebar_item(session.item_name, session.item_type)
 
         if session.cursor_row is not None and session.cursor_column is not None:
             try:
@@ -1552,8 +1828,17 @@ class DbMan(App):
             self.load_item(item.item_name, item.item_type, should_focus=True)
 
     def on_list_view_highlighted(self, event: ListView.Highlighted):
+        if self._sidebar_rebuilding:
+            return
         item = event.item
         if isinstance(item, DbItem):
+            if item.item_name == self.current_item and item.item_type == self.current_type:
+                # The highlight landing back on the item that's already
+                # loaded is _rebuild_sidebar/_restore_workspace_session
+                # putting it there, not the user navigating. Re-fetching
+                # would be a wasted round trip (a real one, on Notion) and
+                # would throw away the filters/sort below.
+                return
             self.filters = {}
             self.sort = []
             self.reset_paging()
@@ -1600,6 +1885,7 @@ class DbMan(App):
                 self.row_keys = {}
                 self.raw_docs = {}
                 self.row_values = {}
+                self.columns_by_name = {}
                 self.row_order = []
                 self.rendered_rows = {}
                 self.rows_editable = False
@@ -1652,7 +1938,14 @@ class DbMan(App):
                     display_columns, display_rows = apply_view_settings(page.columns, page.rows, view_settings)
                     column_widths = compute_column_widths(display_columns, display_rows, view_settings)
                     self.column_widths = column_widths
+                    self.columns_by_name = {c.name: c for c in display_columns}
                     rendered_rows = truncate_rows(display_columns, display_rows, column_widths)
+                    # Paint enum-valued cells in their option colors. Must
+                    # follow truncation - see cell_render.stylize_row.
+                    rendered_rows = [
+                        stylize_row(display_columns, rendered, source)
+                        for rendered, source in zip(rendered_rows, display_rows)
+                    ]
 
                     for i, col in enumerate(display_columns):
                         color = COLORS[i % len(COLORS)]
@@ -1683,6 +1976,7 @@ class DbMan(App):
                 self.row_keys = {}
                 self.raw_docs = {}
                 self.row_values = {}
+                self.columns_by_name = {}
                 self.row_order = []
                 self.rendered_rows = {}
                 self.rows_editable = False
@@ -1760,7 +2054,9 @@ class DbMan(App):
 
     def action_jump_section(self):
         sidebar_list = self.query_one("#sidebar-list", ListView)
-        current_idx = sidebar_list.index
+        # No row highlighted yet (nothing selected, or a rebuild in flight):
+        # start the search from before the first row rather than raising.
+        current_idx = -1 if sidebar_list.index is None else sidebar_list.index
         found = False
         for i in range(current_idx + 1, len(sidebar_list.children)):
             if isinstance(sidebar_list.children[i], SidebarHeader):
@@ -1784,11 +2080,6 @@ class DbMan(App):
         self.mode = modes[(idx + 1) % len(modes)]
         self.refresh_bindings()
         self.refresh_sidebar()
-        sidebar_list = self.query_one("#sidebar-list", ListView)
-        for i, child in enumerate(sidebar_list.children):
-            if isinstance(child, DbItem) and child.item_name == self.current_item:
-                sidebar_list.index = i
-                break
         if self.current_item:
             self.load_item(self.current_item, self.current_type)
 
@@ -2036,14 +2327,20 @@ class DbMan(App):
         column_name = self.focused.ordered_columns[coord.column].key.value
         current_filter = self.filters.get(column_name, "")
         def apply_filter(val):
+            # None is cancel; anything falsy ("" from the text box, [] from
+            # the picker) clears this column's filter. An empty list must
+            # never reach a provider - see get_page's contract in base.py.
             if val is not None:
-                if val == "":
+                if not val:
                     self.filters.pop(column_name, None)
                 else:
                     self.filters[column_name] = val
                 self.reset_paging()
                 self.load_item(self.current_item, self.current_type)
-        self.push_screen(FilterColumnScreen(column_name, current_filter), apply_filter)
+        self.push_screen(
+            FilterColumnScreen(column_name, current_filter, self.columns_by_name.get(column_name)),
+            apply_filter,
+        )
 
     def action_sort_column(self):
         if self.mode != "view":
@@ -2283,6 +2580,34 @@ class DbMan(App):
 
         if self.provider.capabilities.whole_row_edit and isinstance(current_value, (dict, list)):
             self.action_edit_document()
+            return
+
+        col = self.columns_by_name.get(column_name)
+        if col is not None and col.read_only:
+            # Fail here rather than round-tripping to the provider just to
+            # get its ValueError back: the column's own schema already says
+            # this is a computed/system field (Notion formula, rollup,
+            # relation, unique_id, ...).
+            self.notify(f"Column '{column_name}' is read-only", severity="error")
+            return
+
+        if col is not None and col.options:
+            def perform_choice_update(new_value):
+                # No str->int/float coercion here, unlike perform_update
+                # below: an option is a name, even one that looks numeric.
+                if new_value is None:
+                    return
+                try:
+                    self.provider.update_cell(
+                        self.current_item, self.current_type, row_key, column_name, new_value
+                    )
+                    self.notify("Updated")
+                    self.load_item(self.current_item, self.current_type)
+                except Exception as e:
+                    self.notify(f"Update failed: {e}", severity="error")
+
+            screen_cls = MultiChoiceScreen if col.multi_value else ChoiceSelectScreen
+            self.push_screen(screen_cls(column_name, col.options, current_value), perform_choice_update)
             return
 
         lookup_conf = self.lookup_plugin.get_lookup_config(self.current_item, column_name) if self.lookup_plugin else None

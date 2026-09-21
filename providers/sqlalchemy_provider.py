@@ -1,11 +1,12 @@
 from sqlalchemy import (
-    create_engine, inspect, text, MetaData, Table, select, update, func,
+    create_engine, inspect, text, MetaData, Table, select, update, func, or_,
 )
 from sqlalchemy.exc import SQLAlchemyError
 
 from .base import (
     Provider, Column, RowKey, RowPage, Capabilities,
     DiagramModel, DiagramNode, DiagramEdge,
+    FILTER_EMPTY, FILTER_NOT_EMPTY,
 )
 
 
@@ -61,20 +62,39 @@ class SqlAlchemyProvider(Provider):
             ))
         return result
 
+    def _value_clause(self, col, val):
+        """One filter value -> one WHERE clause. The picker sentinels are
+        accepted alongside the typed keywords so a list filter reduces to
+        the same per-value logic."""
+        if val == FILTER_EMPTY:
+            return (col.is_(None)) | (col == "")
+        if val == FILTER_NOT_EMPTY:
+            return (col.is_not(None)) & (col != "")
+        low = val.lower()
+        if low == "null":
+            return col.is_(None)
+        if low in ("not null", "!null"):
+            return col.is_not(None)
+        if low == "empty":
+            return (col.is_(None)) | (col == "")
+        if low == "not empty":
+            return (col.is_not(None)) & (col != "")
+        return col.like(f"%{val}%")
+
     def _build_filter_clause(self, table_obj, filters):
         clauses = []
         for col_name, val in filters.items():
             col = table_obj.c[col_name]
-            if val.lower() == "null":
-                clauses.append(col.is_(None))
-            elif val.lower() in ("not null", "!null"):
-                clauses.append(col.is_not(None))
-            elif val.lower() == "empty":
-                clauses.append((col.is_(None)) | (col == ""))
-            elif val.lower() == "not empty":
-                clauses.append((col.is_not(None)) & (col != ""))
+            if isinstance(val, list):
+                # The picker path (see get_page's contract in base.py). No
+                # SQL column advertises Column.options today, so nothing in
+                # the UI currently produces this - implemented so the
+                # contract holds rather than raising on an unexpected shape.
+                if not val:
+                    continue
+                clauses.append(or_(*[self._value_clause(col, v) for v in val]))
             else:
-                clauses.append(col.like(f"%{val}%"))
+                clauses.append(self._value_clause(col, val))
         return clauses
 
     def _apply_sort(self, stmt, table, sort):

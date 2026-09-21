@@ -3,7 +3,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from .base import (
     Provider, Column, RowKey, RowPage, Capabilities,
-    DiagramModel,
+    DiagramModel, FILTER_EMPTY, FILTER_NOT_EMPTY,
 )
 
 SAMPLE_SIZE = 200
@@ -172,17 +172,54 @@ class CouchDBProvider(Provider):
             return self._get_view_page(name, cursor, page_size)
         return self._get_documents_page(filters, cursor, page_size)
 
-    def _mango_selector(self, filters: dict[str, str]) -> dict:
+    def _mango_list_branches(self, col_name, val: list) -> list:
+        """A picker-built list filter -> the `$or` branches for one column.
+        Each branch is keyed under `col_name`, so unlike the `$or`/`$and`
+        branches in _mango_selector nothing here can collide across
+        columns."""
+        branches = []
+        for v in val:
+            if v == FILTER_EMPTY:
+                branches += [{col_name: None}, {col_name: ""}]
+            elif v == FILTER_NOT_EMPTY:
+                branches.append({col_name: {"$nin": [None, ""]}})
+            else:
+                branches.append({col_name: {"$eq": v}})
+        return branches
+
+    def _mango_selector(self, filters: dict) -> dict:
         selector = {}
         for col_name, val in filters.items():
-            if val.lower() == "null":
+            if isinstance(val, list):
+                # The picker path (see get_page's contract in base.py). No
+                # CouchDB column advertises Column.options today - inferring
+                # columns from sampled documents can't establish that a
+                # field's domain is closed - so nothing in the UI currently
+                # produces this shape; implemented so the contract holds
+                # rather than raising on it.
+                if not val:
+                    continue
+                branches = self._mango_list_branches(col_name, val)
+                if len(branches) == 1:
+                    selector.update(branches[0])
+                else:
+                    selector.setdefault("$and", []).append({"$or": branches})
+            elif val.lower() == "null":
                 selector[col_name] = None
             elif val.lower() in ("not null", "!null"):
                 selector[col_name] = {"$ne": None}
             elif val.lower() == "empty":
-                selector["$or"] = [{col_name: None}, {col_name: ""}]
+                # Accumulated under a single $and rather than assigned to a
+                # bare top-level $or/$and key: two columns both filtered
+                # 'empty' used to overwrite each other's clause, and the
+                # list path above shares the same $and.
+                selector.setdefault("$and", []).append(
+                    {"$or": [{col_name: None}, {col_name: ""}]}
+                )
             elif val.lower() == "not empty":
-                selector["$and"] = [{col_name: {"$ne": None}}, {col_name: {"$ne": ""}}]
+                selector.setdefault("$and", []).append(
+                    {col_name: {"$nin": [None, ""]}}
+                )
             else:
                 selector[col_name] = {"$regex": val}
         return selector

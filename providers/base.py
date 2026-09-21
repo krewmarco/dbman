@@ -6,6 +6,25 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 
+# Sentinels for the "is this cell empty?" filter conditions in a *list*
+# filter value (see get_page's `filters` contract). The string filter path
+# keeps its human-typed "empty"/"not empty" keywords, but a picker-built
+# list holds real option names, and an enum column could legitimately have
+# an option literally named "empty" - hence a value no option name can be.
+FILTER_EMPTY = "\x00empty"
+FILTER_NOT_EMPTY = "\x00not-empty"
+
+
+@dataclass(frozen=True)
+class ColumnOption:
+    """One choice in an enum-like column (a Notion select/status/multi_select
+    option). `color` is the provider's own palette name (Notion's
+    "red"/"brown"/"default"/...), left untranslated here - mapping it to a
+    terminal style is the UI's job, see cell_render.py."""
+    name: str
+    color: Optional[str] = None
+
+
 @dataclass(frozen=True)
 class Column:
     name: str
@@ -15,6 +34,14 @@ class Column:
     primary_key: bool = False
     inferred: bool = False  # True when sampled from data rather than a declared schema
     read_only: bool = False  # True for computed/system columns (e.g. Notion formula/rollup)
+    # A non-empty `options` means this column is enum-like: the UI offers a
+    # picker (for editing *and* filtering) instead of a free-text box, which
+    # is both the expected gesture and the only safe one - writing an
+    # arbitrary string to a Notion select silently creates a new option on
+    # the user's real database. A tuple, not a list, because Column is
+    # frozen and therefore hashable.
+    options: tuple = ()
+    multi_value: bool = False  # a cell holds several options at once (Notion multi_select)
 
 
 @dataclass(frozen=True)
@@ -105,12 +132,26 @@ class Provider(ABC):
         self,
         name: str,
         item_type: str,
-        filters: dict[str, str],
+        filters: dict[str, "str | list[str]"],
         cursor: Optional[str],
         page_size: Optional[int],
         sort: Optional[tuple[str, str]] = None,
     ) -> RowPage:
-        """`sort`, when given, is (column_name, "asc" | "desc") - a single
+        """`filters` maps a column name to one of two shapes:
+
+          * a `str` - the free-text path: the "null"/"not null"/"empty"/
+            "not empty" keywords, else a substring match (LIKE/$regex/
+            Notion's `contains`).
+          * a `list[str]` - the picker path, used for enum-like columns
+            (Column.options): an OR of exact matches, where an entry may be
+            the FILTER_EMPTY / FILTER_NOT_EMPTY sentinel. An empty list
+            never reaches a provider; the UI drops the key instead.
+
+        A union rather than a richer object on purpose - every provider's
+        existing string handling stays untouched and each adds exactly one
+        `isinstance(val, list)` branch.
+
+        `sort`, when given, is (column_name, "asc" | "desc") - a single
         column, pushed into the underlying query/re-fetch rather than
         applied client-side, so it composes correctly with paging. Only
         meaningful for providers with capabilities.sort_column = True;
