@@ -12,6 +12,7 @@ from textual.app import App, ComposeResult
 from textual.widgets import Header, Footer, DataTable, ListView, ListItem, Label, Static, Button, Input, ContentSwitcher, TextArea, Select
 from textual.containers import Horizontal, Vertical, Center, VerticalScroll
 from textual.binding import Binding
+from textual.coordinate import Coordinate
 from textual.screen import ModalScreen
 from textual.reactive import reactive
 from textual.message import Message
@@ -28,7 +29,7 @@ from view_settings import (
 )
 from cell_render import option_text, stylize_row
 from providers.base import Column, ColumnOption, FILTER_EMPTY, FILTER_NOT_EMPTY
-from virtual_table import OptionPickerTable, VirtualTableScreen
+from virtual_table import OptionPickerTable, VirtualTableScreen, cell_matches
 from column_meta import ColumnMetadataTable
 from workspace import WorkspaceStore, ConnectionSession
 
@@ -167,6 +168,8 @@ class ShortcutsScreen(ModalScreen):
                 "    also works on a TABLES/VIEWS sidebar header, even when empty)\n"
                 " d: Delete selected table/view\n"
                 " x: Export current Table/View to CSV\n"
+                " /: Search the loaded page - cell values, or column names in column mode\n"
+                " n / N: Step to the next / previous match\n"
                 " f: Filter the column under the cursor (field or column select mode)\n"
                 "    Option columns open the same picker table (multi-pick, plus\n"
                 "    (empty)/(not empty)); text columns accept '*' wildcards\n"
@@ -314,6 +317,45 @@ class FilterColumnScreen(ModalScreen):
 
     def key_escape(self) -> None:
         self.dismiss(None)
+
+class SearchScreen(ModalScreen):
+    """'/' - find text in the page that's loaded, and move the cursor to it.
+
+    Distinct from the filter box: a filter narrows the rowset and costs a
+    provider round trip, while this only moves the cursor. That split is
+    what lets search be cross-column and instant - it runs over the rows
+    already in memory, so it behaves identically on all three backends
+    instead of inheriting each one's filter vocabulary."""
+    CSS = """
+    SearchScreen { background: rgba(0, 0, 0, 0.3); align: center middle; }
+    #search-dialog {
+        background: $panel; border: thick $primary;
+        padding: 1 2; width: 50; height: auto;
+    }
+    #search-dialog Label { text-style: bold; margin-bottom: 1; }
+    #search-hint { color: $text-muted; margin-top: 1; }
+    """
+
+    def __init__(self, scope: str, current: str = ""):
+        super().__init__()
+        self.scope = scope
+        self.current = current
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="search-dialog"):
+            yield Label(f"Search {self.scope}")
+            yield Input(value=self.current, placeholder="Text, or a '*' pattern", id="search-input")
+            yield Static("n / N step through matches · empty clears", id="search-hint")
+
+    def on_mount(self):
+        self.query_one(Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value)
+
+    def key_escape(self) -> None:
+        self.dismiss(None)
+
 
 class ConfirmScreen(ModalScreen):
     """A modal screen for confirmation."""
@@ -998,6 +1040,15 @@ def _filter_column_ctx(app):
     return app.mode == "view" and bool(app.current_item)
 
 
+def _search_step_ctx(app):
+    """n/N are only meaningful with a search running. Greyed (None) rather
+    than hidden so the keys stay discoverable once '/' has been used, and
+    inert - check_action returning None also stops the keypress."""
+    if app.mode != "view" or not app.current_item:
+        return False
+    return True if app.search_matches else None
+
+
 def _sort_column_ctx(app):
     """Mirrors _filter_column_ctx: kept dispatchable across select modes/item
     types whenever View mode has an item loaded, so action_sort_column's own
@@ -1187,6 +1238,9 @@ class DbMan(App):
         Binding("E", "edit_document", "Edit Document", show=False),
         Binding("a", "add", "Add"),
         Binding("x", "export_csv", "Export CSV", show=False),
+        Binding("/", "search", "Search"),
+        Binding("n", "search_next", "Next Match", show=False),
+        Binding("N", "search_prev", "Prev Match", show=False),
         Binding("f", "filter_column", "Filter Column"),
         Binding("F", "clear_filters", "Clear Filters"),
         Binding("o", "sort_column", "Sort Column"),
@@ -1215,6 +1269,9 @@ class DbMan(App):
         "edit_document": _ctx(modes={"view"}, capability="whole_row_edit"),
         "filter_column": _filter_column_ctx,
         "sort_column": _sort_column_ctx,
+        "search": _ctx(modes={"view"}),
+        "search_next": _search_step_ctx,
+        "search_prev": _search_step_ctx,
         "truncate_column": _truncate_column_ctx,
         "rotate_select_mode": _ctx(modes={"view"}),
         "reorder_column": _ctx(modes={"view"}, select_modes={"column"}),
@@ -1259,6 +1316,13 @@ class DbMan(App):
         self.select_mode = "field"
         self.filters = {}
         self.sort = []  # [(column_name, "asc" | "desc")] - single-column for now, see action_sort_column
+        # '/' search over the loaded page. search_cells is every matching
+        # cell (what gets highlighted); search_matches is the subset the
+        # cursor steps through, which differs by select mode.
+        self.search_term = None
+        self.search_cells = []
+        self.search_matches = []
+        self.search_index = 0
         self.page_size = 500
         self.page_cursor = None
         self.page_history = []
@@ -1403,6 +1467,7 @@ class DbMan(App):
         self.select_mode = "field"
         self.filters = {}
         self.sort = []
+        self._reset_search()
         self.reset_paging()
         self.row_keys = {}
         self.raw_docs = {}
@@ -1577,6 +1642,7 @@ class DbMan(App):
         if isinstance(item, DbItem):
             self.filters = {}
             self.sort = []
+            self._reset_search()
             self.reset_paging()
             self.load_item(item.item_name, item.item_type, should_focus=True)
 
@@ -1594,6 +1660,7 @@ class DbMan(App):
                 return
             self.filters = {}
             self.sort = []
+            self._reset_search()
             self.reset_paging()
             self.load_item(item.item_name, item.item_type, should_focus=False)
         elif isinstance(item, SidebarHeader):
@@ -1774,6 +1841,12 @@ class DbMan(App):
             if should_focus:
                 sql_widget.focus()
                 
+        if self.search_term and self.mode == "view":
+            # load_item redraws every cell, so the highlight has to be laid
+            # back down. Don't move the cursor: the reload is usually the
+            # tail of an edit, and yanking the user back to match #1 would
+            # undo where they had navigated to.
+            self._refresh_search(move_cursor=False)
         self.update_title()
         self.refresh_bindings()
 
@@ -1793,7 +1866,16 @@ class DbMan(App):
         if self.mode == "view" and self.sort:
             col_name, direction = self.sort[0]
             sort_indicator = f" [sort: {col_name} {'asc' if direction == 'asc' else 'desc'}]"
-        self.title = f"dbman - {self.current_item} ({self.mode.upper()}){page_indicator}{select_indicator}{sort_indicator}"
+        search_indicator = ""
+        if self.mode == "view" and self.search_term:
+            if self.search_matches:
+                search_indicator = f" [/{self.search_term} {self.search_index + 1}/{len(self.search_matches)}]"
+            else:
+                search_indicator = f" [/{self.search_term} no match]"
+        self.title = (
+            f"dbman - {self.current_item} ({self.mode.upper()})"
+            f"{page_indicator}{select_indicator}{sort_indicator}{search_indicator}"
+        )
 
     def action_switch_focus(self):
         if self.query_one("#sidebar").display:
@@ -1857,8 +1939,16 @@ class DbMan(App):
         if not isinstance(self.focused, DataTable):
             return
         idx = self.SELECT_MODES.index(self.select_mode)
+        if self.search_term:
+            # Rotating changes what '/' is searching - column mode looks at
+            # headers, the other two at values - so drop the old marks
+            # before the scope moves out from under them.
+            self._paint_search(False)
         self.select_mode = self.SELECT_MODES[(idx + 1) % len(self.SELECT_MODES)]
         self.focused.cursor_type = self._cursor_type_for_select_mode()
+        if self.search_term:
+            self.search_index = 0
+            self._refresh_search(move_cursor=False)
         self.update_title()
         self.refresh_bindings()
 
@@ -2109,6 +2199,138 @@ class DbMan(App):
                     self.load_item(self.current_item, self.current_type)
 
         self.push_screen(UnhideColumnScreen(list(settings.hidden)), do_unhide)
+
+    # -- '/' search over the loaded page -------------------------------------
+
+    def _reset_search(self):
+        self.search_term = None
+        self.search_cells = []
+        self.search_matches = []
+        self.search_index = 0
+
+    def _search_scope(self) -> str:
+        """What '/' looks at in the current select mode. Column mode
+        searches headers because a column's identity is its name; the other
+        two search values, and differ only in what the cursor lands on."""
+        return "column names" if self.select_mode == "column" else "cell values"
+
+    def _compute_search(self):
+        """(every matching cell, the cells the cursor steps through).
+
+        Matching runs against self.row_values - the *untruncated* values -
+        not the rendered cells, so text that got shortened to ".." is still
+        findable. The cursor can therefore land on a cell whose match isn't
+        legible; that's deliberate, the cell is selected and 'e' shows it
+        in full, and the alternative is a search that can't find what's
+        demonstrably there."""
+        table = self.query_one("#data-table", DataTable)
+        if not self.search_term or not table.columns:
+            return [], []
+        names = [c.key.value for c in table.ordered_columns]
+
+        if self.select_mode == "column":
+            row = table.cursor_coordinate.row
+            hits = [Coordinate(row, i) for i, n in enumerate(names) if cell_matches(n, self.search_term)]
+            return [], hits  # the column cursor is its own highlight
+
+        cells = []
+        for ri, row_key in enumerate(self.row_order):
+            values = self.row_values.get(row_key, {})
+            for ci, name in enumerate(names):
+                if cell_matches(values.get(name), self.search_term):
+                    cells.append(Coordinate(ri, ci))
+        if self.select_mode == "row":
+            # One stop per row, so n steps row to row rather than crawling
+            # across every matching cell within one.
+            seen, steps = set(), []
+            for coord in cells:
+                if coord.row not in seen:
+                    seen.add(coord.row)
+                    steps.append(coord)
+            return cells, steps
+        return cells, list(cells)
+
+    def _paint_search(self, on: bool):
+        """Mark (or restore) the matching cells. Restoring reads back from
+        self.rendered_rows, which holds what load_item actually drew -
+        including option colors, which the highlight sits on top of rather
+        than replacing."""
+        table = self.query_one("#data-table", DataTable)
+        for coord in self.search_cells:
+            if coord.row >= len(self.row_order):
+                continue
+            original = self.rendered_rows.get(self.row_order[coord.row])
+            if not original or coord.column >= len(original):
+                continue
+            value = original[coord.column]
+            if on:
+                text = value if isinstance(value, Text) else Text("" if value is None else str(value))
+                value = Text(text.plain, style=f"{text.style} reverse".strip())
+            try:
+                table.update_cell_at(coord, value)
+            except Exception:
+                pass  # table rebuilt underneath us; the next load_item repaints
+
+    def _refresh_search(self, move_cursor=True):
+        self.search_cells, self.search_matches = self._compute_search()
+        self._paint_search(True)
+        if self.search_matches:
+            self.search_index = min(self.search_index, len(self.search_matches) - 1)
+            if move_cursor:
+                self._goto_match(self.search_index)
+        self.update_title()
+        self.refresh_bindings()
+
+    def _goto_match(self, index):
+        table = self.query_one("#data-table", DataTable)
+        coord = self.search_matches[index]
+        # In column mode the row is whatever the cursor was already on -
+        # searching for a column shouldn't also move you down the table.
+        row = table.cursor_coordinate.row if self.select_mode == "column" else coord.row
+        table.cursor_coordinate = Coordinate(row, coord.column)
+        self.search_index = index
+
+    def action_search(self):
+        if self.mode != "view":
+            self.notify("Search only allowed in View mode", severity="error")
+            return
+        if not isinstance(self.focused, DataTable) or not self.current_item:
+            return
+
+        def run(term):
+            if term is None:
+                return
+            self._paint_search(False)
+            self.search_term = term.strip() or None
+            self.search_index = 0
+            if self.search_term is None:
+                self._reset_search()
+                self.update_title()
+                self.refresh_bindings()
+                return
+            self._refresh_search()
+            if not self.search_matches:
+                self.notify(f"No match for '{term}' in {self._search_scope()}", severity="warning")
+            else:
+                self.notify(f"{len(self.search_matches)} match(es) - n / N to step")
+
+        self.push_screen(SearchScreen(self._search_scope(), self.search_term or ""), run)
+
+    def _step_search(self, delta):
+        if not self.search_matches:
+            return
+        index = self.search_index + delta
+        wrapped = not (0 <= index < len(self.search_matches))
+        self._goto_match(index % len(self.search_matches))
+        self.update_title()
+        if wrapped:
+            self.notify("Wrapped" + (" to top" if delta > 0 else " to bottom"))
+
+    def action_search_next(self):
+        self._step_search(1)
+
+    def action_search_prev(self):
+        self._step_search(-1)
 
     def action_filter_column(self):
         if self.mode != "view":

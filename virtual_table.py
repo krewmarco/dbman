@@ -53,6 +53,17 @@ class VirtualRow:
     cells: list
 
 
+def cell_matches(value, term: str) -> bool:
+    """Does one cell match the on-screen search term? See matches() for the
+    semantics; this is the per-cell half, shared with dbman's table search
+    ('/') so the two can't drift apart."""
+    term = term.strip().lower()
+    if not term:
+        return True
+    text = (value.plain if isinstance(value, Text) else str(value if value is not None else "")).lower()
+    return fnmatch.fnmatch(text, f"*{term}*")
+
+
 def matches(cells: list, term: str) -> bool:
     """Filter one row against the search box, case-insensitively, against
     the rendered text of every cell - so a term can hit any column without
@@ -68,15 +79,9 @@ def matches(cells: list, term: str) -> bool:
     That one builds a stored, re-applied query over rows the app may never
     have seen; this one narrows a short list already on screen, where making
     someone anchor a search they can see the results of is just friction."""
-    term = term.strip().lower()
-    if not term:
+    if not term.strip():
         return True
-    pattern = f"*{term}*"
-    for cell in cells:
-        text = (cell.plain if isinstance(cell, Text) else str(cell if cell is not None else "")).lower()
-        if fnmatch.fnmatch(text, pattern):
-            return True
-    return False
+    return any(cell_matches(cell, term) for cell in cells)
 
 
 class VirtualTable(ABC):
