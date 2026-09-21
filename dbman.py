@@ -9,8 +9,7 @@ import csv
 import json
 from sqlalchemy import text
 from textual.app import App, ComposeResult
-from textual.widgets import Header, Footer, DataTable, ListView, ListItem, Label, Static, Button, Input, ContentSwitcher, TextArea, Select, SelectionList
-from textual.widgets.selection_list import Selection
+from textual.widgets import Header, Footer, DataTable, ListView, ListItem, Label, Static, Button, Input, ContentSwitcher, TextArea, Select
 from textual.containers import Horizontal, Vertical, Center, VerticalScroll
 from textual.binding import Binding
 from textual.screen import ModalScreen
@@ -28,7 +27,8 @@ from view_settings import (
     compute_column_widths, truncate_rows,
 )
 from cell_render import option_text, stylize_row
-from providers.base import FILTER_EMPTY, FILTER_NOT_EMPTY
+from providers.base import Column, ColumnOption, FILTER_EMPTY, FILTER_NOT_EMPTY
+from virtual_table import OptionPickerTable, VirtualTableScreen
 from workspace import WorkspaceStore, ConnectionSession
 
 __version__ = "0.1.0"
@@ -159,14 +159,16 @@ class ShortcutsScreen(ModalScreen):
                 " \\] / \\[: Fetch next / previous page of rows from the DB (View mode)\n\n"
                 " [bold]Editing & Filtering[/]\n"
                 " e: Edit selected cell/row (View mode) or SQL (SQL mode)\n"
-                "    Columns with a fixed option set open a picker, not a text box\n"
+                "    Columns with a fixed option set open a picker table (space toggles,\n"
+                "    f filters the options, enter saves)\n"
                 " E: Edit whole document as JSON (document DB providers)\n"
                 " a: Add a new row (table) or create a new Table/View (where supported;\n"
                 "    also works on a TABLES/VIEWS sidebar header, even when empty)\n"
                 " d: Delete selected table/view\n"
                 " x: Export current Table/View to CSV\n"
                 " f: Filter selected column (press 's' first for column select mode)\n"
-                "    Option columns offer a multi-pick list; text columns accept '*' wildcards\n"
+                "    Option columns open the same picker table (multi-pick, plus\n"
+                "    (empty)/(not empty)); text columns accept '*' wildcards\n"
                 " F: Clear all filters for current table (column select mode)\n"
                 " o: Sort by selected column, cycling asc -> desc -> none (column select mode)\n"
                 " t: Truncate/Shorten Column data (View mode only)\n"
@@ -241,7 +243,11 @@ class VersionScreen(ModalScreen):
         self.app.pop_screen()
 
 class FilterColumnScreen(ModalScreen):
-    """A modal screen for filtering a column."""
+    """Free-text filter for one column. An enum-like column (Column.options)
+    doesn't come here at all - action_filter_column sends it to an
+    OptionPickerTable instead, since picking from the declared option set is
+    both the expected gesture and the only one a per-option filter API can
+    actually answer."""
     CSS = """
     FilterColumnScreen {
         background: rgba(0, 0, 0, 0.5);
@@ -261,12 +267,6 @@ class FilterColumnScreen(ModalScreen):
     Input {
         margin-bottom: 1;
     }
-    SelectionList {
-        margin-bottom: 1;
-        height: auto;
-        max-height: 20;
-        border: tall $primary-darken-2;
-    }
     #filter-buttons {
         align: right middle;
     }
@@ -274,64 +274,34 @@ class FilterColumnScreen(ModalScreen):
         margin-left: 1;
     }
     """
-    def __init__(self, column_name, current_filter="", column=None):
+    def __init__(self, column_name, current_filter=""):
         super().__init__()
         self.column_name = column_name
-        # `column` is the provider Column, when the UI has one cached (see
-        # DbMan.columns_by_name). An enum-like column (Column.options) gets a
-        # multi-pick list of its real options instead of a free-text box:
-        # for a dropdown-backed property, picking is the expected gesture,
-        # and on Notion a typed value is an exact-`equals` that mostly can't
-        # match anything anyway.
-        self.column = column
-        self.options = tuple(getattr(column, "options", ()) or ())
-        self.current_filter = current_filter
+        self.current_filter = current_filter if isinstance(current_filter, str) else ""
 
     def compose(self) -> ComposeResult:
         with Vertical(id="filter-dialog"):
             yield Label(f"Filter Column: {self.column_name}")
-            if self.options:
-                yield Static("Select one or more values (space toggles):", id="small-label")
-                yield SelectionList(*self._selections(), id="filter-choices")
-            else:
-                yield Static(
-                    "Enter search term ('null'/'not null', 'empty'/'not empty', "
-                    "'*' wildcards, or free text):",
-                    id="small-label",
-                )
-                yield Input(value=self._current_text(), id="filter-input", placeholder="Filter...")
+            yield Static(
+                "Enter search term ('null'/'not null', 'empty'/'not empty', "
+                "'*' wildcards, or free text):",
+                id="small-label",
+            )
+            yield Input(value=self.current_filter, id="filter-input", placeholder="Filter...")
             with Horizontal(id="filter-buttons"):
                 yield Button("Cancel", id="cancel-filter")
                 yield Button("Clear", variant="warning", id="clear-filter")
                 yield Button("Apply", variant="success", id="apply-filter")
 
-    def _current_text(self) -> str:
-        return self.current_filter if isinstance(self.current_filter, str) else ""
-
-    def _selections(self):
-        selected = self.current_filter if isinstance(self.current_filter, list) else []
-        for opt in self.options:
-            yield Selection(option_text(opt.name, opt.color), opt.name, opt.name in selected)
-        yield Selection("(empty)", FILTER_EMPTY, FILTER_EMPTY in selected)
-        yield Selection("(not empty)", FILTER_NOT_EMPTY, FILTER_NOT_EMPTY in selected)
-
     def on_mount(self):
-        self.query_one("#filter-choices" if self.options else "#filter-input").focus()
-
-    def _value(self):
-        """The filter value for this column, in whichever shape it takes -
-        a list for an enum-like column, a str otherwise. See get_page's
-        `filters` contract in providers/base.py."""
-        if self.options:
-            return list(self.query_one(SelectionList).selected)
-        return self.query_one(Input).value
+        self.query_one(Input).focus()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "apply-filter":
-            self.dismiss(self._value())
+            self.dismiss(self.query_one(Input).value)
         elif event.button.id == "clear-filter":
             # Falsy-but-not-None: clear this column's filter. None is cancel.
-            self.dismiss([] if self.options else "")
+            self.dismiss("")
         else:
             self.dismiss(None)
 
@@ -413,160 +383,6 @@ class EditCellScreen(ModalScreen):
 
     def key_escape(self) -> None:
         self.dismiss(None)
-
-class ChoiceSelectScreen(ModalScreen):
-    """Pick one option for an enum-like column (Column.options) - a Notion
-    select or status property.
-
-    Replaces EditCellScreen's free-text Input for these columns, which is
-    the point: a typed value doesn't just risk a typo, it silently *creates*
-    a new option on the user's real Notion database (or, for a status
-    property, 400s, since Notion's API can't create status options at all).
-    Picking from the declared set can do neither.
-
-    Dismisses the chosen option name, "" to clear the property, or None to
-    cancel."""
-    CSS = """
-    ChoiceSelectScreen {
-        background: rgba(0, 0, 0, 0.5);
-        align: center middle;
-    }
-    #choice-dialog {
-        background: $panel;
-        border: thick $primary;
-        padding: 1 2;
-        width: 60;
-        height: auto;
-    }
-    Label {
-        margin-bottom: 1;
-        text-style: bold;
-    }
-    Select {
-        margin-bottom: 1;
-    }
-    #choice-buttons {
-        align: right middle;
-    }
-    Button {
-        margin-left: 1;
-    }
-    """
-
-    CLEAR = "\x00clear"
-
-    def __init__(self, column_name, options, current_value):
-        super().__init__()
-        self.column_name = column_name
-        self.options = tuple(options)
-        self.current_value = None if current_value is None else str(current_value)
-
-    def compose(self) -> ComposeResult:
-        choices = [(option_text(o.name, o.color), o.name) for o in self.options]
-        choices.append(("(none)", self.CLEAR))
-        # An option deleted in Notion since this page loaded would still be
-        # sitting in the cell; Textual's Select raises on a value that isn't
-        # among its options, so fall back to blank rather than crashing.
-        names = {o.name for o in self.options}
-        value = self.current_value if self.current_value in names else Select.BLANK
-        with Vertical(id="choice-dialog"):
-            yield Label(f"Set {self.column_name}")
-            yield Select(choices, value=value, id="choice-select")
-            with Horizontal(id="choice-buttons"):
-                yield Button("Cancel", id="cancel-choice")
-                yield Button("Save", variant="success", id="save-choice")
-
-    def on_mount(self):
-        self.query_one(Select).focus()
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id != "save-choice":
-            self.dismiss(None)
-            return
-        value = self.query_one(Select).value
-        if value is Select.BLANK:
-            self.dismiss(None)
-        else:
-            self.dismiss("" if value == self.CLEAR else value)
-
-    def key_escape(self) -> None:
-        self.dismiss(None)
-
-
-class MultiChoiceScreen(ModalScreen):
-    """Pick any number of options for a multi-valued enum column
-    (Column.multi_value) - a Notion multi_select property. Dismisses a list
-    of option names (possibly empty, which clears the property) or None to
-    cancel."""
-    CSS = """
-    MultiChoiceScreen {
-        background: rgba(0, 0, 0, 0.5);
-        align: center middle;
-    }
-    #multi-dialog {
-        background: $panel;
-        border: thick $primary;
-        padding: 1 2;
-        width: 60;
-        height: auto;
-    }
-    Label {
-        margin-bottom: 1;
-        text-style: bold;
-    }
-    SelectionList {
-        margin-bottom: 1;
-        height: auto;
-        max-height: 20;
-        border: tall $primary-darken-2;
-    }
-    #multi-buttons {
-        align: right middle;
-    }
-    Button {
-        margin-left: 1;
-    }
-    """
-
-    def __init__(self, column_name, options, current_value):
-        super().__init__()
-        self.column_name = column_name
-        self.options = tuple(options)
-        # The cell holds the ", "-joined display string built by the
-        # provider's read path; split it back into names to preselect.
-        if isinstance(current_value, (list, tuple)):
-            self.current = [str(v) for v in current_value]
-        elif current_value in (None, ""):
-            self.current = []
-        else:
-            self.current = [p.strip() for p in str(current_value).split(",") if p.strip()]
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="multi-dialog"):
-            yield Label(f"Set {self.column_name}")
-            yield SelectionList(
-                *[
-                    Selection(option_text(o.name, o.color), o.name, o.name in self.current)
-                    for o in self.options
-                ],
-                id="multi-choices",
-            )
-            with Horizontal(id="multi-buttons"):
-                yield Button("Cancel", id="cancel-multi")
-                yield Button("Save", variant="success", id="save-multi")
-
-    def on_mount(self):
-        self.query_one(SelectionList).focus()
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "save-multi":
-            self.dismiss(list(self.query_one(SelectionList).selected))
-        else:
-            self.dismiss(None)
-
-    def key_escape(self) -> None:
-        self.dismiss(None)
-
 
 class TruncateColumnScreen(ModalScreen):
     """A modal screen for truncating a column with live row count."""
@@ -2337,10 +2153,31 @@ class DbMan(App):
                     self.filters[column_name] = val
                 self.reset_paging()
                 self.load_item(self.current_item, self.current_type)
-        self.push_screen(
-            FilterColumnScreen(column_name, current_filter, self.columns_by_name.get(column_name)),
-            apply_filter,
-        )
+        column = self.columns_by_name.get(column_name)
+        options = tuple(getattr(column, "options", ()) or ())
+        if options:
+            # An enum-like column filters by picking from its declared
+            # options - the same table the cell editor uses, just multi-pick
+            # and with the two empty/not-empty conditions appended as
+            # pseudo-options (their sentinels can't collide with a real
+            # option name - see providers/base.py).
+            picker_options = list(options) + [
+                ColumnOption("(empty)", None), ColumnOption("(not empty)", None),
+            ]
+            label_to_value = {"(empty)": FILTER_EMPTY, "(not empty)": FILTER_NOT_EMPTY}
+            value_to_label = {v: k for k, v in label_to_value.items()}
+            current = [value_to_label.get(v, v) for v in (current_filter or [])] \
+                if isinstance(current_filter, list) else []
+            self.push_screen(
+                VirtualTableScreen(
+                    OptionPickerTable(f"Filter {column_name}", picker_options, current, multi=True)
+                ),
+                lambda picked: apply_filter(
+                    None if picked is None else [label_to_value.get(p, p) for p in picked]
+                ),
+            )
+            return
+        self.push_screen(FilterColumnScreen(column_name, current_filter), apply_filter)
 
     def action_sort_column(self):
         if self.mode != "view":
@@ -2606,8 +2443,19 @@ class DbMan(App):
                 except Exception as e:
                     self.notify(f"Update failed: {e}", severity="error")
 
-            screen_cls = MultiChoiceScreen if col.multi_value else ChoiceSelectScreen
-            self.push_screen(screen_cls(column_name, col.options, current_value), perform_choice_update)
+            if col.multi_value:
+                current = (
+                    list(current_value) if isinstance(current_value, (list, tuple))
+                    else [p.strip() for p in str(current_value or "").split(",") if p.strip()]
+                )
+            else:
+                current = [current_value] if current_value not in (None, "") else []
+            self.push_screen(
+                VirtualTableScreen(
+                    OptionPickerTable(f"Set {column_name}", col.options, current, multi=col.multi_value)
+                ),
+                perform_choice_update,
+            )
             return
 
         lookup_conf = self.lookup_plugin.get_lookup_config(self.current_item, column_name) if self.lookup_plugin else None
