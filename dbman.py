@@ -23,7 +23,7 @@ from rich.text import Text
 from plugins.lookup import LookupPlugin, LookupSelectScreen, LookupConfigScreen
 from providers import create_provider
 from view_settings import (
-    ViewSettingsStore, derive_db_name, apply_view_settings,
+    ViewSettings, ViewSettingsStore, derive_db_name, apply_view_settings,
     compute_column_widths, truncate_rows,
 )
 from cell_render import option_text, stylize_row
@@ -167,13 +167,14 @@ class ShortcutsScreen(ModalScreen):
                 "    also works on a TABLES/VIEWS sidebar header, even when empty)\n"
                 " d: Delete selected table/view\n"
                 " x: Export current Table/View to CSV\n"
-                " f: Filter selected column (press 's' first for column select mode)\n"
+                " f: Filter the column under the cursor (field or column select mode)\n"
                 "    Option columns open the same picker table (multi-pick, plus\n"
                 "    (empty)/(not empty)); text columns accept '*' wildcards\n"
-                " F: Clear all filters for current table (column select mode)\n"
+                " F: Clear all filters for current table\n"
                 " o: Sort by selected column, cycling asc -> desc -> none (column select mode)\n"
                 " t: Truncate/Shorten Column data (View mode only)\n"
-                " w: Set/clear column display width (column select mode)\n\n"
+
+
                 " [bold]Select Mode (View mode only)[/]\n"
                 " s: Rotate select mode: field -> row -> column -> field\n"
                 " e: In column mode, opens that column's settings (hidden, colored,\n"
@@ -457,73 +458,6 @@ class TruncateColumnScreen(ModalScreen):
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "apply-truncate":
-            self.dismiss(self.query_one(Input).value)
-        else:
-            self.dismiss(None)
-
-    def on_input_submitted(self, event: Input.Submitted) -> None:
-        self.dismiss(event.value)
-
-class ColumnWidthScreen(ModalScreen):
-    """A modal screen for pinning (or clearing) a column's display width."""
-    CSS = """
-    ColumnWidthScreen {
-        background: rgba(0, 0, 0, 0.5);
-        align: center middle;
-    }
-    #width-dialog {
-        background: $panel;
-        border: thick $primary;
-        padding: 1 2;
-        width: 50;
-        height: auto;
-    }
-    Label {
-        margin-bottom: 1;
-        text-style: bold;
-    }
-    Input {
-        margin-bottom: 1;
-    }
-    #width-hint {
-        color: $text-muted;
-        margin-bottom: 1;
-    }
-    #width-buttons {
-        align: right middle;
-    }
-    Button {
-        margin-left: 1;
-    }
-    """
-
-    def __init__(self, column: str, current_width, auto_width: int):
-        super().__init__()
-        self.column = column
-        self.current_width = current_width
-        self.auto_width = auto_width
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="width-dialog"):
-            yield Label(f"Width for '{self.column}'")
-            yield Input(
-                value=str(self.current_width) if self.current_width is not None else "",
-                placeholder=str(self.auto_width),
-                id="width-input",
-            )
-            yield Static(
-                f"Auto width would be {self.auto_width}. Clear the field to remove the override.",
-                id="width-hint",
-            )
-            with Horizontal(id="width-buttons"):
-                yield Button("Cancel", id="cancel-width")
-                yield Button("Apply", variant="success", id="apply-width")
-
-    def on_mount(self):
-        self.query_one(Input).focus()
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "apply-width":
             self.dismiss(self.query_one(Input).value)
         else:
             self.dismiss(None)
@@ -1142,14 +1076,11 @@ def _add_ctx(app):
 
 
 def _clear_filters_ctx(app):
-    """Paired with 'f' - see _filter_column_ctx for why this must stay
-    dispatchable outside column select mode too (action_clear_filters's own
-    "press 's' to rotate" notify would otherwise be dead code). Still greys
+    """Paired with 'f', and like it dispatchable in every select mode -
+    clearing all filters names no column, so it needs no rotation. Greys
     out (rather than hides) when there's genuinely nothing to clear."""
     if app.mode != "view" or not bool(app.current_item):
         return False
-    if app.select_mode != "column":
-        return True
     return True if app.filters else None
 
 
@@ -1260,7 +1191,6 @@ class DbMan(App):
         Binding("F", "clear_filters", "Clear Filters"),
         Binding("o", "sort_column", "Sort Column"),
         Binding("t", "truncate_column", "Shorten Column"),
-        Binding("w", "set_column_width", "Column Width"),
         Binding("s", "rotate_select_mode", "Select Mode"),
         Binding("z", "hide_column", "Hide Column"),
         Binding("Z", "unhide_column", "Unhide Column"),
@@ -1286,7 +1216,6 @@ class DbMan(App):
         "filter_column": _filter_column_ctx,
         "sort_column": _sort_column_ctx,
         "truncate_column": _truncate_column_ctx,
-        "set_column_width": _ctx(modes={"view"}, select_modes={"column"}),
         "rotate_select_mode": _ctx(modes={"view"}),
         "reorder_column": _ctx(modes={"view"}, select_modes={"column"}),
         "move_row": _ctx(modes={"view"}, select_modes={"row"}, capability="reorder_row"),
@@ -1480,6 +1409,7 @@ class DbMan(App):
         self.row_values = {}
         self.column_widths = {}
         self.columns_by_name = {}
+        self.auto_column_widths = {}
         self.row_order = []
         self.rendered_rows = {}
 
@@ -1709,6 +1639,7 @@ class DbMan(App):
                 self.raw_docs = {}
                 self.row_values = {}
                 self.columns_by_name = {}
+                self.auto_column_widths = {}
                 self.row_order = []
                 self.rendered_rows = {}
                 self.rows_editable = False
@@ -1761,6 +1692,14 @@ class DbMan(App):
                     display_columns, display_rows = apply_view_settings(page.columns, page.rows, view_settings)
                     column_widths = compute_column_widths(display_columns, display_rows, view_settings)
                     self.column_widths = column_widths
+                    # What each column *would* be without its override, so
+                    # ColumnMetadataTable can show "auto (25)". The old
+                    # ColumnWidthScreen read this off column_widths, which
+                    # already has the override folded in - so it reported
+                    # the override back as the auto width.
+                    self.auto_column_widths = compute_column_widths(
+                        display_columns, display_rows, ViewSettings()
+                    )
                     self.columns_by_name = {c.name: c for c in display_columns}
                     rendered_rows = truncate_rows(display_columns, display_rows, column_widths)
                     # Paint enum-valued cells in their option colors. Must
@@ -1801,6 +1740,7 @@ class DbMan(App):
                 self.raw_docs = {}
                 self.row_values = {}
                 self.columns_by_name = {}
+                self.auto_column_widths = {}
                 self.row_order = []
                 self.rendered_rows = {}
                 self.rows_editable = False
@@ -2099,6 +2039,7 @@ class DbMan(App):
         table = ColumnMetadataTable(
             column, self.current_item, self.view_settings,
             visible_column_count=len(self.focused.ordered_columns),
+            auto_width=self.auto_column_widths.get(column_name),
         )
 
         def done(changed):
@@ -2173,8 +2114,13 @@ class DbMan(App):
         if self.mode != "view":
             self.notify("Filtering only allowed in View mode", severity="error")
             return
-        if self.select_mode != "column":
-            self.notify("Filtering only allowed in column select mode (press 's' to rotate)", severity="error")
+        if self.select_mode == "row":
+            # The cursor keeps a live column coordinate in every select
+            # mode, but row mode is the one where nothing on screen says
+            # *which* column that is - filtering an invisible target is
+            # worse than asking for a rotation. Field and column mode both
+            # show the user exactly what they're about to filter.
+            self.notify("Filtering needs a visible column - press 's' for field or column mode", severity="error")
             return
         if not isinstance(self.focused, DataTable) or not self.current_item:
             return
@@ -2263,9 +2209,12 @@ class DbMan(App):
         if self.mode != "view":
             self.notify("Filtering only allowed in View mode", severity="error")
             return
-        if self.select_mode != "column":
-            self.notify("Filtering only allowed in column select mode (press 's' to rotate)", severity="error")
-            return
+        # No select-mode guard at all, unlike its 'f' counterpart: clearing
+        # every filter doesn't name a column, so there's nothing for a
+        # rotation to disambiguate. Nothing to clear is handled upstream by
+        # _clear_filters_ctx returning None, which greys the binding out
+        # *and* stops the keypress reaching here - so there's deliberately
+        # no "no filters" notify, matching Z/unhide's silent-when-inert.
         self.filters = {}
         self.reset_paging()
         if self.current_item:
@@ -2765,46 +2714,6 @@ class DbMan(App):
                             self.notify(f"Truncate failed: {e}", severity="error")
                 self.push_screen(ConfirmScreen(f"Truncate ALL values in '{column_name}' to {target_len}?", "Apply"), do_it)
         self.push_screen(TruncateColumnScreen(self.current_item, column_name, max_len, suggested, self.provider), perform_truncate)
-
-    def action_set_column_width(self):
-        """Pin (or clear) a display-only column width, persisted via
-        ViewSettingsStore. Distinct from action_truncate_column, which
-        mutates the underlying data rather than just how it's displayed."""
-        if self.mode != "view":
-            self.notify("Column width only allowed in View mode", severity="error")
-            return
-        if self.select_mode != "column":
-            self.notify("Column width only allowed in column select mode (press 's' to rotate)", severity="error")
-            return
-        if not isinstance(self.focused, DataTable) or not self.current_item:
-            return
-        coord = self.focused.cursor_coordinate
-        column_name = self.focused.ordered_columns[coord.column].key.value
-
-        settings = self.view_settings.get(self.current_item)
-        current_override = settings.widths.get(column_name)
-        auto_width = self.column_widths.get(column_name, current_override or 20)
-
-        def apply_width(value):
-            if value is None:
-                return
-            value = value.strip()
-            settings = self.view_settings.get(self.current_item)
-            if value == "":
-                settings.widths.pop(column_name, None)
-            else:
-                try:
-                    width = int(value)
-                    if width < 1:
-                        raise ValueError
-                except ValueError:
-                    self.notify("Width must be a positive integer", severity="error")
-                    return
-                settings.widths[column_name] = width
-            self.view_settings.save(self.current_item, settings)
-            self.load_item(self.current_item, self.current_type)
-
-        self.push_screen(ColumnWidthScreen(column_name, current_override, auto_width), apply_width)
 
 def _build_arg_parser():
     parser = argparse.ArgumentParser(

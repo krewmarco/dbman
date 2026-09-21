@@ -43,18 +43,30 @@ class ColumnMetadataTable(VirtualTable):
     # Shown because they're the context for the editable rows below (a
     # Colored row only makes sense once you can see the column has options)
     # and because a read-only column is worth knowing before you try to edit.
-    def __init__(self, column: Column, item_name: str, view_settings_store, visible_column_count: int):
+    def __init__(self, column: Column, item_name: str, view_settings_store,
+                 visible_column_count: int, auto_width=None):
         self.column = column
         self.item_name = item_name
         self.store = view_settings_store
         self.settings = view_settings_store.get(item_name)
         self.visible_column_count = visible_column_count
+        # What this column would be sized at with no override - shown next
+        # to "auto" so there's a number to start from, which is the one
+        # affordance the retired `w` dialog had that this didn't.
+        self.auto_width = auto_width
         self.title = f"Column: {column.name}"
         self.changed = False
         self.error = None
 
     def columns(self) -> list[Column]:
         return [Column("Property", "text"), Column("Value", "text")]
+
+    def _width_value(self, width):
+        if width is not None:
+            return Text(str(width))
+        if self.auto_width is None:
+            return AUTO
+        return Text.assemble(("auto", "italic grey62"), (f" ({self.auto_width})", "grey62"))
 
     def _sort_value(self):
         if self.settings.sort_column != self.column.name:
@@ -79,7 +91,7 @@ class ColumnMetadataTable(VirtualTable):
                 Text("Colored"), NO if col.name in self.settings.no_color else YES,
             ]))
         width = self.settings.widths.get(col.name)
-        rows.append(VirtualRow("width", [Text("Width"), AUTO if width is None else Text(str(width))]))
+        rows.append(VirtualRow("width", [Text("Width"), self._width_value(width)]))
         rows.append(VirtualRow("sort", [Text("Sort"), self._sort_value()]))
         if self.error:
             rows.append(VirtualRow(None, [Text("!", style="red"), Text(self.error, style="red")]))
@@ -105,8 +117,9 @@ class ColumnMetadataTable(VirtualTable):
             return True
         if key == "width":
             current = self.settings.widths.get(self.column.name)
+            auto = "" if self.auto_width is None else f", auto is {self.auto_width}"
             return Prompt(
-                f"Width for {self.column.name} (blank for auto)",
+                f"Width for {self.column.name} (blank for auto{auto})",
                 "" if current is None else str(current),
                 self._apply_width,
             )
