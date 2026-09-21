@@ -29,6 +29,7 @@ from view_settings import (
 from cell_render import option_text, stylize_row
 from providers.base import Column, ColumnOption, FILTER_EMPTY, FILTER_NOT_EMPTY
 from virtual_table import OptionPickerTable, VirtualTableScreen
+from column_meta import ColumnMetadataTable
 from workspace import WorkspaceStore, ConnectionSession
 
 __version__ = "0.1.0"
@@ -175,6 +176,8 @@ class ShortcutsScreen(ModalScreen):
                 " w: Set/clear column display width (column select mode)\n\n"
                 " [bold]Select Mode (View mode only)[/]\n"
                 " s: Rotate select mode: field -> row -> column -> field\n"
+                " e: In column mode, opens that column's settings (hidden, colored,\n"
+                "    width, sort) as a table - space edits the selected property\n"
                 " H / L: Move selected column left / right (column mode; option+left/right also works on some terminals)\n"
                 " J / K: Move selected row down / up, persisted (row mode; providers that support it)\n"
                 " z: Hide selected column (column mode)\n"
@@ -1028,8 +1031,9 @@ def _edit_cell_ctx(app):
     """'e' is polymorphic: SQL mode edits the View's SQL, the lookup plugin
     edits its own config, and in View mode what it edits depends on
     select_mode (field: the cell, row: the whole row/document, or a hand-off
-    to an external app/page for providers with open_in_browser; column: n/a).
-    Too many cross-cutting branches to express as a plain _ctx() AND."""
+    to an external app/page for providers with open_in_browser; column: that
+    column's own display settings). Too many cross-cutting branches to
+    express as a plain _ctx() AND."""
     if app.mode == "sql":
         return app.current_type == "view" and app.provider.capabilities.create_definition
     if app.current_type == "plugin":
@@ -1039,7 +1043,10 @@ def _edit_cell_ctx(app):
     if app.select_mode == "row":
         return app.provider.capabilities.whole_row_edit or app.provider.capabilities.open_in_browser
     if app.select_mode == "column":
-        return False
+        # Unlike the branches above this doesn't need a writable row - it
+        # edits dbman's own per-column display settings, which a read-only
+        # view has just as much as a table does.
+        return app.current_type in ("table", "view")
     return app.current_type == "table" and app.rows_editable
 
 
@@ -1758,8 +1765,9 @@ class DbMan(App):
                     rendered_rows = truncate_rows(display_columns, display_rows, column_widths)
                     # Paint enum-valued cells in their option colors. Must
                     # follow truncation - see cell_render.stylize_row.
+                    no_color = set(view_settings.no_color)
                     rendered_rows = [
-                        stylize_row(display_columns, rendered, source)
+                        stylize_row(display_columns, rendered, source, skip=no_color)
                         for rendered, source in zip(rendered_rows, display_rows)
                     ]
 
@@ -2074,6 +2082,40 @@ class DbMan(App):
                     self.load_item(name, item_type)
             self.call_from_thread(finish)
         self.run_worker(worker, thread=True)
+
+    def action_edit_column(self):
+        """'e' in column select mode: open the selected column's own
+        settings as a virtual table. The column-mode half of `e`'s
+        "edit the selected thing" promise - see ColumnMetadataTable."""
+        if not isinstance(self.focused, DataTable) or not self.current_item:
+            return
+        coord = self.focused.cursor_coordinate
+        column_name = self.focused.ordered_columns[coord.column].key.value
+        column = self.columns_by_name.get(column_name)
+        if column is None:
+            self.notify(f"No metadata for column '{column_name}'", severity="error")
+            return
+
+        table = ColumnMetadataTable(
+            column, self.current_item, self.view_settings,
+            visible_column_count=len(self.focused.ordered_columns),
+        )
+
+        def done(changed):
+            if not changed:
+                return
+            # Sort lives on the table, not the column, and self.sort is
+            # authoritative for the session - so re-seed it from what the
+            # metadata table just wrote rather than letting the two drift.
+            settings = self.view_settings.get(self.current_item)
+            self.sort = (
+                [(settings.sort_column, settings.sort_direction or "asc")]
+                if settings.sort_column else []
+            )
+            self.reset_paging()
+            self.load_item(self.current_item, self.current_type)
+
+        self.push_screen(VirtualTableScreen(table), done)
 
     def action_hide_column(self):
         """'z' in column select mode: hide the column-mode-selected column
@@ -2393,7 +2435,7 @@ class DbMan(App):
                 self.notify("Row edit not supported for this provider — switch to field mode", severity="error")
             return
         if self.select_mode == "column":
-            self.notify("No edit action in column mode (use 't' to shorten, option+left/right to reorder)", severity="error")
+            self.action_edit_column()
             return
 
         if self.current_type == "view":

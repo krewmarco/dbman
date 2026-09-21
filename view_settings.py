@@ -23,6 +23,11 @@ class ViewSettings:
     hidden: list[str] = field(default_factory=list)
     widths: dict[str, int] = field(default_factory=dict)
     order: list[str] = field(default_factory=list)
+    # Columns whose enum values should render *without* their option colors.
+    # Per-column rather than a global switch because the answer differs by
+    # column: a Status worth spotting at a glance vs. a Section whose every
+    # row is colored, where the color is repetition rather than signal.
+    no_color: list[str] = field(default_factory=list)
     sort_column: Optional[str] = None
     sort_direction: Optional[str] = None  # "asc" | "desc", meaningless if sort_column is None
 
@@ -46,6 +51,7 @@ class ViewSettingsStore:
             hidden=list(raw.get("hidden", [])),
             widths=dict(raw.get("widths", {})),
             order=list(raw.get("order", [])),
+            no_color=list(raw.get("no_color", [])),
             sort_column=raw.get("sort_column"),
             sort_direction=raw.get("sort_direction"),
         )
@@ -55,6 +61,7 @@ class ViewSettingsStore:
             "hidden": settings.hidden,
             "widths": settings.widths,
             "order": settings.order,
+            "no_color": settings.no_color,
             "sort_column": settings.sort_column,
             "sort_direction": settings.sort_direction,
         }

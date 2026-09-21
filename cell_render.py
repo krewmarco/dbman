@@ -39,7 +39,7 @@ def option_text(name: str, color) -> Text:
     return Text(str(name), style=option_style(color))
 
 
-def stylize_row(display_columns: list, rendered_row: list, source_row: list) -> list:
+def stylize_row(display_columns: list, rendered_row: list, source_row: list, skip=()) -> list:
     """Paint a rendered row's enum-valued cells in their option colors,
     leaving every other cell exactly as it was.
 
@@ -53,6 +53,9 @@ def stylize_row(display_columns: list, rendered_row: list, source_row: list) -> 
     Notion's "P2 - Friction / should fix before launch") still gets its
     color, with the shortened string carrying it.
 
+    `skip` names columns to leave unstyled regardless (ViewSettings.no_color
+    - see ColumnMetadataTable's "Colored" row).
+
     A cell is styled only when its untruncated value equals exactly one of
     the column's option names. That's also what makes multi-value columns
     behave sanely: a Notion multi_select holding one option gets that
@@ -61,7 +64,7 @@ def stylize_row(display_columns: list, rendered_row: list, source_row: list) -> 
     out = list(rendered_row)
     for i, col in enumerate(display_columns):
         options = getattr(col, "options", ())
-        if not options or i >= len(out) or i >= len(source_row):
+        if not options or col.name in skip or i >= len(out) or i >= len(source_row):
             continue
         value = source_row[i]
         if not isinstance(value, str):

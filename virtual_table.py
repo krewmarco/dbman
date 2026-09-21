@@ -34,6 +34,17 @@ from providers.base import Column
 
 
 @dataclass
+class Prompt:
+    """Returned by open_row when opening a row means asking for a value
+    rather than flipping one - a column's width, say, next to rows that
+    just toggle. The screen collects the text and hands it to `apply`;
+    a cancelled prompt never calls it."""
+    title: str
+    value: str
+    apply: Any  # Callable[[str], None]
+
+
+@dataclass
 class VirtualRow:
     """`key` is the row's stable identity - it survives filtering and
     re-rendering, and is what open_row is handed. `cells` are positionally
@@ -74,6 +85,12 @@ class VirtualTable(ABC):
     title = "Table"
     # Shown under the title; a one-liner telling the user what space does here.
     hint = "space toggles · enter saves"
+    # True when the opener writes through immediately rather than the screen
+    # collecting a value to hand back on save. Such a table has nothing to
+    # cancel - closing it can only report what already happened - so the
+    # screen drops the Save/Clear buttons and dismisses result() however it
+    # is closed, escape included.
+    commits_immediately = False
 
     @abstractmethod
     def columns(self) -> list[Column]:
@@ -83,9 +100,10 @@ class VirtualTable(ABC):
     def rows(self) -> list[VirtualRow]:
         ...
 
-    def open_row(self, key) -> bool:
+    def open_row(self, key):
         """The opener - what `space` does to the selected row. Return True
-        if the table's contents changed and it should be re-rendered."""
+        if the table's contents changed and it should be re-rendered, or a
+        Prompt to ask the user for a value first."""
         return False
 
     def clear(self) -> None:
@@ -221,12 +239,20 @@ class VirtualTableScreen(ModalScreen):
         with Vertical(id="vt-dialog"):
             yield Label(self.table.title, id="vt-title")
             yield Label(self.table.hint, id="vt-hint")
-            yield Input(placeholder="Filter (try 'auth*' or '13')", id="vt-filter")
+            # Hidden until `f`, like the main table's filter: an always-on
+            # box is a permanent row of chrome for something most visits to
+            # this screen never use, and it makes the list start lower.
+            filter_box = Input(placeholder="Filter (try 'auth*' or '13')", id="vt-filter")
+            filter_box.display = False
+            yield filter_box
             yield DataTable(id="vt-table", cursor_type="row")
             with Horizontal(id="vt-buttons"):
-                yield Button("Cancel", id="vt-cancel")
-                yield Button("Clear", variant="warning", id="vt-clear")
-                yield Button("Save", variant="success", id="vt-save")
+                if self.table.commits_immediately:
+                    yield Button("Close", variant="primary", id="vt-cancel")
+                else:
+                    yield Button("Cancel", id="vt-cancel")
+                    yield Button("Clear", variant="warning", id="vt-clear")
+                    yield Button("Save", variant="success", id="vt-save")
 
     def on_mount(self):
         self._populate()
@@ -268,22 +294,56 @@ class VirtualTableScreen(ModalScreen):
 
     def action_open_row(self):
         key = self._selected_key()
-        if key is not None and self.table.open_row(key):
+        if key is None:
+            return
+        outcome = self.table.open_row(key)
+        if isinstance(outcome, Prompt):
+            def done(value):
+                if value is not None:
+                    outcome.apply(value)
+                    self._populate(keep_key=key)
+            self.app.push_screen(PromptScreen(outcome), done)
+        elif outcome:
             self._populate(keep_key=key)
 
     def action_focus_filter(self):
-        self.query_one("#vt-filter", Input).focus()
+        box = self.query_one("#vt-filter", Input)
+        box.display = True
+        box.focus()
+
+    def _hide_filter_if_empty(self):
+        """Leaving an empty box puts the chrome away again; a box with a
+        term in it stays visible, since it's explaining the shortened list."""
+        box = self.query_one("#vt-filter", Input)
+        if not box.value.strip():
+            box.display = False
 
     def action_cancel(self):
-        self.dismiss(None)
+        box = self.query_one("#vt-filter", Input)
+        if box.has_focus:
+            # Escape in the filter box backs out of filtering, not out of
+            # the whole screen - losing a half-made selection to a stray
+            # escape would be a nasty way to learn the difference.
+            box.value = ""
+            box.display = False
+            self.query_one("#vt-table", DataTable).focus()
+            return
+        self.dismiss(self.table.result() if self.table.commits_immediately else None)
 
     def on_input_changed(self, event: Input.Changed) -> None:
         self._populate(keep_key=self._selected_key())
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
+        self._hide_filter_if_empty()
         self.query_one("#vt-table", DataTable).focus()
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        if self.table.commits_immediately:
+            # Enter is the opener's twin here, not a commit - there's
+            # nothing left to commit, and closing on it would make the row
+            # cursor feel like a trapdoor.
+            self.action_open_row()
+            return
         # Enter on a row saves, matching the main app's "enter commits" feel.
         self.dismiss(self.table.result())
 
@@ -295,6 +355,39 @@ class VirtualTableScreen(ModalScreen):
             self.dismiss(self.table.result())
         else:
             self.dismiss(None)
+
+    def key_escape(self) -> None:
+        self.action_cancel()
+
+
+class PromptScreen(ModalScreen):
+    """One-line input for a Prompt returned by an opener. Local to this
+    module rather than reusing dbman's EditCellScreen, which would make
+    virtual_table import dbman and close an import cycle."""
+
+    CSS = """
+    PromptScreen { background: rgba(0, 0, 0, 0.3); align: center middle; }
+    #prompt-dialog {
+        background: $panel; border: thick $primary;
+        padding: 1 2; width: 50; height: auto;
+    }
+    #prompt-title { text-style: bold; margin-bottom: 1; }
+    """
+
+    def __init__(self, prompt: Prompt):
+        super().__init__()
+        self.prompt = prompt
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="prompt-dialog"):
+            yield Label(self.prompt.title, id="prompt-title")
+            yield Input(value=self.prompt.value, id="prompt-input")
+
+    def on_mount(self):
+        self.query_one(Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value)
 
     def key_escape(self) -> None:
         self.dismiss(None)
