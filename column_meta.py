@@ -9,7 +9,7 @@ up; here, adding a property is adding a row.
 
 Distinct from editing the *table's* schema, which is what Schema mode (`m`)
 shows - these are dbman's own display settings for one column, persisted to
-.dbman/<db>.json via ViewSettingsStore, plus the provider facts that explain
+dbman.sqlite via ViewSettingsStore, plus the provider facts that explain
 why some of them are there at all.
 
 See PLANNING_space-vs-edit-keybinding.md, whose follow-on section proposed

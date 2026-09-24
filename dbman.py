@@ -149,7 +149,7 @@ class ShortcutsScreen(ModalScreen):
                 " shift+tab: Jump to next sidebar section\n"
                 " m: Toggle View/Schema/SQL/Diag mode\n"
                 " r: Reload current table/view from the database\n"
-                " c: Switch connection (pick from dbman.json, j/k + enter)\n"
+                " c: Switch connection (pick from dbman.sqlite, j/k + enter)\n"
                 " ?: Toggle this Shortcuts panel\n"
                 " ctrl+p: Open Textual's command palette\n"
                 " V: Show version/about screen\n\n"
@@ -567,7 +567,7 @@ class ConnectionListItem(ListItem):
         self.connection_name = name
 
 class ConnectionSwitcherScreen(ModalScreen):
-    """A modal listing every connection saved in dbman.json (workspace.py),
+    """A modal listing every connection saved in dbman.sqlite (workspace.py),
     for fast switching without restarting the app - see 'c'/action_switch_
     connection. Enter (ListView's native binding) dismisses with the chosen
     connection name; Escape cancels with None.
@@ -3063,7 +3063,7 @@ if __name__ == "__main__":
     resolved = workspace.resolve(args.connection, name_override=args.name)
     if resolved is None:
         parser.print_usage()
-        print("(bare 'dbman' works once a connection has been saved to ./dbman.json)")
+        print("(bare 'dbman' works once a connection has been saved to ./dbman.sqlite)")
         sys.exit(1)
     url, name = resolved
     app = DbMan(url, workspace=workspace, workspace_name=name)
