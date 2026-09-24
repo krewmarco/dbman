@@ -20,6 +20,10 @@ def create_provider(db_url: str) -> Provider:
         from .notion_provider import NotionProvider
         return NotionProvider(db_url)
 
+    if db_url.startswith("github://"):
+        from .github_provider import GitHubProvider
+        return GitHubProvider(db_url)
+
     if not db_url.startswith(("sqlite://", "postgresql://", "mysql://")):
         db_url = f"sqlite:///{os.path.abspath(db_url)}"
     from .sqlalchemy_provider import SqlAlchemyProvider
