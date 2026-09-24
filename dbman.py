@@ -168,7 +168,8 @@ class ShortcutsScreen(ModalScreen):
                 "    also works on a TABLES/VIEWS sidebar header, even when empty)\n"
                 " d: Delete selected table/view\n"
                 " x: Export current Table/View to CSV\n"
-                " /: Search the loaded page - cell values, or column names in column mode\n"
+                " /: Search the loaded page - cell values, or column names in column mode;\n"
+                "    with the sidebar focused, search table/view/plugin names instead\n"
                 " n / N: Step to the next / previous match\n"
                 " f: Filter the column under the cursor (field or column select mode)\n"
                 "    Option columns open the same picker table (multi-pick, plus\n"
@@ -1040,10 +1041,27 @@ def _filter_column_ctx(app):
     return app.mode == "view" and bool(app.current_item)
 
 
+def _sidebar_has_focus(app):
+    return app.focused is not None and app.focused.id == "sidebar-list"
+
+
+def _search_ctx(app):
+    """'/' is polymorphic on focus: with the sidebar focused it searches
+    object names (any mode - the sidebar is on screen in all but Diagram,
+    which hides it), otherwise it searches the loaded page, View mode only."""
+    if _sidebar_has_focus(app):
+        return True
+    return app.mode == "view"
+
+
 def _search_step_ctx(app):
     """n/N are only meaningful with a search running. Greyed (None) rather
     than hidden so the keys stay discoverable once '/' has been used, and
-    inert - check_action returning None also stops the keypress."""
+    inert - check_action returning None also stops the keypress. Follows
+    whichever search '/' would start: object names if the sidebar has focus,
+    else the loaded page."""
+    if _sidebar_has_focus(app):
+        return True if app.sidebar_search_term else None
     if app.mode != "view" or not app.current_item:
         return False
     return True if app.search_matches else None
@@ -1269,7 +1287,7 @@ class DbMan(App):
         "edit_document": _ctx(modes={"view"}, capability="whole_row_edit"),
         "filter_column": _filter_column_ctx,
         "sort_column": _sort_column_ctx,
-        "search": _ctx(modes={"view"}),
+        "search": _search_ctx,
         "search_next": _search_step_ctx,
         "search_prev": _search_step_ctx,
         "truncate_column": _truncate_column_ctx,
@@ -1323,6 +1341,10 @@ class DbMan(App):
         self.search_cells = []
         self.search_matches = []
         self.search_index = 0
+        # '/' with the sidebar focused: a name search over its objects. Only
+        # the term is kept - matches are recomputed against _sidebar_rows on
+        # each step, so a sidebar rebuild can't leave stale row indices.
+        self.sidebar_search_term = None
         self.page_size = 500
         self.page_cursor = None
         self.page_history = []
@@ -1386,6 +1408,11 @@ class DbMan(App):
     def on_mount(self):
         self.refresh_sidebar()
         self.query_one("#sidebar-list").focus()
+
+    def on_descendant_focus(self, event) -> None:
+        # '/' and n/N change meaning with focus (sidebar vs table), so the
+        # footer has to follow focus moves, not just mode/item changes.
+        self.refresh_bindings()
 
     def on_app_focus(self):
         """Fires when the terminal window regains OS focus (Textual enables
@@ -2290,7 +2317,67 @@ class DbMan(App):
         table.cursor_coordinate = Coordinate(row, coord.column)
         self.search_index = index
 
+    def _sidebar_match_rows(self):
+        """Indices into the sidebar's rows whose object name matches the
+        current sidebar search. Headers are never matched."""
+        term = self.sidebar_search_term
+        if not term:
+            return []
+        return [
+            i for i, row in enumerate(self._sidebar_rows)
+            if row is not None and cell_matches(row[0], term)
+        ]
+
+    def _goto_sidebar_row(self, index):
+        # Setting .index emits Highlighted, which loads the item - the same
+        # thing j/k does, so a search hit opens the object like navigating to it.
+        self.query_one("#sidebar-list", ListView).index = index
+
+    def _search_sidebar(self):
+        def run(term):
+            if term is None:
+                return
+            self.sidebar_search_term = term.strip() or None
+            if self.sidebar_search_term is None:
+                self.refresh_bindings()
+                return
+            matches = self._sidebar_match_rows()
+            if not matches:
+                self.notify(f"No table/view/plugin matches '{term}'", severity="warning")
+                self.refresh_bindings()
+                return
+            # Start from the highlighted row rather than the top, so the
+            # first hit is the nearest one below the cursor (wrapping).
+            current = self.query_one("#sidebar-list", ListView).index
+            current = -1 if current is None else current
+            target = next((i for i in matches if i >= current), matches[0])
+            self._goto_sidebar_row(target)
+            self.notify(f"{len(matches)} match(es) - n / N to step")
+            self.refresh_bindings()
+
+        self.push_screen(SearchScreen("objects by name", self.sidebar_search_term or ""), run)
+
+    def _step_sidebar_search(self, delta):
+        matches = self._sidebar_match_rows()
+        if not matches:
+            self.notify(f"No table/view/plugin matches '{self.sidebar_search_term}'", severity="warning")
+            return
+        current = self.query_one("#sidebar-list", ListView).index
+        current = -1 if current is None else current
+        if delta > 0:
+            later = [i for i in matches if i > current]
+            target, wrapped = (later[0], False) if later else (matches[0], True)
+        else:
+            earlier = [i for i in matches if i < current]
+            target, wrapped = (earlier[-1], False) if earlier else (matches[-1], True)
+        self._goto_sidebar_row(target)
+        if wrapped:
+            self.notify("Wrapped" + (" to top" if delta > 0 else " to bottom"))
+
     def action_search(self):
+        if _sidebar_has_focus(self):
+            self._search_sidebar()
+            return
         if self.mode != "view":
             self.notify("Search only allowed in View mode", severity="error")
             return
@@ -2327,10 +2414,16 @@ class DbMan(App):
             self.notify("Wrapped" + (" to top" if delta > 0 else " to bottom"))
 
     def action_search_next(self):
-        self._step_search(1)
+        if _sidebar_has_focus(self):
+            self._step_sidebar_search(1)
+        else:
+            self._step_search(1)
 
     def action_search_prev(self):
-        self._step_search(-1)
+        if _sidebar_has_focus(self):
+            self._step_sidebar_search(-1)
+        else:
+            self._step_search(-1)
 
     def action_filter_column(self):
         if self.mode != "view":
