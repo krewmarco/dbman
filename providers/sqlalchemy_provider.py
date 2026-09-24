@@ -1,7 +1,7 @@
 from sqlalchemy import (
-    create_engine, event, inspect, text, MetaData, Table, select, update, func, or_,
+    create_engine, event, inspect, text, MetaData, Table, select, update, insert, delete, func, or_,
 )
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from .base import (
     Provider, Column, RowKey, RowPage, Capabilities,
@@ -31,6 +31,10 @@ class SqlAlchemyProvider(Provider):
         self.engine = create_engine(db_url)
         if self.engine.dialect.name == "sqlite":
             event.listen(self.engine, "connect", _enable_sqlite_foreign_keys)
+        # Row add/delete target a row by SQLite's rowid, the same identity
+        # update_cell uses; other dialects have no PK-based path yet (see
+        # update_cell), so they stay off there rather than half-working.
+        rowid_dialect = self.engine.dialect.name == "sqlite"
         self.capabilities = Capabilities(
             definition_pane=True,
             create_definition=True,
@@ -40,6 +44,8 @@ class SqlAlchemyProvider(Provider):
             truncate_column=True,
             whole_row_edit=False,
             delete_item=True,
+            add_row=rowid_dialect,
+            delete_row=rowid_dialect,
             sort_column=True,
         )
 
@@ -218,6 +224,46 @@ class SqlAlchemyProvider(Provider):
         else:
             pass  # PK logic needed for non-sqlite
         return row_key
+
+    def _blocking_required_columns(self, table) -> list[str]:
+        """Columns an all-defaults INSERT can't satisfy: NOT NULL, no server
+        default, and not SQLite's rowid alias (a lone INTEGER PRIMARY KEY is
+        auto-assigned even when it's declared NOT NULL)."""
+        pk = list(table.primary_key.columns)
+        rowid_alias = pk[0].name if len(pk) == 1 and str(pk[0].type).upper() == "INTEGER" else None
+        return [
+            c.name for c in table.columns
+            if not c.nullable and c.server_default is None and c.name != rowid_alias
+        ]
+
+    def add_row(self, name, item_type) -> RowKey:
+        """Insert an all-defaults row for the user to fill in by editing
+        cells - the same "create minimal, then edit" posture as CouchDB and
+        Notion. A table with a NOT NULL column that has no default can't
+        take a blank row; that needs a schema-aware form, so it's refused
+        with the offending columns named rather than guessed at."""
+        t = Table(name, MetaData(), autoload_with=self.engine)
+        blocking = self._blocking_required_columns(t)
+        if blocking:
+            raise ValueError(f"required columns have no default: {', '.join(blocking)}")
+        with self.engine.connect() as conn:
+            try:
+                result = conn.execute(insert(t).values({}))
+            except IntegrityError as e:
+                # A CHECK or trigger the column scan can't see. The driver's
+                # own message is the readable part; SQLAlchemy's wrapper adds
+                # the SQL text and a docs link, too long for a notification.
+                raise ValueError(str(e.orig)) from e
+            conn.commit()
+            return RowKey(result.lastrowid)
+
+    def delete_row(self, name, item_type, row_key: RowKey) -> None:
+        t = Table(name, MetaData(), autoload_with=self.engine)
+        with self.engine.connect() as conn:
+            result = conn.execute(delete(t).where(text("rowid = :rid")), {"rid": row_key.value})
+            conn.commit()
+        if result.rowcount != 1:
+            raise ValueError(f"expected to delete 1 row, deleted {result.rowcount}")
 
     def delete_item(self, name, item_type) -> None:
         metadata = MetaData()

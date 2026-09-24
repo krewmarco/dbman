@@ -205,10 +205,10 @@ class Provider(ABC):
 
     def add_row(self, name: str, item_type: str) -> RowKey:
         """Create a new, minimal row/document. Only relevant/implemented for
-        providers with capabilities.add_row = True — currently CouchDB's
-        freeform documents. SQL tables need a schema-aware form (typed
-        defaults for NOT NULL columns), deferred to a future dynamic-forms
-        layer rather than implemented here."""
+        providers with capabilities.add_row = True. A provider that can't
+        create a blank row for a particular table (SQLite: a NOT NULL column
+        with no default, which needs a schema-aware form) raises with a
+        readable reason rather than guessing values."""
         raise NotImplementedError
 
     @abstractmethod

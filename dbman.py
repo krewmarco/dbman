@@ -2855,12 +2855,11 @@ class DbMan(App):
 
     def action_add(self):
         """'a': context-sensitive "create new thing". On a Table, add a new
-        row/document and immediately open it for editing — only implemented
-        where a provider can create a sensible blank row without a
-        schema-aware form (currently CouchDB's freeform documents,
-        capabilities.add_row; SqlAlchemyProvider tables need typed defaults
-        for NOT NULL columns, deferred to a future dynamic-forms/
-        business-logic layer). On a View, create a new view (formerly the
+        row/document and put the cursor on it (CouchDB also opens the
+        whole-document editor) — only where a provider can create a blank
+        row without a schema-aware form (capabilities.add_row; a SQLite
+        table with a NOT NULL column lacking a default refuses, deferred to
+        a future dynamic-forms layer). On a View, create a new view (formerly the
         standalone 'v' key — folded in here since it's the same "add a new
         thing" gesture, just for a different item type). See issue #10.
 
@@ -2919,6 +2918,12 @@ class DbMan(App):
             key_str = json.dumps(row_key.value, sort_keys=True)
         else:
             key_str = str(row_key.value)
+        # A blank row is only useful once filled in, so land on it - it may
+        # sort anywhere, or not be on this page at all, in which case the
+        # cursor stays put.
+        if key_str in self.row_order:
+            table_widget = self.query_one("#data-table", DataTable)
+            table_widget.move_cursor(row=self.row_order.index(key_str))
         raw_doc = self.raw_docs.get(key_str)
         if raw_doc is not None:
             self._open_document_editor(row_key, raw_doc)
