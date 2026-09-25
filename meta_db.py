@@ -27,6 +27,7 @@ LEGACY_WORKSPACE = "dbman.json"
 LEGACY_SETTINGS_DIR = ".dbman"
 
 SCHEMA_VERSION = 2
+CONFIG_TABLES = ("connections", "sessions", "item_settings", "column_settings", "workspace")
 
 # The whole schema, and the one place it lives. Browsing dbman.sqlite shows
 # the same DDL in SQL mode ('m'), and these foreign keys are what the
@@ -42,7 +43,7 @@ SCHEMA_VERSION = 2
 # rename cascade (ON UPDATE CASCADE) rather than needing to be propagated
 # by hand.
 CONNECTIONS_DDL = """
-CREATE TABLE connections (
+CREATE TABLE IF NOT EXISTS connections (
     id INTEGER PRIMARY KEY,
     name TEXT UNIQUE,
     url TEXT,
@@ -54,7 +55,7 @@ CREATE TABLE connections (
 CHILD_DDL = """
 -- Separate from `connections` so the on-quit session save never rewrites
 -- the row a user edits by hand.
-CREATE TABLE sessions (
+CREATE TABLE IF NOT EXISTS sessions (
     connection TEXT PRIMARY KEY
         REFERENCES connections (name) ON DELETE CASCADE ON UPDATE CASCADE,
     item_name TEXT,
@@ -66,7 +67,7 @@ CREATE TABLE sessions (
 );
 -- One row per table/view that has any saved settings: the parent of its
 -- column_settings, so deleting it (or its connection) takes those along.
-CREATE TABLE item_settings (
+CREATE TABLE IF NOT EXISTS item_settings (
     connection TEXT NOT NULL
         REFERENCES connections (name) ON DELETE CASCADE ON UPDATE CASCADE,
     item TEXT NOT NULL,
@@ -77,7 +78,7 @@ CREATE TABLE item_settings (
 -- One row per column: the relational form of ViewSettings' parallel
 -- hidden/widths/order/no_color collections. `position` is the column's
 -- index in the saved order, NULL when it has no explicit place.
-CREATE TABLE column_settings (
+CREATE TABLE IF NOT EXISTS column_settings (
     connection TEXT NOT NULL,
     item TEXT NOT NULL,
     column_name TEXT NOT NULL,
@@ -92,7 +93,7 @@ CREATE TABLE column_settings (
 -- Exactly one row. A typed column rather than a key/value table so the
 -- last-used connection is a real relation: a rename follows it, and
 -- deleting that connection clears it instead of leaving a dangling name.
-CREATE TABLE workspace (
+CREATE TABLE IF NOT EXISTS workspace (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     last_connection TEXT
         REFERENCES connections (name) ON DELETE SET NULL ON UPDATE CASCADE
@@ -182,8 +183,70 @@ def _open_initialized(path: Path) -> sqlite3.Connection:
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     elif version == 1:
         _upgrade_v1(conn)
+    elif _missing_tables(conn):
+        _restore_tables(conn)
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
+
+
+def _missing_tables(conn: sqlite3.Connection) -> set[str]:
+    present = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    return set(CONFIG_TABLES) - present
+
+
+def _restore_tables(conn: sqlite3.Connection) -> None:
+    """Recreate any config table that's gone missing - dropped by hand in
+    another tool, since DbmanMetaProvider refuses it in dbman - rather than
+    let every store call fail with "no such table" while user_version still
+    says the schema is current. Surviving child rows whose connection went
+    with a dropped `connections` table get a url-less parent, the same
+    orphan policy as the legacy import."""
+    with _transaction(conn):
+        _execute_ddl(conn, CONNECTIONS_DDL + CHILD_DDL)
+        conn.execute(
+            "INSERT OR IGNORE INTO connections (name)"
+            " SELECT connection FROM sessions UNION SELECT connection FROM item_settings"
+            " UNION SELECT last_connection FROM workspace WHERE last_connection IS NOT NULL"
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO item_settings (connection, item)"
+            " SELECT DISTINCT connection, item FROM column_settings"
+        )
+
+
+def is_config_db(path: Path) -> bool:
+    """Whether `path` is a dbman config database - by name *and* contents,
+    so an unrelated file that happens to be called dbman.sqlite is browsed
+    as the ordinary database it is. Read-only probe: never creates or
+    upgrades anything."""
+    if path.name != DB_FILENAME or not path.is_file():
+        return False
+    try:
+        conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            present = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return False
+    # Any one config table is enough, not all five: a config db missing a
+    # dropped table is exactly what DbmanMetaProvider exists to recover.
+    return version >= 1 and bool(present & set(CONFIG_TABLES))
+
+
+def sqlite_url_path(db_url: str) -> Path:
+    """The file a `sqlite:///...` URL names, the way SQLAlchemy reads it:
+    everything after the third slash, so `sqlite:////abs/x.db` is
+    `/abs/x.db`. Not `urlsplit(...).path`, which keeps a doubled leading
+    slash (`//abs/x.db`) that breaks a SQLite `file:` URI built from it."""
+    return Path(db_url[len("sqlite:///"):].split("?", 1)[0])
+
+
+def ensure_schema(path: Path) -> None:
+    """Bring an existing config database up to the current schema: upgrade
+    an older version, or recreate missing tables."""
+    _open_initialized(path).close()
 
 
 def _upgrade_v1(conn: sqlite3.Connection) -> None:

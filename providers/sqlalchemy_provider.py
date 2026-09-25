@@ -266,6 +266,15 @@ class SqlAlchemyProvider(Provider):
             raise ValueError(f"expected to delete 1 row, deleted {result.rowcount}")
 
     def delete_item(self, name, item_type) -> None:
+        if item_type == "view":
+            # Table.drop always emits DROP TABLE, which SQLite refuses for a
+            # view ("use DROP VIEW to delete view ..."). The name is quoted
+            # by the dialect's own preparer, not interpolated raw.
+            quoted = self.engine.dialect.identifier_preparer.quote(name)
+            with self.engine.connect() as conn:
+                conn.execute(text(f"DROP VIEW {quoted}"))
+                conn.commit()
+            return
         metadata = MetaData()
         table = Table(name, metadata, autoload_with=self.engine)
         table.drop(self.engine)
