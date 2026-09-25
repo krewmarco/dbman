@@ -1,7 +1,7 @@
 import os
 
 from .base import (
-    Provider, Column, RowKey, RowPage, Capabilities,
+    Provider, Column, RowKey, RowPage, RowTarget, Capabilities,
     DiagramModel, DiagramNode, DiagramEdge,
 )
 

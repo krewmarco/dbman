@@ -164,6 +164,8 @@ class ShortcutsScreen(ModalScreen):
                 "    Columns with a fixed option set open a picker table (space toggles,\n"
                 "    f filters the options, enter saves)\n"
                 " E: Edit whole document as JSON (document DB providers)\n"
+                " space: Open the selected row (row select mode): a Notion row in the\n"
+                "    browser, a dbman.sqlite connections row connects to it\n"
                 " a: Add a new row (table) or create a new Table/View (where supported;\n"
                 "    also works on a TABLES/VIEWS sidebar header, even when empty)\n"
                 " d: Delete selected table/view\n"
@@ -1027,6 +1029,18 @@ def _edit_cell_ctx(app):
     return app.current_type == "table" and app.rows_editable
 
 
+def _open_row_ctx(app):
+    """space = "see it more truly" (PLANNING_space-vs-edit-keybinding.md),
+    for now only its row-mode half: open the selected row wherever its
+    provider says it leads. Per item via can_open_row, not a Capabilities
+    flag, since in dbman.sqlite only `connections` rows open anywhere."""
+    if app.mode != "view" or app.select_mode != "row" or not app.current_item:
+        return False
+    if not isinstance(app.focused, DataTable) or not app.rows_editable:
+        return False
+    return app.provider.can_open_row(app.current_item, app.current_type)
+
+
 def _filter_column_ctx(app):
     """Kept enabled across select modes and item types (unlike the
     column-scoped z/w/H/L/F actions) since filtering is basic/core usage -
@@ -1253,6 +1267,7 @@ class DbMan(App):
         Binding("?", "toggle_shortcuts", "Shortcuts"),
         Binding("V", "toggle_version", "Version", show=False),
         Binding("e", "edit_cell", "Edit"),
+        Binding("space", "open_row", "Open"),
         Binding("E", "edit_document", "Edit Document", show=False),
         Binding("a", "add", "Add"),
         Binding("x", "export_csv", "Export CSV", show=False),
@@ -1284,6 +1299,7 @@ class DbMan(App):
     # not listed here are always shown+enabled. See issue #10.
     ACTION_CONTEXTS = {
         "edit_cell": _edit_cell_ctx,
+        "open_row": _open_row_ctx,
         "edit_document": _ctx(modes={"view"}, capability="whole_row_edit"),
         "filter_column": _filter_column_ctx,
         "sort_column": _sort_column_ctx,
@@ -2833,6 +2849,36 @@ class DbMan(App):
             self.notify("Opened in browser")
         except Exception as e:
             self.notify(f"Could not open in browser: {e}", severity="error")
+
+    def action_open_row(self):
+        """space in row select mode: open the selected row where its
+        provider says it leads (Provider.open_row) - a url in the browser,
+        or, for a dbman.sqlite `connections` row, that connection."""
+        if not isinstance(self.focused, DataTable) or not self.current_item:
+            return
+        coord = self.focused.cursor_coordinate
+        row_id_str = list(self.focused.rows.values())[coord.row].key.value
+        row_key = self.row_keys.get(row_id_str)
+        if row_key is None or row_key.value is None:
+            self.notify("Cannot open this row", severity="error")
+            return
+        try:
+            target = self.provider.open_row(self.current_item, self.current_type, row_key)
+        except Exception as e:
+            self.notify(f"Cannot open this row: {e}", severity="error")
+            return
+        if target.kind == "url":
+            webbrowser.open(target.value)
+            self.notify("Opened in browser")
+        elif target.kind == "connection":
+            if self.workspace is None:
+                self.notify("No saved connections in this session", severity="error")
+            elif target.value == self.workspace_name:
+                self.notify(f"Already connected to '{target.value}'")
+            else:
+                # The same path as picking it from 'c', including leaving
+                # the app untouched if the connect fails.
+                self._on_switch_connection_selected(target.value)
 
     def _open_document_editor(self, row_key, raw_doc):
         """Shared by action_edit_document (existing row) and _add_row
