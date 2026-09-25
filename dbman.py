@@ -33,7 +33,7 @@ from virtual_table import OptionPickerTable, VirtualTableScreen, cell_matches
 from column_meta import ColumnMetadataTable
 from workspace import WorkspaceStore, ConnectionSession
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 # ... (rest of imports unchanged) ...
 
