@@ -31,8 +31,9 @@ class WorkspaceStore:
     writing; `upsert_connection` and `save_session` are the two write
     paths, called after a successful connect and on clean quit respectively.
 
-    Rows with no name are skipped everywhere: they're what 'a' leaves behind
-    when the connections table is browsed directly, not yet connectable.
+    Rows with no name or no url are skipped everywhere: a blank row from 'a'
+    when the connections table is browsed directly, or an orphan's parent
+    row (see meta_db), neither of which can be connected to yet.
     """
 
     def __init__(self, base_dir: Optional[Path] = None):
@@ -45,15 +46,16 @@ class WorkspaceStore:
             if conn is None:
                 return {}
             rows = conn.execute(
-                "SELECT name, url FROM connections WHERE name IS NOT NULL AND name != '' ORDER BY id"
+                "SELECT name, url FROM connections"
+                " WHERE name IS NOT NULL AND name != '' AND url IS NOT NULL AND url != '' ORDER BY id"
             ).fetchall()
-        return {name: url or "" for name, url in rows}
+        return dict(rows)
 
     def _last_connection(self) -> Optional[str]:
         with self.db.read() as conn:
             if conn is None:
                 return None
-            row = conn.execute("SELECT value FROM workspace WHERE key = 'last_connection'").fetchone()
+            row = conn.execute("SELECT last_connection FROM workspace WHERE id = 1").fetchone()
         return row[0] if row else None
 
     def resolve(self, arg: Optional[str], name_override: Optional[str] = None) -> Optional[tuple[str, str]]:
@@ -100,18 +102,23 @@ class WorkspaceStore:
                 (name, url),
             )
             conn.execute(
-                "INSERT INTO workspace (key, value) VALUES ('last_connection', ?)"
-                " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                "INSERT INTO workspace (id, last_connection) VALUES (1, ?)"
+                " ON CONFLICT(id) DO UPDATE SET last_connection = excluded.last_connection",
                 (name,),
             )
 
     def save_session(self, name: str, session: ConnectionSession) -> None:
+        # Only while the connection still exists: browsing dbman.sqlite, the
+        # user can delete (cascading) the very connection they're on, and
+        # the quit-time save shouldn't then fail the foreign key - or
+        # resurrect the row they just removed.
         with self.db.write() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO sessions (connection, item_name, item_type, mode, select_mode,"
-                " cursor_row, cursor_column) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                " cursor_row, cursor_column)"
+                " SELECT ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM connections WHERE name = ?)",
                 (name, session.item_name, session.item_type, session.mode, session.select_mode,
-                 session.cursor_row, session.cursor_column),
+                 session.cursor_row, session.cursor_column, name),
             )
 
     def get_session(self, name: str) -> Optional[ConnectionSession]:

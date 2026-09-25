@@ -86,18 +86,25 @@ class ViewSettingsStore:
 
 def write_view_settings(conn: sqlite3.Connection, connection: str, item: str, settings: ViewSettings) -> None:
     """Replace one item's rows wholesale. Shared with meta_db's JSON import
-    so both write the same shape. The caller owns the transaction."""
+    so both write the same shape. The caller owns the transaction.
+
+    Foreign keys are on (meta_db._open_initialized), so the parents are
+    ensured first: a `connections` row (url-less if it's an orphan's - see
+    meta_db's CHILD_DDL note), then this item's `item_settings` row, which
+    every column_settings row hangs off. Deleting that row cascades its
+    columns away, which is what clears them here."""
+    conn.execute("INSERT OR IGNORE INTO connections (name) VALUES (?)", (connection,))
     conn.execute("DELETE FROM item_settings WHERE connection = ? AND item = ?", (connection, item))
-    conn.execute("DELETE FROM column_settings WHERE connection = ? AND item = ?", (connection, item))
-    if settings.sort_column is not None:
-        conn.execute(
-            "INSERT INTO item_settings (connection, item, sort_column, sort_direction) VALUES (?, ?, ?, ?)",
-            (connection, item, settings.sort_column, settings.sort_direction),
-        )
-    hidden, no_color = set(settings.hidden), set(settings.no_color)
-    position = {column: i for i, column in enumerate(settings.order)}
     # Every column any setting mentions, once, in first-mention order.
     columns = dict.fromkeys([*settings.order, *settings.hidden, *settings.widths, *settings.no_color])
+    if settings.sort_column is None and not columns:
+        return
+    conn.execute(
+        "INSERT INTO item_settings (connection, item, sort_column, sort_direction) VALUES (?, ?, ?, ?)",
+        (connection, item, settings.sort_column, settings.sort_direction),
+    )
+    hidden, no_color = set(settings.hidden), set(settings.no_color)
+    position = {column: i for i, column in enumerate(settings.order)}
     conn.executemany(
         "INSERT INTO column_settings (connection, item, column_name, hidden, width, position, no_color)"
         " VALUES (?, ?, ?, ?, ?, ?, ?)",

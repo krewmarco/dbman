@@ -1,5 +1,5 @@
 from sqlalchemy import (
-    create_engine, inspect, text, MetaData, Table, select, update, func, or_,
+    create_engine, event, inspect, text, MetaData, Table, select, update, func, or_,
 )
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -10,6 +10,18 @@ from .base import (
 )
 
 
+def _enable_sqlite_foreign_keys(dbapi_conn, _record):
+    """SQLite ignores declared foreign keys unless each connection opts in,
+    so without this a row delete or key edit made in dbman would skip the
+    schema's ON DELETE/ON UPDATE actions and could leave dangling children -
+    e.g. deleting a row from dbman.sqlite's `connections` wouldn't cascade
+    to its settings. The flip side is intended too: an edit that would
+    violate a declared key is now refused with the database's own error."""
+    cursor = dbapi_conn.cursor()
+    cursor.execute("PRAGMA foreign_keys = ON")
+    cursor.close()
+
+
 class SqlAlchemyProvider(Provider):
     """Relational-database provider (SQLite primarily; Postgres/MySQL best-effort)
     backed by SQLAlchemy Core. No ORM, no caching — everything is reflected live."""
@@ -17,6 +29,8 @@ class SqlAlchemyProvider(Provider):
     def __init__(self, db_url: str):
         self.db_url = db_url
         self.engine = create_engine(db_url)
+        if self.engine.dialect.name == "sqlite":
+            event.listen(self.engine, "connect", _enable_sqlite_foreign_keys)
         self.capabilities = Capabilities(
             definition_pane=True,
             create_definition=True,
