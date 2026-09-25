@@ -33,7 +33,7 @@ from virtual_table import OptionPickerTable, VirtualTableScreen, cell_matches
 from column_meta import ColumnMetadataTable
 from workspace import WorkspaceStore, ConnectionSession
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 # ... (rest of imports unchanged) ...
 
@@ -149,7 +149,7 @@ class ShortcutsScreen(ModalScreen):
                 " shift+tab: Jump to next sidebar section\n"
                 " m: Toggle View/Schema/SQL/Diag mode\n"
                 " r: Reload current table/view from the database\n"
-                " c: Switch connection (pick from dbman.json, j/k + enter)\n"
+                " c: Switch connection (pick from dbman.sqlite, j/k + enter)\n"
                 " ?: Toggle this Shortcuts panel\n"
                 " ctrl+p: Open Textual's command palette\n"
                 " V: Show version/about screen\n\n"
@@ -164,6 +164,8 @@ class ShortcutsScreen(ModalScreen):
                 "    Columns with a fixed option set open a picker table (space toggles,\n"
                 "    f filters the options, enter saves)\n"
                 " E: Edit whole document as JSON (document DB providers)\n"
+                " space: Open the selected row (row select mode): a Notion row in the\n"
+                "    browser, a dbman.sqlite connections row connects to it\n"
                 " a: Add a new row (table) or create a new Table/View (where supported;\n"
                 "    also works on a TABLES/VIEWS sidebar header, even when empty)\n"
                 " d: Delete selected table/view\n"
@@ -567,7 +569,7 @@ class ConnectionListItem(ListItem):
         self.connection_name = name
 
 class ConnectionSwitcherScreen(ModalScreen):
-    """A modal listing every connection saved in dbman.json (workspace.py),
+    """A modal listing every connection saved in dbman.sqlite (workspace.py),
     for fast switching without restarting the app - see 'c'/action_switch_
     connection. Enter (ListView's native binding) dismisses with the chosen
     connection name; Escape cancels with None.
@@ -1027,6 +1029,18 @@ def _edit_cell_ctx(app):
     return app.current_type == "table" and app.rows_editable
 
 
+def _open_row_ctx(app):
+    """space = "see it more truly" (PLANNING_space-vs-edit-keybinding.md),
+    for now only its row-mode half: open the selected row wherever its
+    provider says it leads. Per item via can_open_row, not a Capabilities
+    flag, since in dbman.sqlite only `connections` rows open anywhere."""
+    if app.mode != "view" or app.select_mode != "row" or not app.current_item:
+        return False
+    if not isinstance(app.focused, DataTable) or not app.rows_editable:
+        return False
+    return app.provider.can_open_row(app.current_item, app.current_type)
+
+
 def _filter_column_ctx(app):
     """Kept enabled across select modes and item types (unlike the
     column-scoped z/w/H/L/F actions) since filtering is basic/core usage -
@@ -1253,6 +1267,7 @@ class DbMan(App):
         Binding("?", "toggle_shortcuts", "Shortcuts"),
         Binding("V", "toggle_version", "Version", show=False),
         Binding("e", "edit_cell", "Edit"),
+        Binding("space", "open_row", "Open"),
         Binding("E", "edit_document", "Edit Document", show=False),
         Binding("a", "add", "Add"),
         Binding("x", "export_csv", "Export CSV", show=False),
@@ -1284,6 +1299,7 @@ class DbMan(App):
     # not listed here are always shown+enabled. See issue #10.
     ACTION_CONTEXTS = {
         "edit_cell": _edit_cell_ctx,
+        "open_row": _open_row_ctx,
         "edit_document": _ctx(modes={"view"}, capability="whole_row_edit"),
         "filter_column": _filter_column_ctx,
         "sort_column": _sort_column_ctx,
@@ -2834,6 +2850,36 @@ class DbMan(App):
         except Exception as e:
             self.notify(f"Could not open in browser: {e}", severity="error")
 
+    def action_open_row(self):
+        """space in row select mode: open the selected row where its
+        provider says it leads (Provider.open_row) - a url in the browser,
+        or, for a dbman.sqlite `connections` row, that connection."""
+        if not isinstance(self.focused, DataTable) or not self.current_item:
+            return
+        coord = self.focused.cursor_coordinate
+        row_id_str = list(self.focused.rows.values())[coord.row].key.value
+        row_key = self.row_keys.get(row_id_str)
+        if row_key is None or row_key.value is None:
+            self.notify("Cannot open this row", severity="error")
+            return
+        try:
+            target = self.provider.open_row(self.current_item, self.current_type, row_key)
+        except Exception as e:
+            self.notify(f"Cannot open this row: {e}", severity="error")
+            return
+        if target.kind == "url":
+            webbrowser.open(target.value)
+            self.notify("Opened in browser")
+        elif target.kind == "connection":
+            if self.workspace is None:
+                self.notify("No saved connections in this session", severity="error")
+            elif target.value == self.workspace_name:
+                self.notify(f"Already connected to '{target.value}'")
+            else:
+                # The same path as picking it from 'c', including leaving
+                # the app untouched if the connect fails.
+                self._on_switch_connection_selected(target.value)
+
     def _open_document_editor(self, row_key, raw_doc):
         """Shared by action_edit_document (existing row) and _add_row
         (freshly-created row, opened immediately so a freeform document is
@@ -2855,12 +2901,11 @@ class DbMan(App):
 
     def action_add(self):
         """'a': context-sensitive "create new thing". On a Table, add a new
-        row/document and immediately open it for editing — only implemented
-        where a provider can create a sensible blank row without a
-        schema-aware form (currently CouchDB's freeform documents,
-        capabilities.add_row; SqlAlchemyProvider tables need typed defaults
-        for NOT NULL columns, deferred to a future dynamic-forms/
-        business-logic layer). On a View, create a new view (formerly the
+        row/document and put the cursor on it (CouchDB also opens the
+        whole-document editor) — only where a provider can create a blank
+        row without a schema-aware form (capabilities.add_row; a SQLite
+        table with a NOT NULL column lacking a default refuses, deferred to
+        a future dynamic-forms layer). On a View, create a new view (formerly the
         standalone 'v' key — folded in here since it's the same "add a new
         thing" gesture, just for a different item type). See issue #10.
 
@@ -2919,6 +2964,12 @@ class DbMan(App):
             key_str = json.dumps(row_key.value, sort_keys=True)
         else:
             key_str = str(row_key.value)
+        # A blank row is only useful once filled in, so land on it - it may
+        # sort anywhere, or not be on this page at all, in which case the
+        # cursor stays put.
+        if key_str in self.row_order:
+            table_widget = self.query_one("#data-table", DataTable)
+            table_widget.move_cursor(row=self.row_order.index(key_str))
         raw_doc = self.raw_docs.get(key_str)
         if raw_doc is not None:
             self._open_document_editor(row_key, raw_doc)
@@ -3063,7 +3114,7 @@ if __name__ == "__main__":
     resolved = workspace.resolve(args.connection, name_override=args.name)
     if resolved is None:
         parser.print_usage()
-        print("(bare 'dbman' works once a connection has been saved to ./dbman.json)")
+        print("(bare 'dbman' works once a connection has been saved to ./dbman.sqlite)")
         sys.exit(1)
     url, name = resolved
     app = DbMan(url, workspace=workspace, workspace_name=name)

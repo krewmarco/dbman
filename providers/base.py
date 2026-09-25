@@ -51,6 +51,15 @@ class RowKey:
     value: Any
 
 
+@dataclass(frozen=True)
+class RowTarget:
+    """What opening a row (space, in row select mode) leads to - see
+    Provider.open_row. `kind` is "url" (open `value` in the browser) or
+    "connection" (switch dbman to the saved connection named `value`)."""
+    kind: str
+    value: str
+
+
 @dataclass
 class RowPage:
     columns: list[Column]
@@ -198,6 +207,19 @@ class Provider(ABC):
         for providers with capabilities.open_in_browser = True."""
         raise NotImplementedError
 
+    def can_open_row(self, name: str, item_type: str) -> bool:
+        """Whether rows of this table/view have somewhere to open to. Per
+        item rather than a Capabilities flag because it genuinely varies by
+        table (only dbman.sqlite's `connections` rows open to a connection)
+        - a small precursor of the per-table capabilities in issue #25.
+        Called from check_action, so it must stay cheap: no I/O."""
+        return self.capabilities.open_in_browser
+
+    def open_row(self, name: str, item_type: str, row_key: RowKey) -> RowTarget:
+        """Where opening this row leads. Raises (with a readable message)
+        when this particular row can't be opened."""
+        return RowTarget("url", self.get_row_url(name, item_type, row_key))
+
     def update_row_json(
         self, name: str, item_type: str, row_key: RowKey, new_json_text: str
     ) -> RowKey:
@@ -205,10 +227,10 @@ class Provider(ABC):
 
     def add_row(self, name: str, item_type: str) -> RowKey:
         """Create a new, minimal row/document. Only relevant/implemented for
-        providers with capabilities.add_row = True — currently CouchDB's
-        freeform documents. SQL tables need a schema-aware form (typed
-        defaults for NOT NULL columns), deferred to a future dynamic-forms
-        layer rather than implemented here."""
+        providers with capabilities.add_row = True. A provider that can't
+        create a blank row for a particular table (SQLite: a NOT NULL column
+        with no default, which needs a schema-aware form) raises with a
+        readable reason rather than guessing values."""
         raise NotImplementedError
 
     @abstractmethod

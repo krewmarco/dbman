@@ -264,8 +264,7 @@ class NotionProvider(Provider):
         # host, specifically so derive_db_name() (view_settings.py) can pull
         # a secret-free name from it - a bare host+userinfo shape would leave
         # the path empty and fall back to hashing the whole URL, token
-        # included, into both the saved connection name and a .dbman/*.json
-        # filename on disk.
+        # included, into the saved connection name.
         if not token or len(path_segments) != 1:
             raise ValueError(
                 "Notion URL must be notion://<integration-token>@notion.so/<page-id>"

@@ -5,3 +5,9 @@ __pycache__/
 dbman_crash.log
 .dbman/
 dbman.json
+# dbman's own config db (meta_db.py) - connection urls can embed tokens
+dbman.sqlite
+dbman.sqlite-journal
+dbman.sqlite.migrating
+dbman.json.bak*
+.dbman.bak*/

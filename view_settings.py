@@ -1,18 +1,21 @@
-"""Per-view display settings (hidden columns, widths, column order),
-persisted to a local `.dbman/<db-name>.json` file relative to the directory
-dbman was invoked from. Provider-agnostic: keyed by table/view name, so it
-works the same for SqlAlchemyProvider tables and CouchDBProvider's inferred
-columns. See CLAUDE.md and github.com/krewmarco/dbman issue #1."""
-import json
+"""Per-view display settings (hidden columns, widths, column order, color,
+sort), persisted in `dbman.sqlite`'s `item_settings` and `column_settings`
+tables (meta_db.py), keyed by connection name then table/view name.
+Provider-agnostic: works the same for SqlAlchemyProvider tables and
+CouchDBProvider's inferred columns. See CLAUDE.md and github.com/krewmarco/dbman
+issues #1 and #22."""
+import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlsplit
 
+from meta_db import MetaDb
+
 
 def derive_db_name(db_url: str) -> str:
-    """A stable, filesystem-safe name for a connection string, used to key
-    its settings file. Bare sqlite paths, sqlite:// URLs, and couchdb://
+    """A stable, short name for a connection string, used as its default
+    connection name. Bare sqlite paths, sqlite:// URLs, and couchdb://
     URLs all carry their meaningful identifier in the last path segment."""
     path = urlsplit(db_url).path or db_url
     return Path(path).stem or "db"
@@ -33,40 +36,84 @@ class ViewSettings:
 
 
 class ViewSettingsStore:
-    """Loads/saves ViewSettings for every table/view in one database, from
-    `<base_dir>/.dbman/<db_name>.json`."""
+    """Loads/saves ViewSettings for every table/view of one connection, in
+    `<base_dir>/dbman.sqlite`. Reads the file on every get() rather than
+    caching - see meta_db.py for why."""
 
     def __init__(self, db_name: str, base_dir: Optional[Path] = None):
-        self.path = (base_dir or Path.cwd()) / ".dbman" / f"{db_name}.json"
-        self._data: dict[str, dict] = {}
-        if self.path.exists():
-            try:
-                self._data = json.loads(self.path.read_text())
-            except (json.JSONDecodeError, OSError):
-                self._data = {}
+        self.connection = db_name
+        self.db = MetaDb(base_dir)
 
     def get(self, item_name: str) -> ViewSettings:
-        raw = self._data.get(item_name, {})
-        return ViewSettings(
-            hidden=list(raw.get("hidden", [])),
-            widths=dict(raw.get("widths", {})),
-            order=list(raw.get("order", [])),
-            no_color=list(raw.get("no_color", [])),
-            sort_column=raw.get("sort_column"),
-            sort_direction=raw.get("sort_direction"),
-        )
+        settings = ViewSettings()
+        with self.db.read() as conn:
+            if conn is None:
+                return settings
+            sort = conn.execute(
+                "SELECT sort_column, sort_direction FROM item_settings"
+                " WHERE connection = ? AND item = ?",
+                (self.connection, item_name),
+            ).fetchone()
+            if sort:
+                settings.sort_column, settings.sort_direction = sort
+            # rowid order is write order: saved column order first (see
+            # write_view_settings). `hidden`/`no_color` are only ever used
+            # as sets, so they come back in that order rather than the
+            # order columns were hidden in - the unhide picker lists them
+            # in column order, which reads better anyway.
+            rows = conn.execute(
+                "SELECT column_name, hidden, width, position, no_color FROM column_settings"
+                " WHERE connection = ? AND item = ? ORDER BY rowid",
+                (self.connection, item_name),
+            ).fetchall()
+        positioned = []
+        for column, hidden, width, position, no_color in rows:
+            if hidden:
+                settings.hidden.append(column)
+            if width is not None:
+                settings.widths[column] = width
+            if position is not None:
+                positioned.append((position, column))
+            if no_color:
+                settings.no_color.append(column)
+        settings.order = [column for _, column in sorted(positioned)]
+        return settings
 
     def save(self, item_name: str, settings: ViewSettings) -> None:
-        self._data[item_name] = {
-            "hidden": settings.hidden,
-            "widths": settings.widths,
-            "order": settings.order,
-            "no_color": settings.no_color,
-            "sort_column": settings.sort_column,
-            "sort_direction": settings.sort_direction,
-        }
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(self._data, indent=2, sort_keys=True))
+        with self.db.write() as conn:
+            write_view_settings(conn, self.connection, item_name, settings)
+
+
+def write_view_settings(conn: sqlite3.Connection, connection: str, item: str, settings: ViewSettings) -> None:
+    """Replace one item's rows wholesale. Shared with meta_db's JSON import
+    so both write the same shape. The caller owns the transaction.
+
+    Foreign keys are on (meta_db._open_initialized), so the parents are
+    ensured first: a `connections` row (url-less if it's an orphan's - see
+    meta_db's CHILD_DDL note), then this item's `item_settings` row, which
+    every column_settings row hangs off. Deleting that row cascades its
+    columns away, which is what clears them here."""
+    conn.execute("INSERT OR IGNORE INTO connections (name) VALUES (?)", (connection,))
+    conn.execute("DELETE FROM item_settings WHERE connection = ? AND item = ?", (connection, item))
+    # Every column any setting mentions, once, in first-mention order.
+    columns = dict.fromkeys([*settings.order, *settings.hidden, *settings.widths, *settings.no_color])
+    if settings.sort_column is None and not columns:
+        return
+    conn.execute(
+        "INSERT INTO item_settings (connection, item, sort_column, sort_direction) VALUES (?, ?, ?, ?)",
+        (connection, item, settings.sort_column, settings.sort_direction),
+    )
+    hidden, no_color = set(settings.hidden), set(settings.no_color)
+    position = {column: i for i, column in enumerate(settings.order)}
+    conn.executemany(
+        "INSERT INTO column_settings (connection, item, column_name, hidden, width, position, no_color)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [
+            (connection, item, column, int(column in hidden), settings.widths.get(column),
+             position.get(column), int(column in no_color))
+            for column in columns
+        ],
+    )
 
 
 def apply_view_settings(columns: list, rows: list[list], settings: ViewSettings):

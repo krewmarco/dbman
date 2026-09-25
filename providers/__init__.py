@@ -1,7 +1,7 @@
 import os
 
 from .base import (
-    Provider, Column, RowKey, RowPage, Capabilities,
+    Provider, Column, RowKey, RowPage, RowTarget, Capabilities,
     DiagramModel, DiagramNode, DiagramEdge,
 )
 
@@ -26,5 +26,15 @@ def create_provider(db_url: str) -> Provider:
 
     if not db_url.startswith(("sqlite://", "postgresql://", "mysql://")):
         db_url = f"sqlite:///{os.path.abspath(db_url)}"
+
+    # dbman's own config db: SQLite browsing with a guard against taking the
+    # config apart. Matched by file contents, not only the name - see
+    # meta_db.is_config_db.
+    if db_url.startswith("sqlite:///"):
+        import meta_db
+        if meta_db.is_config_db(meta_db.sqlite_url_path(db_url)):
+            from .dbman_meta_provider import DbmanMetaProvider
+            return DbmanMetaProvider(db_url)
+
     from .sqlalchemy_provider import SqlAlchemyProvider
     return SqlAlchemyProvider(db_url)
