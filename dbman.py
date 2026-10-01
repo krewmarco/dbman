@@ -7,6 +7,8 @@ import math
 import random
 import csv
 import json
+import shutil
+import subprocess
 from sqlalchemy import text
 from textual.app import App, ComposeResult
 from textual.widgets import Header, Footer, DataTable, ListView, ListItem, Label, Static, Button, Input, ContentSwitcher, TextArea, Select
@@ -170,6 +172,8 @@ class ShortcutsScreen(ModalScreen):
                 "    also works on a TABLES/VIEWS sidebar header, even when empty)\n"
                 " d: Delete selected table/view\n"
                 " x: Export current Table/View to CSV\n"
+                " y: Copy (yank) the selected cell / row (tab-separated) / column\n"
+                "    to the clipboard (View mode; Cmd+C can't reach a terminal app)\n"
                 " /: Search the loaded page - cell values, or column names in column mode;\n"
                 "    with the sidebar focused, search table/view/plugin names instead\n"
                 " n / N: Step to the next / previous match\n"
@@ -1122,6 +1126,10 @@ def _unhide_column_ctx(app):
     return True if app.view_settings.get(app.current_item).hidden else None
 
 
+def _copy_ctx(app):
+    return app.mode == "view" and bool(app.current_item) and isinstance(app.focused, DataTable)
+
+
 def _export_csv_ctx(app):
     return app.current_type in ("table", "view")
 
@@ -1271,6 +1279,7 @@ class DbMan(App):
         Binding("E", "edit_document", "Edit Document", show=False),
         Binding("a", "add", "Add"),
         Binding("x", "export_csv", "Export CSV", show=False),
+        Binding("y", "copy", "Copy"),
         Binding("/", "search", "Search"),
         Binding("n", "search_next", "Next Match", show=False),
         Binding("N", "search_prev", "Prev Match", show=False),
@@ -1315,6 +1324,7 @@ class DbMan(App):
         "delete_item": _delete_item_ctx,
         "toggle_mode": _toggle_mode_ctx,
         "export_csv": _export_csv_ctx,
+        "copy": _copy_ctx,
         "add": _add_ctx,
         "clear_filters": _clear_filters_ctx,
         "switch_connection": _switch_connection_ctx,
@@ -3012,6 +3022,55 @@ class DbMan(App):
         
         language = self.provider.definition_language(self.current_type)
         self.push_screen(EditTextScreen(f"Edit View: {self.current_item}", current_sql, language=language), execute_sql)
+
+    @staticmethod
+    def _clip_text(value):
+        if value is None:
+            return ""
+        if isinstance(value, (dict, list)):
+            return json.dumps(value)
+        return str(value)
+
+    def action_copy(self):
+        """'y' (vim yank): copy what the select mode has selected - the
+        cell, the row as tab-separated values, or the column one value per
+        line. Cmd+C never reaches a TUI (the terminal handles it, copying
+        its own - empty - selection), so this is the in-app way.
+
+        Reads row_values (untruncated) rather than the DataTable cells,
+        which may hold '..'-shortened display strings."""
+        table = self.focused
+        if not isinstance(table, DataTable) or not table.row_count:
+            return
+        coord = table.cursor_coordinate
+        columns = [c.key.value for c in table.ordered_columns]
+        row_ids = [r.key.value for r in table.ordered_rows]
+        def value(row_id, col):
+            return self._clip_text(self.row_values.get(row_id, {}).get(col))
+        if self.select_mode == "row":
+            row_id = row_ids[coord.row]
+            text = "\t".join(value(row_id, c) for c in columns)
+            what = "row"
+        elif self.select_mode == "column":
+            col = columns[coord.column]
+            text = "\n".join(value(r, col) for r in row_ids)
+            what = f"column '{col}' ({len(row_ids)} values)"
+        else:
+            text = value(row_ids[coord.row], columns[coord.column])
+            what = "cell"
+        self._copy_to_clipboard(text)
+        preview = text if len(text) <= 40 else text[:37] + "..."
+        self.notify(f"Copied {what}: {preview}" if self.select_mode == "field" else f"Copied {what}")
+
+    def _copy_to_clipboard(self, text):
+        # OSC 52 covers iTerm2/kitty/WezTerm and works over ssh, but macOS
+        # Terminal.app ignores it, so locally also go through pbcopy.
+        self.copy_to_clipboard(text)
+        if sys.platform == "darwin" and shutil.which("pbcopy"):
+            try:
+                subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True, timeout=2)
+            except Exception as e:
+                self.notify(f"pbcopy failed: {e}", severity="warning")
 
     def action_export_csv(self):
         if not self.current_item:
