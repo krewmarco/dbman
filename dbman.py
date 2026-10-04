@@ -646,6 +646,15 @@ class ConnectionSwitcherScreen(ModalScreen):
     def key_escape(self) -> None:
         self.dismiss(None)
 
+def _json_error(text):
+    """EditTextScreen validator for JSON editors."""
+    try:
+        json.loads(text)
+    except ValueError as e:
+        return f"Invalid JSON: {e}"
+    return None
+
+
 class EditTextScreen(ModalScreen):
     """A modal screen for editing a block of text: SQL, a CouchDB view's
     JS map/reduce definition, or a whole JSON document."""
@@ -676,11 +685,16 @@ class EditTextScreen(ModalScreen):
         margin-left: 1;
     }
     """
-    def __init__(self, title, initial_text="", language="sql"):
+    def __init__(self, title, initial_text="", language="sql", validate=None):
         super().__init__()
         self.title_text = title
         self.initial_text = initial_text
         self.language = language
+        # Optional text -> error message (or None). An invalid edit keeps
+        # the dialog open instead of dismissing and losing the text to a
+        # typo; the caller's own error handling still covers what this
+        # can't see (a 409, a rejected value).
+        self.validate = validate
 
     def compose(self) -> ComposeResult:
         with Vertical(id="edit-sql-dialog"):
@@ -695,7 +709,12 @@ class EditTextScreen(ModalScreen):
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "apply-edit-sql":
-            self.dismiss(self.query_one(TextArea).text)
+            text = self.query_one(TextArea).text
+            error = self.validate(text) if self.validate else None
+            if error:
+                self.notify(error, severity="error")
+                return
+            self.dismiss(text)
         else:
             self.dismiss(None)
 
@@ -2757,10 +2776,6 @@ class DbMan(App):
             self.notify("Cannot edit tables without identifiable rows (yet)", severity="error")
             return
 
-        if self.provider.capabilities.whole_row_edit and isinstance(current_value, (dict, list)):
-            self.action_edit_document()
-            return
-
         col = self.columns_by_name.get(column_name)
         if col is not None and col.read_only:
             # Fail here rather than round-tripping to the provider just to
@@ -2768,6 +2783,14 @@ class DbMan(App):
             # this is a computed/system field (Notion formula, rollup,
             # relation, unique_id, ...).
             self.notify(f"Column '{column_name}' is read-only", severity="error")
+            return
+
+        if isinstance(current_value, (dict, list)):
+            # A nested value can't go in the one-line EditCellScreen, but
+            # field mode means *this field*: open just its JSON, not the
+            # whole document (that's row mode / 'E'), so a long array is
+            # on screen at once instead of below every other field.
+            self._open_field_json_editor(row_key, column_name, current_value)
             return
 
         if col is not None and col.options:
@@ -2915,8 +2938,37 @@ class DbMan(App):
 
         doc_id = row_key.value.get("_id") if isinstance(row_key.value, dict) else row_key.value
         self.push_screen(
-            EditTextScreen(f"Edit Document: {doc_id}", json.dumps(raw_doc, indent=2), language="json"),
+            EditTextScreen(
+                f"Edit Document: {doc_id}", json.dumps(raw_doc, indent=2), language="json",
+                validate=_json_error,
+            ),
             save_document,
+        )
+
+    def _open_field_json_editor(self, row_key, column_name, value):
+        """Field-mode 'e' on a dict/list cell: edit that one value as JSON.
+        Written back through update_cell, which (for CouchDB) re-fetches
+        the document and replaces only this key, so the rest of the
+        document is untouched even if it changed since the page loaded."""
+        def save_field(new_json_text):
+            if new_json_text is None:
+                return
+            try:
+                self.provider.update_cell(
+                    self.current_item, self.current_type, row_key, column_name, json.loads(new_json_text)
+                )
+                self.notify("Updated")
+                self.load_item(self.current_item, self.current_type)
+            except Exception as e:
+                self.notify(f"Update failed: {e}", severity="error")
+
+        doc_id = row_key.value.get("_id") if isinstance(row_key.value, dict) else row_key.value
+        self.push_screen(
+            EditTextScreen(
+                f"Edit {column_name}: {doc_id}", json.dumps(value, indent=2), language="json",
+                validate=_json_error,
+            ),
+            save_field,
         )
 
     def action_add(self):
