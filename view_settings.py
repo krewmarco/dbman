@@ -31,6 +31,10 @@ class ViewSettings:
     # column: a Status worth spotting at a glance vs. a Section whose every
     # row is colored, where the color is repetition rather than signal.
     no_color: list[str] = field(default_factory=list)
+    # Columns sized to their longest loaded value instead of the average -
+    # for reading a whole URL end to end. Recomputed on every load rather
+    # than frozen into `widths`, so it keeps fitting as the data changes.
+    fit: list[str] = field(default_factory=list)
     sort_column: Optional[str] = None
     sort_direction: Optional[str] = None  # "asc" | "desc", meaningless if sort_column is None
 
@@ -62,12 +66,12 @@ class ViewSettingsStore:
             # order columns were hidden in - the unhide picker lists them
             # in column order, which reads better anyway.
             rows = conn.execute(
-                "SELECT column_name, hidden, width, position, no_color FROM column_settings"
+                "SELECT column_name, hidden, width, position, no_color, fit FROM column_settings"
                 " WHERE connection = ? AND item = ? ORDER BY rowid",
                 (self.connection, item_name),
             ).fetchall()
         positioned = []
-        for column, hidden, width, position, no_color in rows:
+        for column, hidden, width, position, no_color, fit in rows:
             if hidden:
                 settings.hidden.append(column)
             if width is not None:
@@ -76,6 +80,8 @@ class ViewSettingsStore:
                 positioned.append((position, column))
             if no_color:
                 settings.no_color.append(column)
+            if fit:
+                settings.fit.append(column)
         settings.order = [column for _, column in sorted(positioned)]
         return settings
 
@@ -96,21 +102,21 @@ def write_view_settings(conn: sqlite3.Connection, connection: str, item: str, se
     conn.execute("INSERT OR IGNORE INTO connections (name) VALUES (?)", (connection,))
     conn.execute("DELETE FROM item_settings WHERE connection = ? AND item = ?", (connection, item))
     # Every column any setting mentions, once, in first-mention order.
-    columns = dict.fromkeys([*settings.order, *settings.hidden, *settings.widths, *settings.no_color])
+    columns = dict.fromkeys([*settings.order, *settings.hidden, *settings.widths, *settings.no_color, *settings.fit])
     if settings.sort_column is None and not columns:
         return
     conn.execute(
         "INSERT INTO item_settings (connection, item, sort_column, sort_direction) VALUES (?, ?, ?, ?)",
         (connection, item, settings.sort_column, settings.sort_direction),
     )
-    hidden, no_color = set(settings.hidden), set(settings.no_color)
+    hidden, no_color, fit = set(settings.hidden), set(settings.no_color), set(settings.fit)
     position = {column: i for i, column in enumerate(settings.order)}
     conn.executemany(
-        "INSERT INTO column_settings (connection, item, column_name, hidden, width, position, no_color)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO column_settings (connection, item, column_name, hidden, width, position, no_color, fit)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         [
             (connection, item, column, int(column in hidden), settings.widths.get(column),
-             position.get(column), int(column in no_color))
+             position.get(column), int(column in no_color), int(column in fit))
             for column in columns
         ],
     )
@@ -138,16 +144,27 @@ def compute_column_widths(
     values for that column (+ padding), clamped to [min_width, max_width]
     and never narrower than the header label. Using the average rather than
     the longest value is the point: one huge outlier value shouldn't blow
-    out the whole column."""
+    out the whole column - unless the column is in `settings.fit`, which
+    asks for exactly that: the longest value, unclamped, so nothing in it
+    is truncated (the DataTable scrolls sideways past the screen edge)."""
     widths = {}
     for i, col in enumerate(display_columns):
         if col.name in settings.widths:
             widths[col.name] = settings.widths[col.name]
             continue
+        if col.name in settings.fit:
+            widths[col.name] = fit_width(col, [row[i] for row in display_rows], min_width)
+            continue
         lengths = [len(str(row[i])) for row in display_rows if row[i] is not None]
         avg = (sum(lengths) / len(lengths)) if lengths else 0
         widths[col.name] = max(min_width, len(col.name), min(max_width, round(avg) + padding))
     return widths
+
+
+def fit_width(col, values: list, min_width: int = 6) -> int:
+    """The width at which no value in `values` is truncated."""
+    longest = max((len(str(v)) for v in values if v is not None), default=0)
+    return max(min_width, len(col.name), longest)
 
 
 def truncate_display_value(value, width: Optional[int]):

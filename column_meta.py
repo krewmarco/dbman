@@ -44,7 +44,7 @@ class ColumnMetadataTable(VirtualTable):
     # Colored row only makes sense once you can see the column has options)
     # and because a read-only column is worth knowing before you try to edit.
     def __init__(self, column: Column, item_name: str, view_settings_store,
-                 visible_column_count: int, auto_width=None):
+                 visible_column_count: int, auto_width=None, fit_width=None):
         self.column = column
         self.item_name = item_name
         self.store = view_settings_store
@@ -54,6 +54,9 @@ class ColumnMetadataTable(VirtualTable):
         # to "auto" so there's a number to start from, which is the one
         # affordance the retired `w` dialog had that this didn't.
         self.auto_width = auto_width
+        # The longest loaded value's width, for the same reason: "fit (87)"
+        # says what typing `fit` would get you before you type it.
+        self.fit_width = fit_width
         self.title = f"Column: {column.name}"
         self.changed = False
         self.error = None
@@ -64,6 +67,10 @@ class ColumnMetadataTable(VirtualTable):
     def _width_value(self, width):
         if width is not None:
             return Text(str(width))
+        if self.column.name in self.settings.fit:
+            if self.fit_width is None:
+                return Text("fit")
+            return Text.assemble("fit", (f" ({self.fit_width})", "grey62"))
         if self.auto_width is None:
             return AUTO
         return Text.assemble(("auto", "italic grey62"), (f" ({self.auto_width})", "grey62"))
@@ -116,10 +123,12 @@ class ColumnMetadataTable(VirtualTable):
             self._save()
             return True
         if key == "width":
-            current = self.settings.widths.get(self.column.name)
-            auto = "" if self.auto_width is None else f", auto is {self.auto_width}"
+            name = self.column.name
+            current = "fit" if name in self.settings.fit else self.settings.widths.get(name)
+            auto = "" if self.auto_width is None else f" ({self.auto_width})"
+            fit = "" if self.fit_width is None else f" ({self.fit_width})"
             return Prompt(
-                f"Width for {self.column.name} (blank for auto{auto})",
+                f"Width for {name}: a number, 'fit' for the longest value{fit}, or blank for auto{auto}",
                 "" if current is None else str(current),
                 self._apply_width,
             )
@@ -143,8 +152,17 @@ class ColumnMetadataTable(VirtualTable):
 
     def _apply_width(self, text):
         text = text.strip()
+        name = self.column.name
+        # A fixed width and fit are alternatives: setting either clears the
+        # other, and blank clears both back to auto.
         if not text:
-            self.settings.widths.pop(self.column.name, None)
+            self.settings.widths.pop(name, None)
+            if name in self.settings.fit:
+                self.settings.fit.remove(name)
+        elif text.lower() == "fit":
+            self.settings.widths.pop(name, None)
+            if name not in self.settings.fit:
+                self.settings.fit.append(name)
         else:
             try:
                 value = int(text)
@@ -154,7 +172,9 @@ class ColumnMetadataTable(VirtualTable):
             if value < 1:
                 self.error = "Width must be at least 1"
                 return
-            self.settings.widths[self.column.name] = value
+            self.settings.widths[name] = value
+            if name in self.settings.fit:
+                self.settings.fit.remove(name)
         self._save()
 
     def _cycle_sort(self):

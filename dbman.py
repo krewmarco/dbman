@@ -1528,6 +1528,7 @@ class DbMan(App):
         self.column_widths = {}
         self.columns_by_name = {}
         self.auto_column_widths = {}
+        self.fit_column_widths = {}
         self.row_order = []
         self.rendered_rows = {}
 
@@ -1760,6 +1761,7 @@ class DbMan(App):
                 self.row_values = {}
                 self.columns_by_name = {}
                 self.auto_column_widths = {}
+                self.fit_column_widths = {}
                 self.row_order = []
                 self.rendered_rows = {}
                 self.rows_editable = False
@@ -1820,6 +1822,12 @@ class DbMan(App):
                     self.auto_column_widths = compute_column_widths(
                         display_columns, display_rows, ViewSettings()
                     )
+                    # Likewise "fit (87)": the width each column would get
+                    # sized to its longest loaded value.
+                    self.fit_column_widths = compute_column_widths(
+                        display_columns, display_rows,
+                        ViewSettings(fit=[c.name for c in display_columns]),
+                    )
                     self.columns_by_name = {c.name: c for c in display_columns}
                     rendered_rows = truncate_rows(display_columns, display_rows, column_widths)
                     # Paint enum-valued cells in their option colors. Must
@@ -1861,6 +1869,7 @@ class DbMan(App):
                 self.row_values = {}
                 self.columns_by_name = {}
                 self.auto_column_widths = {}
+                self.fit_column_widths = {}
                 self.row_order = []
                 self.rendered_rows = {}
                 self.rows_editable = False
@@ -2183,6 +2192,7 @@ class DbMan(App):
             column, self.current_item, self.view_settings,
             visible_column_count=len(self.focused.ordered_columns),
             auto_width=self.auto_column_widths.get(column_name),
+            fit_width=self.fit_column_widths.get(column_name),
         )
 
         def done(changed):
