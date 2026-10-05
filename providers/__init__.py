@@ -6,8 +6,12 @@ from .base import (
 )
 
 
-def create_provider(db_url: str) -> Provider:
+def create_provider(db_url: str, name: str = None) -> Provider:
     """Scheme dispatch: pick a Provider implementation for a connection string.
+
+    `name` is the saved connection name, for a provider whose state is keyed
+    by it in dbman.sqlite rather than carried in the url (CsvProvider's
+    directory list); everything else ignores it.
 
     To add a new provider: implement Provider (providers/base.py), set its
     capabilities honestly, and add one elif branch here.
@@ -23,6 +27,10 @@ def create_provider(db_url: str) -> Provider:
     if db_url.startswith("github://"):
         from .github_provider import GitHubProvider
         return GitHubProvider(db_url)
+
+    if db_url.startswith("csv://"):
+        from .csv_provider import CsvProvider
+        return CsvProvider(db_url, name)
 
     if not db_url.startswith(("sqlite://", "postgresql://", "mysql://")):
         db_url = f"sqlite:///{os.path.abspath(db_url)}"

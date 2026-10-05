@@ -26,9 +26,11 @@ class SqlAlchemyProvider(Provider):
     """Relational-database provider (SQLite primarily; Postgres/MySQL best-effort)
     backed by SQLAlchemy Core. No ORM, no caching — everything is reflected live."""
 
-    def __init__(self, db_url: str):
+    def __init__(self, db_url: str, **engine_kwargs):
         self.db_url = db_url
-        self.engine = create_engine(db_url)
+        # engine_kwargs: for a subclass that needs a particular pool, e.g.
+        # CsvProvider's in-memory database, which every connection must share.
+        self.engine = create_engine(db_url, **engine_kwargs)
         if self.engine.dialect.name == "sqlite":
             event.listen(self.engine, "connect", _enable_sqlite_foreign_keys)
         # Row add/delete target a row by SQLite's rowid, the same identity
