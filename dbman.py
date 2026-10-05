@@ -2839,12 +2839,18 @@ class DbMan(App):
             self.push_screen(LookupSelectScreen(f"Select {column_name}", options, current_value), perform_lookup_update)
             return
 
+        # A text column keeps what was typed: coercing "007" to 7 would drop
+        # the zeros, silently, and write the result back (a CSV file, say).
+        # SQLite's own text-affinity rule; Notion's rich_text/title match too.
+        type_name = (col.type_name or "").upper() if col is not None else ""
+        text_column = any(t in type_name for t in ("CHAR", "CLOB", "TEXT"))
+
         def perform_update(new_value):
             if new_value is not None:
                 typed_value = new_value
                 if new_value.strip() == "":
                     typed_value = None
-                else:
+                elif not text_column:
                     try:
                         if "." in new_value: typed_value = float(new_value)
                         else: typed_value = int(new_value)
