@@ -9,17 +9,19 @@ Deliberately *not* built on the `Provider` ABC. A Provider is ~25 methods of
 schema reflection, cursor paging, capabilities and write paths; a list of 18
 Notion select options needs none of it, and making every future virtual
 table implement that surface would be a tax with no payer. The contract here
-is four methods, only two of them required.
+is five methods, only two of them required.
 
-The "opener" is `space`, following PLANNING_space-vs-edit-keybinding.md's
-split of space ("see it more truly") from `e` ("change it"). What opening
-*means* is the table's business: for an option picker it toggles the row's
-checkbox, which is why open_row returns whether anything changed.
+The keys follow the main table and PLANNING_space-vs-edit-keybinding.md's
+split: `e` changes the selected row's value (edit_row), `space` is the
+opener (open_row). What opening *means* is the table's business, and where
+there's nothing to "see more truly" it's the row's natural quick action -
+an option picker ticks the row, a yes/no setting flips, a sort cycles -
+which is why open_row returns whether anything changed.
 """
 import fnmatch
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable, Optional
 
 from rich.text import Text
 from textual.app import ComposeResult
@@ -34,14 +36,20 @@ from providers.base import Column
 
 
 @dataclass
-class Prompt:
-    """Returned by open_row when opening a row means asking for a value
-    rather than flipping one - a column's width, say, next to rows that
-    just toggle. The screen collects the text and hands it to `apply`;
-    a cancelled prompt never calls it."""
+class RowEdit:
+    """Returned by edit_row: how `e` changes the selected row, decided the
+    way the main table's `e` decides for a column. With `options` it's a
+    pick from them (an OptionPickerTable, like an enum column's cell);
+    without, a one-line text box seeded with `value`.
+
+    Either way the chosen text goes to `apply`, the on-edit hook, which
+    interprets it ("fit", "45", "auto" are all one Width) and returns an
+    error message to refuse it - the text box then stays open with what was
+    typed - or None. A cancelled edit never calls it."""
     title: str
     value: str
-    apply: Any  # Callable[[str], None]
+    apply: Callable[[str], Optional[str]]
+    options: tuple = ()
 
 
 @dataclass
@@ -107,9 +115,13 @@ class VirtualTable(ABC):
 
     def open_row(self, key):
         """The opener - what `space` does to the selected row. Return True
-        if the table's contents changed and it should be re-rendered, or a
-        Prompt to ask the user for a value first."""
+        if the table's contents changed and it should be re-rendered."""
         return False
+
+    def edit_row(self, key) -> Optional[RowEdit]:
+        """What `e` does to the selected row; None means the row is
+        read-only."""
+        return None
 
     def clear(self) -> None:
         """What the Clear button does. No-op unless the table has a notion
@@ -212,7 +224,8 @@ class VirtualTableScreen(ModalScreen):
     BINDINGS = [
         Binding("j", "cursor_down", "Down", show=False),
         Binding("k", "cursor_up", "Up", show=False),
-        Binding("space", "open_row", "Toggle", show=False),
+        Binding("space", "open_row", "Open", show=False),
+        Binding("e", "edit_row", "Edit", show=False),
         Binding("f", "focus_filter", "Filter", show=False),
         # '/' is the app's search key, and in a modal list the two verbs
         # collapse: there's one list, entirely on screen, so narrowing it
@@ -310,15 +323,32 @@ class VirtualTableScreen(ModalScreen):
         key = self._selected_key()
         if key is None:
             return
-        outcome = self.table.open_row(key)
-        if isinstance(outcome, Prompt):
-            def done(value):
-                if value is not None:
-                    outcome.apply(value)
-                    self._populate(keep_key=key)
-            self.app.push_screen(PromptScreen(outcome), done)
-        elif outcome:
+        if self.table.open_row(key):
             self._populate(keep_key=key)
+
+    def action_edit_row(self):
+        key = self._selected_key()
+        edit = self.table.edit_row(key) if key is not None else None
+        if edit is None:
+            self.notify("This row is read-only", severity="warning")
+            return
+        if not edit.options:
+            def typed(applied):
+                if applied:
+                    self._populate(keep_key=key)
+            self.app.push_screen(PromptScreen(edit), typed)
+            return
+
+        def picked(value):
+            # None is a cancel; "" can't happen without a (none) row.
+            if not value:
+                return
+            error = edit.apply(value)
+            if error:
+                self.notify(error, severity="error")
+            self._populate(keep_key=key)
+        picker = OptionPickerTable(edit.title, edit.options, [edit.value], multi=False, allow_none=False)
+        self.app.push_screen(VirtualTableScreen(picker), picked)
 
     def action_focus_filter(self):
         box = self.query_one("#vt-filter", Input)
@@ -353,10 +383,10 @@ class VirtualTableScreen(ModalScreen):
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         if self.table.commits_immediately:
-            # Enter is the opener's twin here, not a commit - there's
-            # nothing left to commit, and closing on it would make the row
-            # cursor feel like a trapdoor.
-            self.action_open_row()
+            # Nothing to commit - the work is already done - and enter
+            # neither edits nor opens: changing a value takes `e`, and its
+            # quick action takes space, as in the main table. Closing on it
+            # would make the row cursor feel like a trapdoor.
             return
         # Enter on a row saves, matching the main app's "enter commits" feel.
         self.dismiss(self.table.result())
@@ -381,9 +411,11 @@ class VirtualTableScreen(ModalScreen):
 
 
 class PromptScreen(ModalScreen):
-    """One-line input for a Prompt returned by an opener. Local to this
-    module rather than reusing dbman's EditCellScreen, which would make
-    virtual_table import dbman and close an import cycle."""
+    """One-line input for a text RowEdit. Local to this module rather than
+    reusing dbman's EditCellScreen, which would make virtual_table import
+    dbman and close an import cycle. Dismisses True once `apply` accepts
+    the text; a refusal stays open with the error, so the typing isn't
+    lost."""
 
     CSS = """
     PromptScreen { background: rgba(0, 0, 0, 0.3); align: center middle; }
@@ -394,7 +426,7 @@ class PromptScreen(ModalScreen):
     #prompt-title { text-style: bold; margin-bottom: 1; }
     """
 
-    def __init__(self, prompt: Prompt):
+    def __init__(self, prompt: RowEdit):
         super().__init__()
         self.prompt = prompt
 
@@ -407,7 +439,11 @@ class PromptScreen(ModalScreen):
         self.query_one(Input).focus()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        self.dismiss(event.value)
+        error = self.prompt.apply(event.value)
+        if error:
+            self.notify(error, severity="error")
+            return
+        self.dismiss(True)
 
     def key_escape(self) -> None:
-        self.dismiss(None)
+        self.dismiss(False)

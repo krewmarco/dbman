@@ -26,7 +26,7 @@ DB_FILENAME = "dbman.sqlite"
 LEGACY_WORKSPACE = "dbman.json"
 LEGACY_SETTINGS_DIR = ".dbman"
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 CONFIG_TABLES = ("connections", "sessions", "item_settings", "column_settings", "workspace")
 
 # The whole schema, and the one place it lives. Browsing dbman.sqlite shows
@@ -76,8 +76,10 @@ CREATE TABLE IF NOT EXISTS item_settings (
     PRIMARY KEY (connection, item)
 );
 -- One row per column: the relational form of ViewSettings' parallel
--- hidden/widths/order/no_color collections. `position` is the column's
--- index in the saved order, NULL when it has no explicit place.
+-- hidden/widths/order/no_color/fit collections. `position` is the column's
+-- index in the saved order, NULL when it has no explicit place. `fit`
+-- sizes the column to its longest loaded value, recomputed on every load
+-- (so a fixed `width` and `fit` are never both set).
 CREATE TABLE IF NOT EXISTS column_settings (
     connection TEXT NOT NULL,
     item TEXT NOT NULL,
@@ -86,6 +88,7 @@ CREATE TABLE IF NOT EXISTS column_settings (
     width INTEGER,
     position INTEGER,
     no_color INTEGER NOT NULL DEFAULT 0,
+    fit INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (connection, item, column_name),
     FOREIGN KEY (connection, item)
         REFERENCES item_settings (connection, item) ON DELETE CASCADE ON UPDATE CASCADE
@@ -181,10 +184,13 @@ def _open_initialized(path: Path) -> sqlite3.Connection:
         with _transaction(conn):
             _execute_ddl(conn, CONNECTIONS_DDL + CHILD_DDL)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-    elif version == 1:
-        _upgrade_v1(conn)
-    elif _missing_tables(conn):
-        _restore_tables(conn)
+    else:
+        if version == 1:
+            _upgrade_v1(conn)
+        elif version == 2:
+            _upgrade_v2(conn)
+        if _missing_tables(conn):
+            _restore_tables(conn)
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
@@ -278,7 +284,12 @@ def _upgrade_v1(conn: sqlite3.Connection) -> None:
             "INSERT OR IGNORE INTO item_settings (connection, item)"
             " SELECT DISTINCT connection, item FROM v1_column_settings"
         )
-        conn.execute("INSERT INTO column_settings SELECT * FROM v1_column_settings")
+        # Named columns, not SELECT *: CHILD_DDL's column_settings has
+        # since grown columns v1 never had (`fit`, v3), left at default.
+        conn.execute(
+            "INSERT INTO column_settings (connection, item, column_name, hidden, width, position, no_color)"
+            " SELECT connection, item, column_name, hidden, width, position, no_color FROM v1_column_settings"
+        )
         conn.execute(
             "INSERT INTO workspace (id, last_connection)"
             " SELECT 1, value FROM v1_workspace WHERE key = 'last_connection'"
@@ -289,6 +300,17 @@ def _upgrade_v1(conn: sqlite3.Connection) -> None:
         violations = conn.execute("PRAGMA foreign_key_check").fetchall()
         if violations:
             raise sqlite3.IntegrityError(f"dbman.sqlite upgrade left foreign key violations: {violations}")
+        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+
+def _upgrade_v2(conn: sqlite3.Connection) -> None:
+    """v3 adds column_settings.fit. A plain ADD COLUMN - no foreign key
+    involved, so no rebuild. Skipped if the table is gone (_restore_tables
+    recreates it from CHILD_DDL, `fit` included) or already has it."""
+    with _transaction(conn):
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(column_settings)")}
+        if columns and "fit" not in columns:
+            conn.execute("ALTER TABLE column_settings ADD COLUMN fit INTEGER NOT NULL DEFAULT 0")
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 

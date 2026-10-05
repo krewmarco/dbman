@@ -7,6 +7,8 @@ import math
 import random
 import csv
 import json
+import shutil
+import subprocess
 from sqlalchemy import text
 from textual.app import App, ComposeResult
 from textual.widgets import Header, Footer, DataTable, ListView, ListItem, Label, Static, Button, Input, ContentSwitcher, TextArea, Select
@@ -170,6 +172,8 @@ class ShortcutsScreen(ModalScreen):
                 "    also works on a TABLES/VIEWS sidebar header, even when empty)\n"
                 " d: Delete selected table/view\n"
                 " x: Export current Table/View to CSV\n"
+                " y: Copy (yank) the selected cell / row (tab-separated) / column\n"
+                "    to the clipboard (View mode; Cmd+C can't reach a terminal app)\n"
                 " /: Search the loaded page - cell values, or column names in column mode;\n"
                 "    with the sidebar focused, search table/view/plugin names instead\n"
                 " n / N: Step to the next / previous match\n"
@@ -642,6 +646,15 @@ class ConnectionSwitcherScreen(ModalScreen):
     def key_escape(self) -> None:
         self.dismiss(None)
 
+def _json_error(text):
+    """EditTextScreen validator for JSON editors."""
+    try:
+        json.loads(text)
+    except ValueError as e:
+        return f"Invalid JSON: {e}"
+    return None
+
+
 class EditTextScreen(ModalScreen):
     """A modal screen for editing a block of text: SQL, a CouchDB view's
     JS map/reduce definition, or a whole JSON document."""
@@ -672,11 +685,16 @@ class EditTextScreen(ModalScreen):
         margin-left: 1;
     }
     """
-    def __init__(self, title, initial_text="", language="sql"):
+    def __init__(self, title, initial_text="", language="sql", validate=None):
         super().__init__()
         self.title_text = title
         self.initial_text = initial_text
         self.language = language
+        # Optional text -> error message (or None). An invalid edit keeps
+        # the dialog open instead of dismissing and losing the text to a
+        # typo; the caller's own error handling still covers what this
+        # can't see (a 409, a rejected value).
+        self.validate = validate
 
     def compose(self) -> ComposeResult:
         with Vertical(id="edit-sql-dialog"):
@@ -691,7 +709,12 @@ class EditTextScreen(ModalScreen):
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "apply-edit-sql":
-            self.dismiss(self.query_one(TextArea).text)
+            text = self.query_one(TextArea).text
+            error = self.validate(text) if self.validate else None
+            if error:
+                self.notify(error, severity="error")
+                return
+            self.dismiss(text)
         else:
             self.dismiss(None)
 
@@ -1122,6 +1145,10 @@ def _unhide_column_ctx(app):
     return True if app.view_settings.get(app.current_item).hidden else None
 
 
+def _copy_ctx(app):
+    return app.mode == "view" and bool(app.current_item) and isinstance(app.focused, DataTable)
+
+
 def _export_csv_ctx(app):
     return app.current_type in ("table", "view")
 
@@ -1271,6 +1298,7 @@ class DbMan(App):
         Binding("E", "edit_document", "Edit Document", show=False),
         Binding("a", "add", "Add"),
         Binding("x", "export_csv", "Export CSV", show=False),
+        Binding("y", "copy", "Copy"),
         Binding("/", "search", "Search"),
         Binding("n", "search_next", "Next Match", show=False),
         Binding("N", "search_prev", "Prev Match", show=False),
@@ -1315,6 +1343,7 @@ class DbMan(App):
         "delete_item": _delete_item_ctx,
         "toggle_mode": _toggle_mode_ctx,
         "export_csv": _export_csv_ctx,
+        "copy": _copy_ctx,
         "add": _add_ctx,
         "clear_filters": _clear_filters_ctx,
         "switch_connection": _switch_connection_ctx,
@@ -1518,6 +1547,7 @@ class DbMan(App):
         self.column_widths = {}
         self.columns_by_name = {}
         self.auto_column_widths = {}
+        self.fit_column_widths = {}
         self.row_order = []
         self.rendered_rows = {}
 
@@ -1750,6 +1780,7 @@ class DbMan(App):
                 self.row_values = {}
                 self.columns_by_name = {}
                 self.auto_column_widths = {}
+                self.fit_column_widths = {}
                 self.row_order = []
                 self.rendered_rows = {}
                 self.rows_editable = False
@@ -1810,6 +1841,12 @@ class DbMan(App):
                     self.auto_column_widths = compute_column_widths(
                         display_columns, display_rows, ViewSettings()
                     )
+                    # Likewise "fit (87)": the width each column would get
+                    # sized to its longest loaded value.
+                    self.fit_column_widths = compute_column_widths(
+                        display_columns, display_rows,
+                        ViewSettings(fit=[c.name for c in display_columns]),
+                    )
                     self.columns_by_name = {c.name: c for c in display_columns}
                     rendered_rows = truncate_rows(display_columns, display_rows, column_widths)
                     # Paint enum-valued cells in their option colors. Must
@@ -1851,6 +1888,7 @@ class DbMan(App):
                 self.row_values = {}
                 self.columns_by_name = {}
                 self.auto_column_widths = {}
+                self.fit_column_widths = {}
                 self.row_order = []
                 self.rendered_rows = {}
                 self.rows_editable = False
@@ -2173,6 +2211,7 @@ class DbMan(App):
             column, self.current_item, self.view_settings,
             visible_column_count=len(self.focused.ordered_columns),
             auto_width=self.auto_column_widths.get(column_name),
+            fit_width=self.fit_column_widths.get(column_name),
         )
 
         def done(changed):
@@ -2737,10 +2776,6 @@ class DbMan(App):
             self.notify("Cannot edit tables without identifiable rows (yet)", severity="error")
             return
 
-        if self.provider.capabilities.whole_row_edit and isinstance(current_value, (dict, list)):
-            self.action_edit_document()
-            return
-
         col = self.columns_by_name.get(column_name)
         if col is not None and col.read_only:
             # Fail here rather than round-tripping to the provider just to
@@ -2748,6 +2783,14 @@ class DbMan(App):
             # this is a computed/system field (Notion formula, rollup,
             # relation, unique_id, ...).
             self.notify(f"Column '{column_name}' is read-only", severity="error")
+            return
+
+        if isinstance(current_value, (dict, list)):
+            # A nested value can't go in the one-line EditCellScreen, but
+            # field mode means *this field*: open just its JSON, not the
+            # whole document (that's row mode / 'E'), so a long array is
+            # on screen at once instead of below every other field.
+            self._open_field_json_editor(row_key, column_name, current_value)
             return
 
         if col is not None and col.options:
@@ -2895,8 +2938,37 @@ class DbMan(App):
 
         doc_id = row_key.value.get("_id") if isinstance(row_key.value, dict) else row_key.value
         self.push_screen(
-            EditTextScreen(f"Edit Document: {doc_id}", json.dumps(raw_doc, indent=2), language="json"),
+            EditTextScreen(
+                f"Edit Document: {doc_id}", json.dumps(raw_doc, indent=2), language="json",
+                validate=_json_error,
+            ),
             save_document,
+        )
+
+    def _open_field_json_editor(self, row_key, column_name, value):
+        """Field-mode 'e' on a dict/list cell: edit that one value as JSON.
+        Written back through update_cell, which (for CouchDB) re-fetches
+        the document and replaces only this key, so the rest of the
+        document is untouched even if it changed since the page loaded."""
+        def save_field(new_json_text):
+            if new_json_text is None:
+                return
+            try:
+                self.provider.update_cell(
+                    self.current_item, self.current_type, row_key, column_name, json.loads(new_json_text)
+                )
+                self.notify("Updated")
+                self.load_item(self.current_item, self.current_type)
+            except Exception as e:
+                self.notify(f"Update failed: {e}", severity="error")
+
+        doc_id = row_key.value.get("_id") if isinstance(row_key.value, dict) else row_key.value
+        self.push_screen(
+            EditTextScreen(
+                f"Edit {column_name}: {doc_id}", json.dumps(value, indent=2), language="json",
+                validate=_json_error,
+            ),
+            save_field,
         )
 
     def action_add(self):
@@ -3012,6 +3084,55 @@ class DbMan(App):
         
         language = self.provider.definition_language(self.current_type)
         self.push_screen(EditTextScreen(f"Edit View: {self.current_item}", current_sql, language=language), execute_sql)
+
+    @staticmethod
+    def _clip_text(value):
+        if value is None:
+            return ""
+        if isinstance(value, (dict, list)):
+            return json.dumps(value)
+        return str(value)
+
+    def action_copy(self):
+        """'y' (vim yank): copy what the select mode has selected - the
+        cell, the row as tab-separated values, or the column one value per
+        line. Cmd+C never reaches a TUI (the terminal handles it, copying
+        its own - empty - selection), so this is the in-app way.
+
+        Reads row_values (untruncated) rather than the DataTable cells,
+        which may hold '..'-shortened display strings."""
+        table = self.focused
+        if not isinstance(table, DataTable) or not table.row_count:
+            return
+        coord = table.cursor_coordinate
+        columns = [c.key.value for c in table.ordered_columns]
+        row_ids = [r.key.value for r in table.ordered_rows]
+        def value(row_id, col):
+            return self._clip_text(self.row_values.get(row_id, {}).get(col))
+        if self.select_mode == "row":
+            row_id = row_ids[coord.row]
+            text = "\t".join(value(row_id, c) for c in columns)
+            what = "row"
+        elif self.select_mode == "column":
+            col = columns[coord.column]
+            text = "\n".join(value(r, col) for r in row_ids)
+            what = f"column '{col}' ({len(row_ids)} values)"
+        else:
+            text = value(row_ids[coord.row], columns[coord.column])
+            what = "cell"
+        self._copy_to_clipboard(text)
+        preview = text if len(text) <= 40 else text[:37] + "..."
+        self.notify(f"Copied {what}: {preview}" if self.select_mode == "field" else f"Copied {what}")
+
+    def _copy_to_clipboard(self, text):
+        # OSC 52 covers iTerm2/kitty/WezTerm and works over ssh, but macOS
+        # Terminal.app ignores it, so locally also go through pbcopy.
+        self.copy_to_clipboard(text)
+        if sys.platform == "darwin" and shutil.which("pbcopy"):
+            try:
+                subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True, timeout=2)
+            except Exception as e:
+                self.notify(f"pbcopy failed: {e}", severity="warning")
 
     def action_export_csv(self):
         if not self.current_item:
