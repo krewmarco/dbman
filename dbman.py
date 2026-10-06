@@ -34,6 +34,7 @@ from providers.base import Column, ColumnOption, FILTER_EMPTY, FILTER_NOT_EMPTY
 from virtual_table import OptionPickerTable, VirtualTableScreen, cell_matches
 from column_meta import ColumnMetadataTable
 from workspace import WorkspaceStore, ConnectionSession
+import computed
 
 __version__ = "0.2.0"
 
@@ -167,7 +168,8 @@ class ShortcutsScreen(ModalScreen):
                 "    f filters the options, enter saves)\n"
                 " E: Edit whole document as JSON (document DB providers)\n"
                 " space: Open the selected row (row select mode): a Notion row in the\n"
-                "    browser, a dbman.sqlite connections row connects to it\n"
+                "    browser, a dbman.sqlite connections row connects to it;\n"
+                "    in field mode, open the focused cell if it's a URL\n"
                 " a: Add a new row (table) or create a new Table/View (where supported;\n"
                 "    also works on a TABLES/VIEWS sidebar header, even when empty)\n"
                 " d: Delete selected table/view\n"
@@ -1053,13 +1055,17 @@ def _edit_cell_ctx(app):
 
 
 def _open_row_ctx(app):
-    """space = "see it more truly" (PLANNING_space-vs-edit-keybinding.md),
-    for now only its row-mode half: open the selected row wherever its
-    provider says it leads. Per item via can_open_row, not a Capabilities
-    flag, since in dbman.sqlite only `connections` rows open anywhere."""
-    if app.mode != "view" or app.select_mode != "row" or not app.current_item:
+    """space = "see it more truly" (PLANNING_space-vs-edit-keybinding.md).
+    Row mode opens the selected row wherever its provider says it leads -
+    per item via can_open_row, not a Capabilities flag, since in
+    dbman.sqlite only `connections` rows open anywhere. Field mode opens the
+    focused cell if its value is a URL; whether it is is only known per
+    cell, so it's always offered there and action_open_row explains a miss."""
+    if app.mode != "view" or not app.current_item or not isinstance(app.focused, DataTable):
         return False
-    if not isinstance(app.focused, DataTable) or not app.rows_editable:
+    if app.select_mode == "field":
+        return True
+    if app.select_mode != "row" or not app.rows_editable:
         return False
     return app.provider.can_open_row(app.current_item, app.current_type)
 
@@ -1801,6 +1807,10 @@ class DbMan(App):
                     saved_settings = self.view_settings.get(name)
                     if saved_settings.sort_column:
                         self.sort = [(saved_settings.sort_column, saved_settings.sort_direction or "asc")]
+                if self.sort and self.sort[0][0] in self._computed_names(name):
+                    # Only reachable via ColumnMetadataTable's Sort row; the
+                    # provider can't see the column, so every load would fail.
+                    self.sort = []
                 try:
                     page = self.provider.get_page(
                         name, item_type, self.filters, cursor=self.page_cursor,
@@ -1830,7 +1840,8 @@ class DbMan(App):
                     self.rows_editable = bool(page.row_keys) and page.row_keys[0].value is not None
 
                     view_settings = self.view_settings.get(name)
-                    display_columns, display_rows = apply_view_settings(page.columns, page.rows, view_settings)
+                    page_columns, page_rows = self._with_computed_columns(name, page.columns, page.rows)
+                    display_columns, display_rows = apply_view_settings(page_columns, page_rows, view_settings)
                     column_widths = compute_column_widths(display_columns, display_rows, view_settings)
                     self.column_widths = column_widths
                     # What each column *would* be without its override, so
@@ -2499,6 +2510,9 @@ class DbMan(App):
             return
         coord = self.focused.cursor_coordinate
         column_name = self.focused.ordered_columns[coord.column].key.value
+        if column_name in self._computed_names(self.current_item):
+            self.notify(f"'{column_name}' is computed by dbman - the database can't filter on it; try / to search", severity="error")
+            return
         current_filter = self.filters.get(column_name, "")
         def apply_filter(val):
             # None is cancel; anything falsy ("" from the text box, [] from
@@ -2551,6 +2565,9 @@ class DbMan(App):
             return
         coord = self.focused.cursor_coordinate
         column_name = self.focused.ordered_columns[coord.column].key.value
+        if column_name in self._computed_names(self.current_item):
+            self.notify(f"'{column_name}' is computed by dbman - the database can't sort on it", severity="error")
+            return
         current = self.sort[0] if self.sort else None
         if current is not None and current[0] == column_name:
             # Single column, cycling asc -> desc -> none. self.sort is a
@@ -2902,11 +2919,24 @@ class DbMan(App):
     def action_open_row(self):
         """space in row select mode: open the selected row where its
         provider says it leads (Provider.open_row) - a url in the browser,
-        or, for a dbman.sqlite `connections` row, that connection."""
+        or, for a dbman.sqlite `connections` row, that connection. In field
+        mode, open the focused cell if it holds a URL."""
         if not isinstance(self.focused, DataTable) or not self.current_item:
+            return
+        if not self.focused.row_count:
             return
         coord = self.focused.cursor_coordinate
         row_id_str = list(self.focused.rows.values())[coord.row].key.value
+        if self.select_mode == "field":
+            # The untruncated value, so a URL cut short on screen opens whole.
+            column_name = self.focused.ordered_columns[coord.column].key.value
+            value = str(self.row_values.get(row_id_str, {}).get(column_name) or "").strip()
+            if value.startswith(("http://", "https://")):
+                webbrowser.open(value)
+                self.notify("Opened in browser")
+            else:
+                self.notify("Nothing to open - this cell isn't a URL", severity="warning")
+            return
         row_key = self.row_keys.get(row_id_str)
         if row_key is None or row_key.value is None:
             self.notify("Cannot open this row", severity="error")
@@ -3140,6 +3170,27 @@ class DbMan(App):
             except Exception as e:
                 self.notify(f"pbcopy failed: {e}", severity="warning")
 
+    def _computed_names(self, item):
+        return {b.name for b in computed.read_bindings(self.view_settings.connection, item)}
+
+    def _with_computed_columns(self, item, columns, rows, notify=True):
+        """Append item's computed columns (computed.py) to a fetched page.
+        A broken binding or function never fails the load: it's reported
+        once per load as a warning and the cells show computed.ERROR_VALUE."""
+        try:
+            bindings = computed.read_bindings(self.view_settings.connection, item)
+        except Exception as e:
+            if notify:
+                self.notify(f"Computed columns unavailable: {e}", severity="warning")
+            return columns, rows
+        if not bindings:
+            return columns, rows
+        columns, rows, errors = computed.apply_computed(columns, rows, bindings)
+        if notify:
+            for message in errors:
+                self.notify(message, severity="warning")
+        return columns, rows
+
     def action_export_csv(self):
         if not self.current_item:
             return
@@ -3156,8 +3207,10 @@ class DbMan(App):
                             self.current_item, self.current_type, self.filters, cursor=None,
                             page_size=None, sort=self.sort[0] if self.sort else None,
                         )
-                        columns = [c.name for c in page.columns]
-                        rows = page.rows
+                        page_columns, rows = self._with_computed_columns(
+                            self.current_item, page.columns, page.rows, notify=False,
+                        )
+                        columns = [c.name for c in page_columns]
                     with open(filename, 'w', newline='') as f:
                         writer = csv.writer(f)
                         writer.writerow(columns)

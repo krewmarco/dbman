@@ -26,9 +26,10 @@ DB_FILENAME = "dbman.sqlite"
 LEGACY_WORKSPACE = "dbman.json"
 LEGACY_SETTINGS_DIR = ".dbman"
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 CONFIG_TABLES = (
     "connections", "sessions", "item_settings", "column_settings", "workspace", "csv_directories",
+    "computed_columns",
 )
 
 # The whole schema, and the one place it lives. Browsing dbman.sqlite shows
@@ -115,6 +116,20 @@ CREATE TABLE IF NOT EXISTS csv_directories (
         REFERENCES connections (name) ON DELETE CASCADE ON UPDATE CASCADE,
     path TEXT,
     UNIQUE (connection, path)
+);
+-- Columns dbman computes rather than reads (v5): `function` is a
+-- "module:func" found in <cwd>/dbman_plugins/, called with each row as a
+-- dict and shown read-only under `column_name` (see computed.py). Every
+-- column may be NULL so `a` adds a blank row; rows missing any field are
+-- skipped, and DbmanMetaProvider checks `function` imports.
+CREATE TABLE IF NOT EXISTS computed_columns (
+    id INTEGER PRIMARY KEY,
+    connection TEXT
+        REFERENCES connections (name) ON DELETE CASCADE ON UPDATE CASCADE,
+    item TEXT,
+    column_name TEXT,
+    function TEXT,
+    UNIQUE (connection, item, column_name)
 );
 """
 # Orphaned settings exist in the wild (a `.dbman/<uuid>.json` written before
@@ -210,6 +225,9 @@ def _open_initialized(path: Path) -> sqlite3.Connection:
             version = 3
         if version == 3:
             _upgrade_v3(conn)
+            version = 4
+        if version == 4:
+            _upgrade_v4(conn)
         if _missing_tables(conn):
             _restore_tables(conn)
     conn.execute("PRAGMA foreign_keys = ON")
@@ -341,6 +359,13 @@ def _upgrade_v3(conn: sqlite3.Connection) -> None:
     with _transaction(conn):
         _execute_ddl(conn, CHILD_DDL)
         conn.execute("PRAGMA user_version = 4")
+
+
+def _upgrade_v4(conn: sqlite3.Connection) -> None:
+    """v5 adds computed_columns, the same way v4 added csv_directories."""
+    with _transaction(conn):
+        _execute_ddl(conn, CHILD_DDL)
+        conn.execute("PRAGMA user_version = 5")
 
 
 def migrate_legacy(base_dir: Path) -> bool:
