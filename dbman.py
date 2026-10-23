@@ -27,11 +27,11 @@ from plugins.lookup import LookupPlugin, LookupSelectScreen, LookupConfigScreen
 from providers import create_provider
 from view_settings import (
     ViewSettings, ViewSettingsStore, derive_db_name,
-    compute_column_widths, truncate_rows,
+    compute_column_widths, forget_column, truncate_rows,
 )
 from cell_render import header_text, option_text, stylize_row
 from providers.base import Column, ColumnOption, FILTER_EMPTY, FILTER_NOT_EMPTY
-from virtual_table import OptionPickerTable, VirtualTableScreen, cell_matches
+from virtual_table import OptionPickerTable, PromptScreen, RowEdit, VirtualTableScreen, cell_matches
 from column_meta import ColumnMetadataTable
 from workspace import WorkspaceStore, ConnectionSession
 import computed
@@ -173,7 +173,10 @@ class ShortcutsScreen(ModalScreen):
                 "    in field mode, open the focused cell if it's a URL\n"
                 " a: Add a new row (table) or create a new Table/View (where supported;\n"
                 "    also works on a TABLES/VIEWS sidebar header, even when empty)\n"
-                " d: Delete selected table/view\n"
+                " a / A: In column mode, add a computed column right / left of the selected\n"
+                "    one, then set its Source, e.g. bst.bst_url(row.ref, row.translation)\n"
+                "    (PLUGINS lists each dbman_plugins module's functions)\n"
+                " d: Delete selected table/view (row mode: the row; column mode: a computed column)\n"
                 " x: Export current Table/View to CSV\n"
                 " y: Copy (yank) the selected cell / row (tab-separated) / column\n"
                 "    to the clipboard (View mode; Cmd+C can't reach a terminal app)\n"
@@ -190,8 +193,8 @@ class ShortcutsScreen(ModalScreen):
 
                 " [bold]Select Mode (View mode only)[/]\n"
                 " s: Rotate select mode: field -> row -> column -> field\n"
-                " e: In column mode, opens that column's settings (hidden, colored,\n"
-                "    width, sort) as a table - space edits the selected property\n"
+                " e: In column mode, opens that column's properties (source, hidden,\n"
+                "    colored, width, sort) as a table - e edits, space toggles\n"
                 " H / L: Move selected column left / right (column mode; option+left/right also works on some terminals)\n"
                 " J / K: Move selected row down / up, persisted (row mode; providers that support it)\n"
                 " z: Hide selected column (column mode)\n"
@@ -1136,6 +1139,11 @@ def _delete_item_ctx(app):
     whole table/view (gated on capabilities.delete_row, not delete_item)."""
     if app.current_type == "plugin":
         return False
+    if app.mode == "view" and isinstance(app.focused, DataTable) and app.select_mode == "column":
+        # Column mode deletes the selected column - only a computed one,
+        # since a provider column is the backend's to remove. Greyed rather
+        # than falling through to dropping the whole table.
+        return True if app._selected_column_is_computed() else None
     if app.mode == "view" and isinstance(app.focused, DataTable) and app.select_mode == "row":
         return bool(app.current_item) and app.rows_editable and app.provider.capabilities.delete_row
     return bool(app.current_type) and app.provider.capabilities.delete_item
@@ -1186,6 +1194,10 @@ def _add_ctx(app):
         return False
     if app.mode != "view" or not app.current_item:
         return False
+    if app.select_mode == "column":
+        # A computed column, right of the selected one (A: left). dbman's
+        # own, so any table or view takes one, whatever the provider.
+        return app.current_type in ("table", "view")
     if app.current_type == "table":
         return app.provider.capabilities.add_row
     if app.current_type == "view":
@@ -1317,6 +1329,7 @@ class DbMan(App):
         Binding("space", "open_row", "Open"),
         Binding("E", "edit_document", "Edit Document", show=False),
         Binding("a", "add", "Add"),
+        Binding("A", "add_column_left", "Add Left"),
         Binding("x", "export_csv", "Export CSV", show=False),
         Binding("y", "copy", "Copy"),
         Binding("/", "search", "Search"),
@@ -1365,6 +1378,7 @@ class DbMan(App):
         "export_csv": _export_csv_ctx,
         "copy": _copy_ctx,
         "add": _add_ctx,
+        "add_column_left": _ctx(modes={"view"}, select_modes={"column"}, item_types={"table", "view"}),
         "clear_filters": _clear_filters_ctx,
         "switch_connection": _switch_connection_ctx,
     }
@@ -1395,6 +1409,10 @@ class DbMan(App):
         # action_filter_column need the column's options/read_only, and
         # re-reading the schema is a network call for Notion.
         self.columns_by_name = {}
+        # Every column of dbman's table for the page on screen, hidden ones
+        # included (columns_by_name has only the displayed ones) - what a
+        # new computed column's name and expression are checked against.
+        self.table_columns = []
         self.mode = "view"
         self.select_mode = "field"
         self.filters = {}
@@ -1452,12 +1470,26 @@ class DbMan(App):
     def get_views(self):
         return self.provider.list_views()
 
+    def get_plugins(self):
+        """The PLUGINS section: the FK lookup plugin (relational providers
+        only), then each module in <cwd>/dbman_plugins/ - the functions
+        computed columns call - listed without importing them."""
+        names = ["lookup"] if self.lookup_plugin else []
+        return names + [m for m in computed.plugin_modules() if m not in names]
+
     def get_plugin_data(self, name):
-        if name == "lookup":
+        if name == "lookup" and self.lookup_plugin:
             columns = ["Table", "ForeignKeyField", "RelatedTable", "RelatedKey", "LookupField"]
             rows = self.lookup_plugin.get_config_data()
             return columns, rows
-        return [], []
+        # A dbman_plugins module: a reference card for writing a computed
+        # column's Source. "Use as" is a template to copy and adjust.
+        try:
+            functions = computed.plugin_functions(name)
+        except ValueError as e:
+            return ["Error"], [[str(e)]]
+        columns = ["Function", "Parameters", "Use as", "Description"]
+        return columns, [[f.name, f.params, f.usage, f.doc] for f in functions]
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -1627,7 +1659,7 @@ class DbMan(App):
 
             views = self.get_views()
             tables = self.get_tables()
-            plugins = ["lookup"] if self.lookup_plugin else []
+            plugins = self.get_plugins()
 
             # One ordered description of the sidebar, recorded as it's built,
             # so a row's position is derived from the same source of truth that
@@ -1682,7 +1714,7 @@ class DbMan(App):
         session = self.workspace.get_session(self.workspace_name)
         if session is None or session.item_name is None:
             return False
-        available = {"view": views, "table": tables, "plugin": ["lookup"] if self.lookup_plugin else []}
+        available = {"view": views, "table": tables, "plugin": self.get_plugins()}
         if session.item_name not in available.get(session.item_type, []):
             return False
 
@@ -1811,7 +1843,13 @@ class DbMan(App):
                     color = COLORS[i % len(COLORS)]
                     table_widget.add_column(f"[{color}]{col}[/]", key=col)
                 for i, row in enumerate(rows):
-                    table_widget.add_row(*row, key=str(i))
+                    # A docstring shows its first line; space shows it all.
+                    self.row_values[str(i)] = dict(zip(columns, row))
+                    cells = [
+                        v.splitlines()[0] + " …" if isinstance(v, str) and "\n" in v.strip() else v
+                        for v in row
+                    ]
+                    table_widget.add_row(*cells, key=str(i))
             elif self.mode == "view":
                 # Seed from this table/view's persisted sort (ViewSettingsStore)
                 # only if nothing's been explicitly set yet this session (e.g.
@@ -1857,6 +1895,7 @@ class DbMan(App):
 
                     view_settings = self.view_settings.get(name)
                     page_columns, page_rows = self._with_computed_columns(name, page.columns, page.rows)
+                    self.table_columns = [c.name for c in page_columns]
                     # Key columns come first and stay put (DataTable's fixed
                     # columns, themed by $dbman-key-column-background).
                     display_columns, display_rows, pinned = table_model.arrange(page_columns, page_rows, view_settings)
@@ -2231,7 +2270,7 @@ class DbMan(App):
             self.call_from_thread(finish)
         self.run_worker(worker, thread=True)
 
-    def action_edit_column(self):
+    def action_edit_column(self, edit_key=None):
         """'e' in column select mode: open the selected column's own
         settings as a virtual table. The column-mode half of `e`'s
         "edit the selected thing" promise - see ColumnMetadataTable."""
@@ -2244,15 +2283,16 @@ class DbMan(App):
             self.notify(f"No metadata for column '{column_name}'", severity="error")
             return
 
-        function = next(
-            (b.function for b in computed.read_bindings(self.view_settings.connection, self.current_item)
+        expression = next(
+            (b.expression for b in computed.read_bindings(self.view_settings.connection, self.current_item)
              if b.name == column_name),
             None,
         ) if column.source == computed.SOURCE else None
         table = ColumnMetadataTable(
             column, self.current_item, self.view_settings,
             visible_column_count=len(self.focused.ordered_columns),
-            computed_function=function,
+            computed_expression=expression,
+            table_columns=self.table_columns,
             auto_width=self.auto_column_widths.get(column_name),
             fit_width=self.fit_column_widths.get(column_name),
         )
@@ -2271,7 +2311,7 @@ class DbMan(App):
             self.reset_paging()
             self.load_item(self.current_item, self.current_type)
 
-        self.push_screen(VirtualTableScreen(table), done)
+        self.push_screen(VirtualTableScreen(table, edit_key=edit_key), done)
 
     def action_hide_column(self):
         """'z' in column select mode: hide the column-mode-selected column
@@ -2662,6 +2702,9 @@ class DbMan(App):
     def action_delete_item(self):
         if self.current_type == "plugin":
             self.notify("Cannot delete Plugins", severity="error")
+            return
+        if self.mode == "view" and isinstance(self.focused, DataTable) and self.select_mode == "column":
+            self._delete_computed_column()
             return
         if (
             self.mode == "view"
@@ -3066,12 +3109,102 @@ class DbMan(App):
         if self.mode != "view" or not self.current_item:
             self.notify("Add only allowed in View mode, on a Table or View", severity="error")
             return
-        if self.current_type == "table":
+        if self.select_mode == "column" and self.current_type in ("table", "view"):
+            self._add_computed_column(right=True)
+        elif self.current_type == "table":
             self._add_row()
         elif self.current_type == "view":
             self._add_view()
         else:
             self.notify("Add only allowed on a Table or View", severity="error")
+
+    def action_add_column_left(self):
+        """'A' in column select mode: a computed column left of the
+        selected one ('a' adds it to the right)."""
+        if self.mode != "view" or self.select_mode != "column" or self.current_type not in ("table", "view"):
+            return
+        self._add_computed_column(right=False)
+
+    def _add_computed_column(self, right: bool):
+        """Ask for a name, add an empty computed column beside the selected
+        one, then open its properties straight into editing its Source -
+        the expression that fills it (see computed.py). Placement is just
+        the saved column order, the same thing H/L write."""
+        table_widget = self.query_one("#data-table", DataTable)
+        if not table_widget.ordered_columns:
+            self.notify("No column to add beside", severity="error")
+            return
+        anchor = table_widget.ordered_columns[table_widget.cursor_coordinate.column].key.value
+        item, item_type = self.current_item, self.current_type
+        connection = self.view_settings.connection
+        taken = set(self.table_columns)
+
+        def create(text):
+            name = text.strip()
+            if not name:
+                return "Name the column"
+            if name in taken:
+                return f"There's already a column named '{name}'"
+            try:
+                computed.add_binding(connection, item, name)
+            except ValueError as e:
+                return str(e)
+            order = [c.key.value for c in table_widget.ordered_columns]
+            # Never inside the pinned key columns, which arrange keeps first.
+            index = max(order.index(anchor) + (1 if right else 0), table_widget.fixed_columns)
+            order.insert(index, name)
+            settings = self.view_settings.get(item)
+            settings.order = order
+            self.view_settings.save(item, settings)
+            return None
+
+        def created(ok):
+            if not ok:
+                return
+            self.load_item(item, item_type)
+            table = self.query_one("#data-table", DataTable)
+            keys = [c.key.value for c in table.ordered_columns]
+            added = [k for k in keys if k not in taken]
+            if added:
+                table.move_cursor(column=keys.index(added[0]))
+                table.focus()
+                self.action_edit_column(edit_key="source")
+
+        side = "right" if right else "left"
+        self.push_screen(
+            PromptScreen(RowEdit(f"New computed column, {side} of {anchor}. Name:", "", create)),
+            created,
+        )
+
+    def _selected_column_is_computed(self):
+        table = self.focused
+        if not isinstance(table, DataTable) or not table.ordered_columns:
+            return False
+        return self._is_computed(table.ordered_columns[table.cursor_coordinate.column].key.value)
+
+    def _delete_computed_column(self):
+        """'d' in column select mode: remove a computed column - its binding
+        and its display settings. The plugin function is untouched."""
+        table_widget = self.focused
+        name = table_widget.ordered_columns[table_widget.cursor_coordinate.column].key.value
+        if not self._is_computed(name):
+            self.notify(f"'{name}' comes from {self.columns_by_name[name].source}; only computed columns can be deleted here",
+                        severity="error")
+            return
+        item, item_type = self.current_item, self.current_type
+        connection = self.view_settings.connection
+
+        def on_confirm(do_delete):
+            if not do_delete:
+                return
+            computed.delete_binding(connection, item, name)
+            settings = self.view_settings.get(item)
+            forget_column(settings, name)
+            self.view_settings.save(item, settings)
+            self.notify(f"Computed column '{name}' deleted")
+            self.load_item(item, item_type)
+
+        self.push_screen(ConfirmScreen(f"Delete computed column '{name}'?", "Delete"), on_confirm)
 
     def _add_table(self):
         if not self.provider.capabilities.create_table:

@@ -123,6 +123,28 @@ def write_view_settings(conn: sqlite3.Connection, connection: str, item: str, se
     )
 
 
+def rename_column(settings: ViewSettings, old: str, new: str) -> None:
+    """Carry a column's settings over to its new name, in place."""
+    settings.hidden = [new if c == old else c for c in settings.hidden]
+    settings.order = [new if c == old else c for c in settings.order]
+    settings.no_color = [new if c == old else c for c in settings.no_color]
+    settings.fit = [new if c == old else c for c in settings.fit]
+    if old in settings.widths:
+        settings.widths[new] = settings.widths.pop(old)
+    if settings.sort_column == old:
+        settings.sort_column = new
+
+
+def forget_column(settings: ViewSettings, name: str) -> None:
+    """Drop every setting for a column that's gone, in place."""
+    for names in (settings.hidden, settings.order, settings.no_color, settings.fit):
+        while name in names:
+            names.remove(name)
+    settings.widths.pop(name, None)
+    if settings.sort_column == name:
+        settings.sort_column, settings.sort_direction = None, None
+
+
 def apply_view_settings(columns: list, rows: list[list], settings: ViewSettings):
     """Project a RowPage's columns/rows through hidden/order settings.
     `rows` must be positionally aligned with `columns`. Returns

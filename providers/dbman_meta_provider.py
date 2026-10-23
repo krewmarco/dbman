@@ -25,7 +25,7 @@ converting it later means lifting these methods into a plugin:
   before cell write  -> update_cell: re-checks read-only, restores a
                         masked secret the edit left in place, and
                         _normalize_value: check/expand a csv directory path,
-                                          check a computed column's function imports
+                                          check a computed column's expression
   open row           -> can_open_row / open_row: row -> connection
 """
 from dataclasses import replace
@@ -140,15 +140,18 @@ class DbmanMetaProvider(SqlAlchemyProvider):
         path, which is what a blank row from `a` starts as."""
         if name == "csv_directories" and column == "path":
             return normalize_directory(value) if str(value or "").strip() else None
-        if name == "computed_columns" and column == "function":
+        if name == "computed_columns" and column == "expression":
             # Checked against dbman_plugins/ in the cwd - the same place
             # load_item will look - so a typo is refused here rather than
-            # showing up later as a warning on every page load.
-            spec = str(value or "").strip()
-            if spec:
+            # showing up later as #ERR on every page load. Stored in its
+            # canonical spelling. Column names can't be checked from here
+            # (that needs the item's columns); ColumnMetadataTable does.
+            text = str(value or "").strip()
+            if text:
                 import computed
-                computed.load_function(spec)
-            return spec or None
+                computed.compile_expression(text)
+                text = str(computed.parse_expression(text))
+            return text or None
         return value
 
     # ---- Provider methods, routed through the hooks ----
