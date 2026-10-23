@@ -42,6 +42,12 @@ class Column:
     # frozen and therefore hashable.
     options: tuple = ()
     multi_value: bool = False  # a cell holds several options at once (Notion multi_select)
+    # Who supplies this column's data: the connection's name for a column
+    # the provider returned, computed.SOURCE for one dbman derives. Stamped
+    # by the UI (table_model.source_table), never by a provider - a provider
+    # only knows its own columns, and the label matters once a table mixes
+    # sources (computed columns now; cross-provider joins later).
+    source: Optional[str] = None
 
 
 @dataclass(frozen=True)

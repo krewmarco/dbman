@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlsplit
 
+from cell_render import header_width
 from meta_db import MetaDb
 
 
@@ -157,14 +158,14 @@ def compute_column_widths(
             continue
         lengths = [len(str(row[i])) for row in display_rows if row[i] is not None]
         avg = (sum(lengths) / len(lengths)) if lengths else 0
-        widths[col.name] = max(min_width, len(col.name), min(max_width, round(avg) + padding))
+        widths[col.name] = max(min_width, header_width(col), min(max_width, round(avg) + padding))
     return widths
 
 
 def fit_width(col, values: list, min_width: int = 6) -> int:
     """The width at which no value in `values` is truncated."""
     longest = max((len(str(v)) for v in values if v is not None), default=0)
-    return max(min_width, len(col.name), longest)
+    return max(min_width, header_width(col), longest)
 
 
 def truncate_display_value(value, width: Optional[int]):

@@ -26,15 +26,16 @@ from rich.text import Text
 from plugins.lookup import LookupPlugin, LookupSelectScreen, LookupConfigScreen
 from providers import create_provider
 from view_settings import (
-    ViewSettings, ViewSettingsStore, derive_db_name, apply_view_settings,
+    ViewSettings, ViewSettingsStore, derive_db_name,
     compute_column_widths, truncate_rows,
 )
-from cell_render import option_text, stylize_row
+from cell_render import header_text, option_text, stylize_row
 from providers.base import Column, ColumnOption, FILTER_EMPTY, FILTER_NOT_EMPTY
 from virtual_table import OptionPickerTable, VirtualTableScreen, cell_matches
 from column_meta import ColumnMetadataTable
 from workspace import WorkspaceStore, ConnectionSession
 import computed
+import table_model
 
 __version__ = "0.2.0"
 
@@ -438,6 +439,7 @@ class EditCellScreen(ModalScreen):
 
     def key_escape(self) -> None:
         self.dismiss(None)
+
 
 class TruncateColumnScreen(ModalScreen):
     """A modal screen for truncating a column with live row count."""
@@ -1213,6 +1215,14 @@ class DbMan(App):
     """A vim-like database browser powered by SQLAlchemy."""
 
     TITLE = "dbman"
+
+    def get_theme_variable_defaults(self) -> dict[str, str]:
+        """dbman's own theme variables, with the values every theme falls
+        back to; a Theme can override them through its `variables`.
+        The key-column background is a translucent grey so it reads as grey
+        on light and dark themes alike."""
+        return {"dbman-key-column-background": "#80808033"}
+
     CSS = """
     Screen {
         background: $surface;
@@ -1242,6 +1252,10 @@ class DbMan(App):
     }
     DataTable:focus {
         border: double $accent;
+    }
+    /* Pinned key columns (table_model.arrange -> fixed_columns). */
+    #data-table > .datatable--fixed {
+        background: $dbman-key-column-background;
     }
     #sql-view, #diagram-view {
         height: 1fr;
@@ -1781,6 +1795,7 @@ class DbMan(App):
 
             if item_type == "plugin":
                 table_widget.clear(columns=True)
+                table_widget.fixed_columns = 0
                 self.row_keys = {}
                 self.raw_docs = {}
                 self.row_values = {}
@@ -1830,6 +1845,7 @@ class DbMan(App):
                 # select/status column filtered with a non-matching value.
                 if page is not None:
                     table_widget.clear(columns=True)
+                    table_widget.fixed_columns = 0
                     self.row_keys = {}
                     self.raw_docs = {}
                     self.row_values = {}
@@ -1841,7 +1857,10 @@ class DbMan(App):
 
                     view_settings = self.view_settings.get(name)
                     page_columns, page_rows = self._with_computed_columns(name, page.columns, page.rows)
-                    display_columns, display_rows = apply_view_settings(page_columns, page_rows, view_settings)
+                    # Key columns come first and stay put (DataTable's fixed
+                    # columns, themed by $dbman-key-column-background).
+                    display_columns, display_rows, pinned = table_model.arrange(page_columns, page_rows, view_settings)
+                    table_widget.fixed_columns = pinned
                     column_widths = compute_column_widths(display_columns, display_rows, view_settings)
                     self.column_widths = column_widths
                     # What each column *would* be without its override, so
@@ -1870,7 +1889,7 @@ class DbMan(App):
 
                     for i, col in enumerate(display_columns):
                         color = COLORS[i % len(COLORS)]
-                        label = f"[{color}]{col.name}[/]"
+                        label = Text(header_text(col), style=color).markup
                         if col.name in self.filters:
                             label = f"[reverse]{label} (F)[/]"
                         if self.sort and self.sort[0][0] == col.name:
@@ -1894,6 +1913,7 @@ class DbMan(App):
             else:
                 # Schema mode
                 table_widget.clear(columns=True)
+                table_widget.fixed_columns = 0
                 self.row_keys = {}
                 self.raw_docs = {}
                 self.row_values = {}
@@ -2069,6 +2089,12 @@ class DbMan(App):
         new_idx = idx + direction
         if new_idx < 0 or new_idx >= len(columns):
             return
+        # Key columns are pinned left (table_model.arrange), so a move into
+        # or out of them would only snap back on the reload.
+        pinned = table_widget.fixed_columns
+        if idx < pinned or new_idx < pinned:
+            self.notify("Key columns stay pinned to the left", severity="warning")
+            return
         columns[idx], columns[new_idx] = columns[new_idx], columns[idx]
         settings = self.view_settings.get(self.current_item)
         settings.order = columns
@@ -2218,9 +2244,15 @@ class DbMan(App):
             self.notify(f"No metadata for column '{column_name}'", severity="error")
             return
 
+        function = next(
+            (b.function for b in computed.read_bindings(self.view_settings.connection, self.current_item)
+             if b.name == column_name),
+            None,
+        ) if column.source == computed.SOURCE else None
         table = ColumnMetadataTable(
             column, self.current_item, self.view_settings,
             visible_column_count=len(self.focused.ordered_columns),
+            computed_function=function,
             auto_width=self.auto_column_widths.get(column_name),
             fit_width=self.fit_column_widths.get(column_name),
         )
@@ -2510,7 +2542,7 @@ class DbMan(App):
             return
         coord = self.focused.cursor_coordinate
         column_name = self.focused.ordered_columns[coord.column].key.value
-        if column_name in self._computed_names(self.current_item):
+        if self._is_computed(column_name):
             self.notify(f"'{column_name}' is computed by dbman - the database can't filter on it; try / to search", severity="error")
             return
         current_filter = self.filters.get(column_name, "")
@@ -2565,7 +2597,7 @@ class DbMan(App):
             return
         coord = self.focused.cursor_coordinate
         column_name = self.focused.ordered_columns[coord.column].key.value
-        if column_name in self._computed_names(self.current_item):
+        if self._is_computed(column_name):
             self.notify(f"'{column_name}' is computed by dbman - the database can't sort on it", severity="error")
             return
         current = self.sort[0] if self.sort else None
@@ -3170,22 +3202,28 @@ class DbMan(App):
             except Exception as e:
                 self.notify(f"pbcopy failed: {e}", severity="warning")
 
+    def _is_computed(self, column_name):
+        column = self.columns_by_name.get(column_name)
+        return column is not None and column.source == computed.SOURCE
+
     def _computed_names(self, item):
         return {b.name for b in computed.read_bindings(self.view_settings.connection, item)}
 
     def _with_computed_columns(self, item, columns, rows, notify=True):
-        """Append item's computed columns (computed.py) to a fetched page.
-        A broken binding or function never fails the load: it's reported
-        once per load as a warning and the cells show computed.ERROR_VALUE."""
+        """A fetched page as dbman's table (table_model.source_table): the
+        provider's columns stamped with this connection's name, then item's
+        computed columns. A broken binding or function never fails the
+        load: it's reported once per load as a warning and the cells show
+        computed.ERROR_VALUE."""
         try:
             bindings = computed.read_bindings(self.view_settings.connection, item)
         except Exception as e:
             if notify:
                 self.notify(f"Computed columns unavailable: {e}", severity="warning")
-            return columns, rows
-        if not bindings:
-            return columns, rows
-        columns, rows, errors = computed.apply_computed(columns, rows, bindings)
+            bindings = []
+        columns, rows, errors = table_model.source_table(
+            columns, rows, self.view_settings.connection, bindings,
+        )
         if notify:
             for message in errors:
                 self.notify(message, severity="warning")

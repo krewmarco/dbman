@@ -135,7 +135,9 @@ class CouchDBProvider(Provider):
         for key in ranked:
             types = seen_types[key]
             type_name = types.pop() if len(types) == 1 else "mixed"
-            columns.append(Column(name=key, type_name=type_name, inferred=True))
+            # _id is the document's key: the one field every document has
+            # and the one CouchDB addresses it by.
+            columns.append(Column(name=key, type_name=type_name, inferred=True, primary_key=(key == "_id")))
         return columns
 
     # -- Provider interface --------------------------------------------------

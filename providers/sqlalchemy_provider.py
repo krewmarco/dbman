@@ -129,7 +129,7 @@ class SqlAlchemyProvider(Provider):
     def get_page(self, name, item_type, filters, cursor, page_size, sort=None) -> RowPage:
         metadata = MetaData()
         table = Table(name, metadata, autoload_with=self.engine)
-        col_objs = [Column(name=c.name, type_name=str(c.type)) for c in table.columns]
+        col_objs = [Column(name=c.name, type_name=str(c.type), primary_key=c.primary_key) for c in table.columns]
         filter_clauses = self._build_filter_clause(table, filters)
         offset = int(cursor) if cursor else 0
         # Fetch one extra row so we can tell whether another page follows,

@@ -8,10 +8,10 @@ dbman.sqlite, so a project's functions travel with its config rather than
 with dbman. The function gets one row as a {column: value} dict and returns
 the cell's value; None shows as an empty cell.
 
-Applied in `load_item` after `get_page` and before `apply_view_settings`,
-so a computed column hides, reorders, sizes, searches and exports like any
-other. The provider never sees it, which is why filtering and sorting on it
-are refused.
+Applied by table_model.source_table, right after `get_page` and before
+view settings, so a computed column hides, reorders, sizes, searches and
+exports like any other. The provider never sees it, which is why filtering
+and sorting on it are refused.
 """
 import importlib
 import sys
@@ -24,6 +24,8 @@ from providers.base import Column
 
 PLUGIN_DIR = "dbman_plugins"
 ERROR_VALUE = "#ERR"
+# Column.source for a column dbman computes (see providers/base.py).
+SOURCE = "computed"
 
 
 @dataclass(frozen=True)
@@ -110,6 +112,6 @@ def apply_computed(columns: list[Column], rows: list, bindings: list[ComputedCol
                 extra.append(ERROR_VALUE)
         out_rows.append(tuple(row) + tuple(extra))
     new_columns = list(columns) + [
-        Column(name=b.name, type_name="TEXT", read_only=True) for b, _ in loaded
+        Column(name=b.name, type_name="TEXT", read_only=True, source=SOURCE) for b, _ in loaded
     ]
     return new_columns, out_rows, errors

@@ -7,16 +7,19 @@ it, so every column-level property had to claim a top-level key of its own
 (`z` hide, `w` width, `o` sort). That namespace is finite and was filling
 up; here, adding a property is adding a row.
 
-Distinct from editing the *table's* schema, which is what Schema mode (`m`)
-shows - these are dbman's own display settings for one column, persisted to
-dbman.sqlite via ViewSettingsStore, plus the provider facts that explain
-why some of them are there at all.
+Distinct from the *provider* schema, which is what Schema mode (`m`) shows:
+the backend's own columns as it declares them. This is the column as part of
+dbman's table - where its data comes from (Source: a connection's name, or
+computed by dbman), whether it's the key, and dbman's own display settings
+for it, persisted to dbman.sqlite via ViewSettingsStore.
 
 See PLANNING_space-vs-edit-keybinding.md, whose follow-on section proposed
 exactly this slot for per-column configuration.
 """
 from rich.text import Text
 
+import computed
+from cell_render import COMPUTED_GLYPH, KEY_GLYPH
 from providers.base import Column, ColumnOption
 from virtual_table import RowEdit, VirtualRow, VirtualTable
 
@@ -48,8 +51,11 @@ class ColumnMetadataTable(VirtualTable):
     # Colored row only makes sense once you can see the column has options)
     # and because a read-only column is worth knowing before you try to edit.
     def __init__(self, column: Column, item_name: str, view_settings_store,
-                 visible_column_count: int, auto_width=None, fit_width=None):
+                 visible_column_count: int, auto_width=None, fit_width=None,
+                 computed_function=None):
         self.column = column
+        # The "module:func" behind a computed column, shown as its Source.
+        self.computed_function = computed_function
         self.item_name = item_name
         self.store = view_settings_store
         self.settings = view_settings_store.get(item_name)
@@ -77,13 +83,25 @@ class ColumnMetadataTable(VirtualTable):
             return Text(strategy)
         return Text.assemble(strategy, (f" ({number})", "grey62"))
 
+    def _source_value(self):
+        source = self.column.source or "?"
+        if source != computed.SOURCE:
+            return Text(source, style="grey62")
+        detail = f" ({self.computed_function})" if self.computed_function else ""
+        return Text(f"{COMPUTED_GLYPH} computed{detail}", style="grey62")
+
     def _sort_value(self):
         name = self._sort_name()
         return NONE if name == "none" else Text(name)
 
     def rows(self) -> list[VirtualRow]:
         col = self.column
-        rows = [
+        rows = [VirtualRow(None, [Text("Source", style="grey62"), self._source_value()])]
+        if col.primary_key and col.source != computed.SOURCE:
+            rows.append(VirtualRow(None, [
+                Text("Key", style="grey62"), Text(f"{KEY_GLYPH} primary key, pinned left", style="grey62"),
+            ]))
+        rows += [
             VirtualRow(None, [Text("Type", style="grey62"), Text(str(col.type_name), style="grey62")]),
             VirtualRow(None, [Text("Editable", style="grey62"), (NO if col.read_only else YES)]),
         ]
