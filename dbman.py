@@ -36,6 +36,7 @@ from column_meta import ColumnMetadataTable
 from workspace import WorkspaceStore, ConnectionSession
 import computed
 import table_model
+from form_view import FormField, FormView
 
 __version__ = "0.2.0"
 
@@ -151,7 +152,7 @@ class ShortcutsScreen(ModalScreen):
                 " q: Quit\n"
                 " tab: Cycle focus (Sidebar -> Main Area)\n"
                 " shift+tab: Jump to next sidebar section\n"
-                " m: Toggle View/Schema/SQL/Diag mode\n"
+                " m: Cycle View / Form / Diagram mode\n"
                 " r: Reload current table/view from the database\n"
                 " c: Switch connection (pick from dbman.sqlite, j/k + enter)\n"
                 " ?: Toggle this Shortcuts panel\n"
@@ -165,12 +166,14 @@ class ShortcutsScreen(ModalScreen):
                 " \\] / \\[: Fetch next / previous page of rows from the DB (View mode)\n\n"
                 " [bold]Editing & Filtering[/]\n"
                 " e: Edit selected cell/row (View mode) or SQL (SQL mode)\n"
+                "    Multi-line text opens a multi-line editor\n"
                 "    Columns with a fixed option set open a picker table (space toggles,\n"
                 "    f filters the options, enter saves)\n"
                 " E: Edit whole document as JSON (document DB providers)\n"
                 " space: Open the selected row (row select mode): a Notion row in the\n"
                 "    browser, a dbman.sqlite connections row connects to it;\n"
-                "    in field mode, open the focused cell if it's a URL\n"
+                "    in field mode, view the whole cell in a scrollable page\n"
+                "    (e there edits it, o opens a URL in the browser)\n"
                 " a: Add a new row (table) or create a new Table/View (where supported;\n"
                 "    also works on a TABLES/VIEWS sidebar header, even when empty)\n"
                 " a / A: In column mode, add a computed column right / left of the selected\n"
@@ -191,6 +194,13 @@ class ShortcutsScreen(ModalScreen):
                 " t: Truncate/Shorten Column data (View mode only)\n"
 
 
+                " [bold]Form mode (m)[/]\n"
+                " The grid's cursor row as a page of fields, values in full; same\n"
+                "    hidden columns, order, filters and sort as the grid\n"
+                " j / k: Next / previous field    J / K: Next / previous record\n"
+                " e / enter: Edit the field (text in place; others open their editor)\n"
+                " escape / tab: Leave the field, saving it\n"
+                " ctrl+n / ctrl+p: Save, then next / previous record, still editing\n\n"
                 " [bold]Select Mode (View mode only)[/]\n"
                 " s: Rotate select mode: field -> row -> column -> field\n"
                 " e: In column mode, opens that column's properties (source, hidden,\n"
@@ -444,6 +454,131 @@ class EditCellScreen(ModalScreen):
         self.dismiss(None)
 
 
+def _typed_input(col, text):
+    """Typed text as the value to write: blank is None, and a number column
+    gets an int/float when the text is one. A text column keeps what was
+    typed: coercing "007" to 7 would drop the zeros, silently, and write the
+    result back (a CSV file, say). SQLite's own text-affinity rule; Notion's
+    rich_text/title match too."""
+    if text.strip() == "":
+        return None
+    type_name = (col.type_name or "").upper() if col is not None else ""
+    if any(t in type_name for t in ("CHAR", "CLOB", "TEXT")):
+        return text
+    try:
+        return float(text) if "." in text else int(text)
+    except ValueError:
+        return text
+
+
+def _is_url(value) -> bool:
+    return isinstance(value, str) and value.strip().startswith(("http://", "https://"))
+
+
+class CellViewerScreen(ModalScreen):
+    """space in field mode: the focused cell's whole value, untruncated, in
+    a scrollable page - the cell-level "see it more truly". Multi-line text
+    keeps its line breaks and a dict/list is pretty-printed JSON. Read-only;
+    'e' dismisses with "edit" so the caller can go straight to the cell's
+    editor (whichever one it has) without closing first, and 'o' opens a
+    URL value in the browser."""
+    CSS = """
+    CellViewerScreen {
+        background: rgba(0, 0, 0, 0.5);
+        align: center middle;
+    }
+    #cell-viewer-dialog {
+        background: $panel;
+        border: thick $primary;
+        padding: 1 2;
+        width: 80%;
+        height: auto;
+        max-height: 80%;
+    }
+    #cell-viewer-title {
+        text-style: bold;
+        margin-bottom: 1;
+    }
+    #cell-viewer-scroll {
+        height: auto;
+        max-height: 1fr;
+    }
+    #cell-viewer-hint {
+        color: $text-muted;
+        margin-top: 1;
+    }
+    """
+    BINDINGS = [
+        Binding("escape,q,space", "close", "Close"),
+        Binding("e", "edit", "Edit"),
+        Binding("o", "open_url", "Open URL"),
+        Binding("j", "scroll_down", show=False),
+        Binding("k", "scroll_up", show=False),
+        Binding("g", "scroll_home", show=False),
+        Binding("G", "scroll_end", show=False),
+    ]
+
+    def __init__(self, title, value, editable=True):
+        super().__init__()
+        self.title_text = title
+        self.value = value
+        self.editable = editable
+
+    def _text(self) -> str:
+        if self.value is None:
+            return "(null)"
+        if isinstance(self.value, (dict, list)):
+            return json.dumps(self.value, indent=2, ensure_ascii=False)
+        text = str(self.value)
+        return text if text != "" else "(empty)"
+
+    def compose(self) -> ComposeResult:
+        hints = ["space/esc close"]
+        if self.editable:
+            hints.append("e edit")
+        if _is_url(self.value):
+            hints.append("o open in browser")
+        with Vertical(id="cell-viewer-dialog"):
+            yield Label(self.title_text, id="cell-viewer-title", markup=False)
+            with VerticalScroll(id="cell-viewer-scroll"):
+                yield Static(self._text(), markup=False)
+            yield Label(" · ".join(hints), id="cell-viewer-hint")
+
+    def on_mount(self):
+        self.query_one("#cell-viewer-scroll").focus()
+
+    def action_close(self):
+        self.dismiss(None)
+
+    def action_edit(self):
+        if not self.editable:
+            self.notify("This cell is read-only", severity="warning")
+            return
+        self.dismiss("edit")
+
+    def action_open_url(self):
+        if not _is_url(self.value):
+            self.notify("Nothing to open - this cell isn't a URL", severity="warning")
+            return
+        webbrowser.open(self.value.strip())
+        self.notify("Opened in browser")
+
+    def _scroll(self, method):
+        getattr(self.query_one("#cell-viewer-scroll"), method)()
+
+    def action_scroll_down(self):
+        self._scroll("scroll_down")
+
+    def action_scroll_up(self):
+        self._scroll("scroll_up")
+
+    def action_scroll_home(self):
+        self._scroll("scroll_home")
+
+    def action_scroll_end(self):
+        self._scroll("scroll_end")
+
+
 class TruncateColumnScreen(ModalScreen):
     """A modal screen for truncating a column with live row count."""
     CSS = """
@@ -692,9 +827,10 @@ class EditTextScreen(ModalScreen):
         margin-left: 1;
     }
     """
-    def __init__(self, title, initial_text="", language="sql", validate=None):
+    def __init__(self, title, initial_text="", language="sql", validate=None, submit_label="Execute"):
         super().__init__()
         self.title_text = title
+        self.submit_label = submit_label
         self.initial_text = initial_text
         self.language = language
         # Optional text -> error message (or None). An invalid edit keeps
@@ -709,7 +845,7 @@ class EditTextScreen(ModalScreen):
             yield TextArea(self.initial_text, id="sql-editor", language=self.language)
             with Horizontal(id="edit-sql-buttons"):
                 yield Button("Cancel", id="cancel-edit-sql")
-                yield Button("Execute", variant="success", id="apply-edit-sql")
+                yield Button(self.submit_label, variant="success", id="apply-edit-sql")
 
     def on_mount(self):
         self.query_one(TextArea).focus()
@@ -1063,9 +1199,8 @@ def _open_row_ctx(app):
     """space = "see it more truly" (PLANNING_space-vs-edit-keybinding.md).
     Row mode opens the selected row wherever its provider says it leads -
     per item via can_open_row, not a Capabilities flag, since in
-    dbman.sqlite only `connections` rows open anywhere. Field mode opens the
-    focused cell if its value is a URL; whether it is is only known per
-    cell, so it's always offered there and action_open_row explains a miss."""
+    dbman.sqlite only `connections` rows open anywhere. Field mode shows the
+    focused cell's whole value (CellViewerScreen), which every cell has."""
     if app.mode != "view" or not app.current_item or not isinstance(app.focused, DataTable):
         return False
     if app.select_mode == "field":
@@ -1319,7 +1454,7 @@ class DbMan(App):
         Binding("G", "scroll_end", "End", show=False),
         Binding("tab", "switch_focus", "Sidebar/Main"),
         Binding("shift+tab", "jump_section", "Jump Section"),
-        Binding("m", "toggle_mode", "View/Schema/SQL/Diag Mode", show=False),
+        Binding("m", "toggle_mode", "View/Form/Diag Mode", show=False),
         Binding("r", "reload", "Reload", show=False),
         Binding("c", "switch_connection", "Switch Connection"),
         Binding("d", "delete_item", "Delete"),
@@ -1498,6 +1633,7 @@ class DbMan(App):
                 yield ListView(id="sidebar-list")
             with ContentSwitcher(initial="data-table"):
                 yield DataTable(id="data-table")
+                yield FormView(id="form-view")
                 yield Static("", id="sql-view")
                 yield DiagramView(self.provider, id="diagram-view")
         yield Footer()
@@ -1718,7 +1854,8 @@ class DbMan(App):
         if session.item_name not in available.get(session.item_type, []):
             return False
 
-        self.mode = session.mode
+        # Schema/SQL left the m cycle; a session saved in one opens in View.
+        self.mode = session.mode if session.mode in ("view", "form", "diagram") else "view"
         self.select_mode = session.select_mode
         self.load_item(session.item_name, session.item_type)
 
@@ -1731,6 +1868,8 @@ class DbMan(App):
                 )
             except Exception:
                 pass
+            if self.mode == "form":
+                self._render_form()
         return True
 
     async def action_quit(self) -> None:
@@ -1742,7 +1881,7 @@ class DbMan(App):
         if self.workspace is None or self.current_item is None:
             return
         cursor_row = cursor_col = None
-        if self.mode == "view":
+        if self.mode in ("view", "form"):
             try:
                 coord = self.query_one("#data-table", DataTable).cursor_coordinate
                 cursor_row, cursor_col = coord.row, coord.column
@@ -1816,7 +1955,7 @@ class DbMan(App):
             diag_widget.refresh_diagram()
             if should_focus:
                 diag_widget.focus()
-        elif self.mode in ["view", "schema"] or item_type == "plugin":
+        elif self.mode in ["view", "form", "schema"] or item_type == "plugin":
             sidebar.display = True
             switcher.current = "data-table"
             # A full rebuild is about to replace this table's rows - commit
@@ -1850,7 +1989,9 @@ class DbMan(App):
                         for v in row
                     ]
                     table_widget.add_row(*cells, key=str(i))
-            elif self.mode == "view":
+            elif self.mode in ("view", "form"):
+                # Form mode loads the grid exactly as View mode does and
+                # shows its cursor row - see _render_form.
                 # Seed from this table/view's persisted sort (ViewSettingsStore)
                 # only if nothing's been explicitly set yet this session (e.g.
                 # just switched to this item) - action_sort_column already
@@ -1976,13 +2117,18 @@ class DbMan(App):
 
             table_widget.cursor_type = self._cursor_type_for_select_mode() if self.mode == "view" else "cell"
 
-            if should_focus:
-                table_widget.focus()
             if saved_coord:
                 try:
                     table_widget.move_cursor(row=saved_coord.row, column=saved_coord.column)
                 except:
                     pass
+            if self.mode == "form" and item_type != "plugin":
+                switcher.current = "form-view"
+                self._render_form()
+                if should_focus:
+                    self.query_one("#form-view", FormView).focus()
+            elif should_focus:
+                table_widget.focus()
         else:
             # SQL mode
             sidebar.display = True
@@ -2006,15 +2152,19 @@ class DbMan(App):
 
     def update_title(self):
         page_indicator = ""
-        if self.mode == "view":
+        if self.mode == "form":
+            table = self.query_one("#data-table", DataTable)
+            if table.row_count:
+                page_indicator = f" [record {table.cursor_row + 1}/{table.row_count}]"
+        if self.mode in ("view", "form"):
             page_num = len(self.page_history) + 1
             if page_num > 1 or self.page_has_more:
-                page_indicator = f" [page {page_num}{'+' if self.page_has_more else ''}]"
+                page_indicator += f" [page {page_num}{'+' if self.page_has_more else ''}]"
         select_indicator = (
             f" [{self.select_mode.upper()}]" if self.mode == "view" and self.select_mode != "field" else ""
         )
         sort_indicator = ""
-        if self.mode == "view" and self.sort:
+        if self.mode in ("view", "form") and self.sort:
             col_name, direction = self.sort[0]
             sort_indicator = f" [sort: {col_name} {'asc' if direction == 'asc' else 'desc'}]"
         search_indicator = ""
@@ -2034,6 +2184,8 @@ class DbMan(App):
                 switcher = self.query_one(ContentSwitcher)
                 if switcher.current == "data-table":
                     self.query_one("#data-table").focus()
+                elif switcher.current == "form-view":
+                    self.query_one("#form-view").focus()
                 elif switcher.current == "sql-view":
                     self.query_one("#sql-view").focus()
                 elif switcher.current == "diagram-view":
@@ -2070,15 +2222,20 @@ class DbMan(App):
         if self.current_type == "plugin":
             self.notify("Plugins only have View mode", severity="error")
             return
-        modes = ["view", "schema", "sql", "diagram"]
+        # m cycles ways of looking at the rows. Schema and SQL are the
+        # object's definition, not its rows, and are meant to be reached
+        # by 'e' on the table/view itself - not built yet, so their
+        # load_item branches stay but nothing in the cycle leads to them.
+        modes = ["view", "form", "diagram"]
         if not self.provider.capabilities.diagram:
             modes = [m for m in modes if m != "diagram"]
-        idx = modes.index(self.mode)
+        idx = modes.index(self.mode) if self.mode in modes else -1
+        main_focused = self.focused is not None and self.focused.id != "sidebar-list"
         self.mode = modes[(idx + 1) % len(modes)]
         self.refresh_bindings()
         self.refresh_sidebar()
         if self.current_item:
-            self.load_item(self.current_item, self.current_type)
+            self.load_item(self.current_item, self.current_type, should_focus=main_focused)
 
     def action_rotate_select_mode(self):
         """Rotate field -> row -> column -> field. Determines what the cursor
@@ -2681,7 +2838,7 @@ class DbMan(App):
         self.notify("All filters cleared")
 
     def action_next_page(self):
-        if self.mode != "view" or not self.current_item:
+        if self.mode not in ("view", "form") or not self.current_item:
             return
         if not self.page_has_more:
             self.notify("No more rows")
@@ -2691,7 +2848,7 @@ class DbMan(App):
         self.load_item(self.current_item, self.current_type)
 
     def action_prev_page(self):
-        if self.mode != "view" or not self.current_item:
+        if self.mode not in ("view", "form") or not self.current_item:
             return
         if not self.page_history:
             self.notify("Already at first page")
@@ -2849,20 +3006,28 @@ class DbMan(App):
             self.action_edit_column()
             return
 
+        if self.focused.row_count == 0:
+            self.notify("No row to edit", severity="error")
+            return
+        coord = self.focused.cursor_coordinate
+        column_name = self.focused.ordered_columns[coord.column].key.value
+        row_id_str = list(self.focused.rows.values())[coord.row].key.value
+        # Prefer the untruncated value: the DataTable cell may hold a
+        # display-only ".."-truncated string (see view_settings.truncate_rows).
+        current_value = self.row_values.get(row_id_str, {}).get(column_name, self.focused.get_cell_at(coord))
+        self._edit_field(row_id_str, column_name, current_value)
+
+    def _edit_field(self, row_id_str, column_name, current_value):
+        """Edit one field of one loaded row, with whichever editor its
+        column calls for. Shared by the grid's field mode and form mode;
+        every save path reloads through load_item, which redraws either."""
         if self.current_type == "view":
-            self.notify("Cannot edit Views directly (press 'e' in SQL mode to edit View SQL)", severity="error")
+            self.notify("Cannot edit Views directly", severity="error")
             return
         if not self.rows_editable:
             self.notify("Cannot edit tables without identifiable rows (yet)", severity="error")
             return
-
-        coord = self.focused.cursor_coordinate
-        column_name = self.focused.ordered_columns[coord.column].key.value
-        row_id_str = list(self.focused.rows.values())[coord.row].key.value
         row_key = self.row_keys.get(row_id_str)
-        # Prefer the untruncated value: the DataTable cell may hold a
-        # display-only ".."-truncated string (see view_settings.truncate_rows).
-        current_value = self.row_values.get(row_id_str, {}).get(column_name, self.focused.get_cell_at(coord))
 
         if row_key is None or row_key.value is None:
             self.notify("Cannot edit tables without identifiable rows (yet)", severity="error")
@@ -2931,28 +3096,22 @@ class DbMan(App):
             self.push_screen(LookupSelectScreen(f"Select {column_name}", options, current_value), perform_lookup_update)
             return
 
-        # A text column keeps what was typed: coercing "007" to 7 would drop
-        # the zeros, silently, and write the result back (a CSV file, say).
-        # SQLite's own text-affinity rule; Notion's rich_text/title match too.
-        type_name = (col.type_name or "").upper() if col is not None else ""
-        text_column = any(t in type_name for t in ("CHAR", "CLOB", "TEXT"))
-
         def perform_update(new_value):
             if new_value is not None:
-                typed_value = new_value
-                if new_value.strip() == "":
-                    typed_value = None
-                elif not text_column:
-                    try:
-                        if "." in new_value: typed_value = float(new_value)
-                        else: typed_value = int(new_value)
-                    except ValueError: pass
+                typed_value = _typed_input(col, new_value)
                 try:
                     self.provider.update_cell(self.current_item, self.current_type, row_key, column_name, typed_value)
                     self.notify("Updated")
                     self.load_item(self.current_item, self.current_type)
                 except Exception as e:
                     self.notify(f"Update failed: {e}", severity="error")
+        if isinstance(current_value, str) and "\n" in current_value:
+            # A one-line Input would flatten the line breaks on save.
+            self.push_screen(
+                EditTextScreen(f"Edit {column_name}", current_value, language=None, submit_label="Save"),
+                perform_update,
+            )
+            return
         self.push_screen(EditCellScreen(current_value), perform_update)
 
     def action_edit_document(self):
@@ -2995,7 +3154,7 @@ class DbMan(App):
         """space in row select mode: open the selected row where its
         provider says it leads (Provider.open_row) - a url in the browser,
         or, for a dbman.sqlite `connections` row, that connection. In field
-        mode, open the focused cell if it holds a URL."""
+        mode, show the focused cell's whole value (_view_cell)."""
         if not isinstance(self.focused, DataTable) or not self.current_item:
             return
         if not self.focused.row_count:
@@ -3003,14 +3162,7 @@ class DbMan(App):
         coord = self.focused.cursor_coordinate
         row_id_str = list(self.focused.rows.values())[coord.row].key.value
         if self.select_mode == "field":
-            # The untruncated value, so a URL cut short on screen opens whole.
-            column_name = self.focused.ordered_columns[coord.column].key.value
-            value = str(self.row_values.get(row_id_str, {}).get(column_name) or "").strip()
-            if value.startswith(("http://", "https://")):
-                webbrowser.open(value)
-                self.notify("Opened in browser")
-            else:
-                self.notify("Nothing to open - this cell isn't a URL", severity="warning")
+            self._view_cell(coord, row_id_str)
             return
         row_key = self.row_keys.get(row_id_str)
         if row_key is None or row_key.value is None:
@@ -3033,6 +3185,34 @@ class DbMan(App):
                 # The same path as picking it from 'c', including leaving
                 # the app untouched if the connect fails.
                 self._on_switch_connection_selected(target.value)
+
+    def _view_cell(self, coord, row_id_str):
+        """Field-mode space: show the focused cell's whole, untruncated
+        value (self.row_values, not the ".."-shortened DataTable cell) in
+        CellViewerScreen. 'e' there hands off to action_edit_cell - the
+        DataTable cursor hasn't moved, so it edits this same cell with
+        whichever editor it would have got (text, picker, JSON, lookup)."""
+        column_name = self.focused.ordered_columns[coord.column].key.value
+        values = self.row_values.get(row_id_str, {})
+        value = values[column_name] if column_name in values else self.focused.get_cell_at(coord)
+        col = self.columns_by_name.get(column_name)
+        row_key = self.row_keys.get(row_id_str)
+        editable = (
+            self.current_type == "table" and self.rows_editable
+            and row_key is not None and row_key.value is not None
+            and not (col is not None and col.read_only)
+        )
+        if col is not None and col.multi_value and isinstance(value, (list, tuple)):
+            value = "\n".join(str(v) for v in value)
+
+        def on_close(result):
+            if result == "edit":
+                self.action_edit_cell()
+
+        self.push_screen(
+            CellViewerScreen(f"{self.current_item} · {column_name}", value, editable=editable),
+            on_close,
+        )
 
     def _open_document_editor(self, row_key, raw_doc):
         """Shared by action_edit_document (existing row) and _add_row
@@ -3334,6 +3514,108 @@ class DbMan(App):
                 subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True, timeout=2)
             except Exception as e:
                 self.notify(f"pbcopy failed: {e}", severity="warning")
+
+    # -- Form mode -----------------------------------------------------
+    # The grid stays loaded behind the form; the record shown is the grid's
+    # cursor row, so filters, sort, hidden columns and order all carry over
+    # and leaving the form leaves the grid on the same row.
+
+    def _form_row_id(self):
+        table = self.query_one("#data-table", DataTable)
+        if not table.row_count or table.cursor_row >= len(self.row_order):
+            return None
+        return self.row_order[table.cursor_row]
+
+    def _form_inline_note(self, col, value, row_key):
+        """None if the field is edited in place as text, else why not."""
+        if self.current_type != "table" or not self.rows_editable or row_key is None or row_key.value is None:
+            return "read-only"
+        if col.source == computed.SOURCE:
+            return "computed"
+        if col.read_only:
+            return "read-only"
+        if col.options:
+            return "e: pick"
+        if isinstance(value, (dict, list)):
+            return "e: edit JSON"
+        if self.lookup_plugin and self.lookup_plugin.get_lookup_config(self.current_item, col.name):
+            return "e: pick"
+        return None
+
+    def _render_form(self, edit_current=False):
+        form = self.query_one("#form-view", FormView)
+        row_id = self._form_row_id()
+        if row_id is None:
+            form.show([FormField("", "No records", None, "", False)])
+            self.update_title()
+            return
+        values = self.row_values.get(row_id, {})
+        row_key = self.row_keys.get(row_id)
+        fields = []
+        for name, col in self.columns_by_name.items():
+            value = values.get(name)
+            if value is None:
+                text = ""
+            elif isinstance(value, (dict, list)):
+                text = json.dumps(value, indent=2, ensure_ascii=False)
+            else:
+                text = str(value)
+            note = self._form_inline_note(col, value, row_key)
+            fields.append(FormField(name, header_text(col), value, text, note is None, note or ""))
+        form.show(fields, edit_current=edit_current)
+        self.update_title()
+
+    def form_commit(self, column_name, text):
+        """Save one in-place field edit. Returns whether it saved; on False
+        the editor keeps the typed text so nothing is lost."""
+        row_id = self._form_row_id()
+        row_key = self.row_keys.get(row_id) if row_id else None
+        col = self.columns_by_name.get(column_name)
+        if row_key is None or col is None:
+            return False
+        value = _typed_input(col, text)
+        try:
+            self.provider.update_cell(self.current_item, self.current_type, row_key, column_name, value)
+        except Exception as e:
+            self.notify(f"Update failed: {e}", severity="error")
+            return False
+        # No reload: that would rebuild the form under the cursor. The grid
+        # reloads when you leave form mode.
+        self.row_values[row_id][column_name] = value
+        self.notify(f"Saved {column_name}", timeout=1.5)
+        return True
+
+    def form_step(self, delta, edit_current=False):
+        """Next/previous record, crossing into the next/previous DB page."""
+        table = self.query_one("#data-table", DataTable)
+        row = table.cursor_row + delta
+        if 0 <= row < table.row_count:
+            table.move_cursor(row=row)
+        elif row >= table.row_count and self.page_has_more:
+            self.action_next_page()
+            table.move_cursor(row=0)
+        elif row < 0 and self.page_history:
+            self.action_prev_page()
+            table.move_cursor(row=max(table.row_count - 1, 0))
+        else:
+            self.notify("Last record" if delta > 0 else "First record")
+            return
+        self._render_form(edit_current=edit_current)
+
+    def form_edit_other(self, field):
+        """e on a field that isn't edited in place: the same editor field
+        mode's e opens (picker, JSON, lookup), or its refusal."""
+        row_id = self._form_row_id()
+        if row_id is None or not field.name:
+            return
+        if self._is_computed(field.name):
+            self.notify(f"'{field.name}' is computed", severity="error")
+            return
+        col = self.columns_by_name.get(field.name)
+        if col is not None and col.read_only:
+            self.notify(f"Column '{field.name}' is read-only", severity="error")
+            return
+        self._edit_field(row_id, field.name, field.value)
 
     def _is_computed(self, column_name):
         column = self.columns_by_name.get(column_name)
