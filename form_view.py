@@ -71,6 +71,7 @@ class FormView(VerticalScroll, can_focus=True):
         Binding("J", "record(1)", "Next Record"),
         Binding("K", "record(-1)", "Prev Record"),
         Binding("e,enter", "edit", "Edit Field"),
+        Binding("space", "open", "Open"),
     ]
 
     DEFAULT_CSS = """
@@ -155,6 +156,7 @@ class FormView(VerticalScroll, can_focus=True):
     def _mark_current(self, scroll: bool = True) -> None:
         for i, box in enumerate(self._boxes):
             box.set_class(i == self.current, "-current")
+        self.refresh_bindings()  # whether space opens depends on the field
         if scroll and self._boxes:
             self.call_after_refresh(self.scroll_to_widget, self._boxes[self.current], animate=False)
 
@@ -182,6 +184,16 @@ class FormView(VerticalScroll, can_focus=True):
             value.move_cursor(value.document.end)
         else:
             self.app.form_edit_other(self.fields[self.current])
+
+    def action_open(self) -> None:
+        if self.fields:
+            self.app.form_open(self.fields[self.current])
+
+    def check_action(self, action: str, parameters) -> bool | None:
+        if action == "open":
+            # Greyed (None), not hidden, when this field has nothing to open.
+            return True if self.fields and self.app.form_can_open(self.fields[self.current]) else None
+        return True
 
     # The app's j/k/g/G bindings call these on whatever has focus.
     def action_cursor_down(self) -> None: self.action_field(1)

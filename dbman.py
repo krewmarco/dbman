@@ -200,7 +200,9 @@ class ShortcutsScreen(ModalScreen):
                 " j / k: Next / previous field    J / K: Next / previous record\n"
                 " e / enter: Edit the field (text in place; others open their editor)\n"
                 " escape / tab: Leave the field, saving it\n"
-                " ctrl+n / ctrl+p: Save, then next / previous record, still editing\n\n"
+                " ctrl+n / ctrl+p: Save, then next / previous record, still editing\n"
+                " space: Open the field's URL in the browser; on another field, open the\n"
+                "    record where the provider supports it (a Notion row, a connection)\n\n"
                 " [bold]Select Mode (View mode only)[/]\n"
                 " s: Rotate select mode: field -> row -> column -> field\n"
                 " e: In column mode, opens that column's properties (source, hidden,\n"
@@ -3164,7 +3166,11 @@ class DbMan(App):
         if self.select_mode == "field":
             self._view_cell(coord, row_id_str)
             return
-        row_key = self.row_keys.get(row_id_str)
+        self._open_row_key(self.row_keys.get(row_id_str))
+
+    def _open_row_key(self, row_key):
+        """Open a row where its provider says it leads. Shared by row
+        mode's space and form mode's."""
         if row_key is None or row_key.value is None:
             self.notify("Cannot open this row", severity="error")
             return
@@ -3601,6 +3607,29 @@ class DbMan(App):
             self.notify("Last record" if delta > 0 else "First record")
             return
         self._render_form(edit_current=edit_current)
+
+    def _form_row_opens(self):
+        row_key = self.row_keys.get(self._form_row_id() or "")
+        return (
+            self.rows_editable and row_key is not None and row_key.value is not None
+            and self.provider.can_open_row(self.current_item, self.current_type)
+        )
+
+    def form_can_open(self, field):
+        """space in form mode: a URL field opens its URL; any other field
+        opens the record, where the provider gives rows somewhere to go.
+        Every value is already on screen in full, so unlike the grid's
+        field mode there's no "show the whole value" to fall back on."""
+        return _is_url(field.value) or self._form_row_opens()
+
+    def form_open(self, field):
+        if _is_url(field.value):
+            webbrowser.open(field.value.strip())
+            self.notify("Opened in browser")
+        elif self._form_row_opens():
+            self._open_row_key(self.row_keys.get(self._form_row_id()))
+        else:
+            self.notify(f"Nothing to open in '{field.name}'")
 
     def form_edit_other(self, field):
         """e on a field that isn't edited in place: the same editor field
