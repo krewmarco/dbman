@@ -1619,6 +1619,10 @@ class DbMan(App):
         self._row_order_dirty = False
         self._row_order_sync_target = None
         self._row_order_timer = None
+        # Set when form mode saves a field in place (form_commit), which
+        # updates row_values but not the grid: leaving the form must then
+        # reload rather than just swap back (see action_toggle_mode).
+        self._form_saved = False
         try:
             self.provider = create_provider(db_url, self.workspace_name or derive_db_name(db_url))
             self.lookup_plugin = (
@@ -1980,6 +1984,7 @@ class DbMan(App):
 
         self.current_item = name
         self.current_type = item_type
+        self._form_saved = False  # everything below is read afresh
         table_widget = self.query_one("#data-table", DataTable)
         sql_widget = self.query_one("#sql-view", Static)
         diag_widget = self.query_one("#diagram-view", DiagramView)
@@ -2268,11 +2273,35 @@ class DbMan(App):
             modes = [m for m in modes if m != "diagram"]
         idx = modes.index(self.mode) if self.mode in modes else -1
         main_focused = self.focused is not None and self.focused.id != "sidebar-list"
+        previous = self.mode
         self.mode = modes[(idx + 1) % len(modes)]
         self.refresh_bindings()
+        if self.current_item and {previous, self.mode} == {"view", "form"} and not self._form_saved:
+            # Two looks at the same loaded rows: just swap which one is on
+            # screen. A reload re-queries and recomputes every computed
+            # column, which is all cost and no change here.
+            self._swap_rows_view(should_focus=main_focused)
+            return
         self.refresh_sidebar()
         if self.current_item:
             self.load_item(self.current_item, self.current_type, should_focus=main_focused)
+
+    def _swap_rows_view(self, should_focus):
+        """View <-> Form without a reload. The form renders the grid's
+        cursor row from row_values, and the grid is untouched behind it, so
+        either one is already current."""
+        switcher = self.query_one(ContentSwitcher)
+        if self.mode == "form":
+            switcher.current = "form-view"
+            self._render_form()
+            if should_focus:
+                self.query_one("#form-view", FormView).focus()
+        else:
+            switcher.current = "data-table"
+            if should_focus:
+                self.query_one("#data-table", DataTable).focus()
+        self.update_title()
+        self.refresh_bindings()
 
     def action_rotate_select_mode(self):
         """Rotate field -> row -> column -> field. Determines what the cursor
@@ -3685,6 +3714,7 @@ class DbMan(App):
         # No reload: that would rebuild the form under the cursor. The grid
         # reloads when you leave form mode.
         self.row_values[row_id][column_name] = value
+        self._form_saved = True  # the grid's cells (and computed columns) are now behind
         self.notify(f"Saved {column_name}", timeout=1.5)
         return True
 
