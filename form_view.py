@@ -85,8 +85,9 @@ class FormView(VerticalScroll, can_focus=True):
         Binding("K", "move_record(-1)", "Move Record Up"),
         Binding("J", "move_field(1)", "Move Field Down"),
         Binding("K", "move_field(-1)", "Move Field Up"),
-        Binding("J", "step(1)", "Next Record"),
-        Binding("K", "step(-1)", "Prev Record"),
+        # Unlisted: h/l (and j/k in row mode) are how records step now.
+        Binding("J", "step(1)", "Next Record", show=False),
+        Binding("K", "step(-1)", "Prev Record", show=False),
         Binding("e,enter", "edit", "Edit"),
         Binding("space", "open", "Open"),
     ]
