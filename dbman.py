@@ -10,7 +10,7 @@ import json
 import shutil
 import subprocess
 from sqlalchemy import text
-from textual.app import App, ComposeResult
+from textual.app import App, ComposeResult, SystemCommand
 from textual.widgets import Header, Footer, DataTable, ListView, ListItem, Label, Static, Button, Input, ContentSwitcher, TextArea, Select
 from textual.containers import Horizontal, Vertical, Center, VerticalScroll
 from textual.binding import Binding
@@ -36,6 +36,7 @@ from column_meta import ColumnMetadataTable
 from workspace import WorkspaceStore, ConnectionSession
 import computed
 import table_model
+import table_actions
 from form_view import FieldEditor, FormField, FormView
 
 __version__ = "0.2.0"
@@ -157,7 +158,8 @@ class ShortcutsScreen(ModalScreen):
                 "    columns' @functools.cache memos)\n"
                 " c: Switch connection (pick from dbman.sqlite, j/k + enter)\n"
                 " ?: Toggle this Shortcuts panel\n"
-                " ctrl+p: Open Textual's command palette\n"
+                " ctrl+p: Open Textual's command palette; 'dbman: sample rows' there\n"
+                "    narrows the table to a random N or N% of the filtered rows\n"
                 " V: Show version/about screen\n\n"
                 " [bold]Navigation[/]\n"
                 " j / k: Move down / up\n"
@@ -1589,6 +1591,10 @@ class DbMan(App):
         self.mode = "view"
         self.select_mode = "field"
         self.filters = {}
+        # A spot-check sample (table_actions.sample_rows): its picks live in
+        # self.filters like any filter; this says which entry is the sample
+        # - see active_sample.
+        self.sample = None
         self.sort = []  # [(column_name, "asc" | "desc")] - single-column for now, see action_sort_column
         # '/' search over the loaded page. search_cells is every matching
         # cell (what gets highlighted); search_matches is the subset the
@@ -2213,6 +2219,8 @@ class DbMan(App):
         if self.mode in ("view", "form") and self.sort:
             col_name, direction = self.sort[0]
             sort_indicator = f" [sort: {col_name} {'asc' if direction == 'asc' else 'desc'}]"
+        sample = self.active_sample() if self.mode in ("view", "form") else None
+        sample_indicator = f" [sample {sample['size']}/{sample['total']}]" if sample else ""
         search_indicator = ""
         if self.mode in ("view", "form") and self.search_term:
             if self.search_matches:
@@ -2221,7 +2229,7 @@ class DbMan(App):
                 search_indicator = f" [/{self.search_term} no match]"
         self.title = (
             f"dbman - {self.current_item} ({self.mode.upper()})"
-            f"{page_indicator}{select_indicator}{sort_indicator}{search_indicator}"
+            f"{page_indicator}{select_indicator}{sort_indicator}{sample_indicator}{search_indicator}"
         )
 
     def action_switch_focus(self):
@@ -2833,6 +2841,17 @@ class DbMan(App):
             # the picker) clears this column's filter. An empty list must
             # never reach a provider - see get_page's contract in base.py.
             if val is not None:
+                sample = self.active_sample()
+                if sample:
+                    # A sample was drawn from the other filters' rows, so
+                    # changing one of them leaves it describing a set
+                    # that's no longer there - drop it rather than show a
+                    # quiet intersection. Re-filtering its own column just
+                    # replaces it.
+                    self.filters.pop(sample["column"], None)
+                    self.sample = None
+                    if sample["column"] != column_name:
+                        self.notify("Sample dropped - its filters changed; run 'sample rows' again", severity="warning")
                 if not val:
                     self.filters.pop(column_name, None)
                 else:
@@ -2905,6 +2924,40 @@ class DbMan(App):
             self.notify(f"Sorting '{column_name}' {direction}")
         else:
             self.notify(f"Cleared sort on '{column_name}'")
+
+    def active_sample(self):
+        """The current sample, if its filter entry is still the one it set.
+        Anything that replaced or reset self.filters (F, switching items or
+        connections) has ended it, so there's no clearing to remember."""
+        sample = self.sample
+        if sample and self.filters.get(sample["column"]) == sample["ids"]:
+            return sample
+        return None
+
+    def _can_sample(self):
+        return (
+            self.mode in ("view", "form") and self.current_item
+            and self.current_type != "plugin"
+            and self.provider.is_filterable(self.current_type)
+        )
+
+    def get_system_commands(self, screen):
+        yield from super().get_system_commands(screen)
+        # Only from the main screen: a modal's palette acting on the table
+        # behind it would reload the table out from under the modal.
+        if screen is self.screen_stack[0] and self._can_sample():
+            yield SystemCommand(
+                "dbman: sample rows",
+                "Spot-check a random N or N% of the rows the current filters match",
+                self.action_sample_rows,
+            )
+
+    def action_sample_rows(self):
+        if not self._can_sample():
+            self.notify("Sampling needs a filterable table in View or Form mode", severity="error")
+            return
+        ctx = table_actions.TableContext(self)
+        self.run_worker(table_actions.sample_rows(ctx), exclusive=True, group="table-action")
 
     def action_clear_filters(self):
         if self.mode not in ("view", "form"):
