@@ -7,7 +7,36 @@ an already-projected, already-truncated value is painted.
 Today the only styled cells are enum-like columns (Column.options), rendered
 in the provider's own option colors - a Notion select/status/multi_select
 value shows up in the same color Notion itself shows it."""
+from rich.cells import cell_len
 from rich.text import Text
+
+import computed
+
+# Header marks for where a column comes from (Column.source,
+# Column.primary_key), so a table mixing sources reads at a glance.
+KEY_GLYPH = "🔑"
+COMPUTED_GLYPH = "⚡"
+
+
+def column_glyph(col) -> str:
+    """The header mark for `col`, or "". A computed column is never a key."""
+    if getattr(col, "source", None) == computed.SOURCE:
+        return COMPUTED_GLYPH
+    if getattr(col, "primary_key", False):
+        return KEY_GLYPH
+    return ""
+
+
+def header_text(col) -> str:
+    """The column's name as its header shows it, mark included."""
+    glyph = column_glyph(col)
+    return f"{glyph} {col.name}" if glyph else col.name
+
+
+def header_width(col) -> int:
+    """Terminal cells the header needs; the glyphs are two cells wide."""
+    return cell_len(header_text(col))
+
 
 # Notion's option palette -> Rich style strings. Four of Notion's ten names
 # (brown, orange, purple, pink) aren't Rich color names at all, hence an

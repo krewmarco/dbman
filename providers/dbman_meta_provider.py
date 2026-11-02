@@ -22,8 +22,10 @@ converting it later means lifting these methods into a plugin:
   before item delete -> _check_delete_item: veto dropping a config table
   column annotation  -> _read_only_columns: columns dbman maintains
   display mask       -> _masked_columns + mask_url: hide url secrets
-  before cell write  -> update_cell: re-checks read-only, and restores a
-                        masked secret the edit left in place
+  before cell write  -> update_cell: re-checks read-only, restores a
+                        masked secret the edit left in place, and
+                        _normalize_value: check/expand a csv directory path,
+                                          check a computed column's expression
   open row           -> can_open_row / open_row: row -> connection
 """
 from dataclasses import replace
@@ -35,6 +37,7 @@ from sqlalchemy import text
 import meta_db
 
 from .base import RowKey, RowTarget
+from .csv_provider import normalize_directory
 from .sqlalchemy_provider import SqlAlchemyProvider
 
 # Set by dbman, never by hand: `id` is the rowid, and the timestamps record
@@ -129,6 +132,28 @@ class DbmanMetaProvider(SqlAlchemyProvider):
         is plain text on disk (gitignored for that reason)."""
         return _MASKED.get(name, set())
 
+    @staticmethod
+    def _normalize_value(name: str, column: str, value):
+        """A csv_directories path is stored expanded and absolute, and must
+        exist - a typo would otherwise just make a CSV connection quietly
+        show nothing. Cleared is allowed: CsvProvider skips a row with no
+        path, which is what a blank row from `a` starts as."""
+        if name == "csv_directories" and column == "path":
+            return normalize_directory(value) if str(value or "").strip() else None
+        if name == "computed_columns" and column == "expression":
+            # Checked against dbman_plugins/ in the cwd - the same place
+            # load_item will look - so a typo is refused here rather than
+            # showing up later as #ERR on every page load. Stored in its
+            # canonical spelling. Column names can't be checked from here
+            # (that needs the item's columns); ColumnMetadataTable does.
+            text = str(value or "").strip()
+            if text:
+                import computed
+                computed.compile_expression(text)
+                text = str(computed.parse_expression(text))
+            return text or None
+        return value
+
     # ---- Provider methods, routed through the hooks ----
 
     def delete_item(self, name, item_type) -> None:
@@ -158,6 +183,7 @@ class DbmanMetaProvider(SqlAlchemyProvider):
             raise ValueError(f"'{column}' is maintained by dbman and is read-only")
         if column in self._masked_columns(name) and isinstance(value, str) and MASK in value:
             value = self._restore_secret(name, row_key, column, value)
+        value = self._normalize_value(name, column, value)
         return super().update_cell(name, item_type, row_key, column, value)
 
     def _restore_secret(self, name, row_key: RowKey, column, value: str) -> str:

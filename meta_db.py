@@ -26,8 +26,11 @@ DB_FILENAME = "dbman.sqlite"
 LEGACY_WORKSPACE = "dbman.json"
 LEGACY_SETTINGS_DIR = ".dbman"
 
-SCHEMA_VERSION = 3
-CONFIG_TABLES = ("connections", "sessions", "item_settings", "column_settings", "workspace")
+SCHEMA_VERSION = 6
+CONFIG_TABLES = (
+    "connections", "sessions", "item_settings", "column_settings", "workspace", "csv_directories",
+    "computed_columns",
+)
 
 # The whole schema, and the one place it lives. Browsing dbman.sqlite shows
 # the same DDL in SQL mode ('m'), and these foreign keys are what the
@@ -100,6 +103,34 @@ CREATE TABLE IF NOT EXISTS workspace (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     last_connection TEXT
         REFERENCES connections (name) ON DELETE SET NULL ON UPDATE CASCADE
+);
+-- The directories a csv:// connection shows the .csv files of (v4). dbman
+-- config, edited by browsing this file - so, like `connections`, every
+-- column may be NULL and `a` can add a blank row to fill in; CsvProvider
+-- skips rows without a path. `connection` must name a saved connection
+-- (the foreign key), and DbmanMetaProvider checks each `path` exists. `id`
+-- order is display order.
+CREATE TABLE IF NOT EXISTS csv_directories (
+    id INTEGER PRIMARY KEY,
+    connection TEXT
+        REFERENCES connections (name) ON DELETE CASCADE ON UPDATE CASCADE,
+    path TEXT,
+    UNIQUE (connection, path)
+);
+-- Columns dbman computes rather than reads (v5): `expression` (named
+-- `function` before v6) is a call like bst.bst_url(row.ref, row.translation)
+-- of a function in <cwd>/dbman_plugins/, shown read-only under `column_name`
+-- (see computed.py). Every column may be NULL so `a` adds a blank row; a row
+-- without a column name is skipped, one without an expression shows empty,
+-- and DbmanMetaProvider checks `expression` parses and imports.
+CREATE TABLE IF NOT EXISTS computed_columns (
+    id INTEGER PRIMARY KEY,
+    connection TEXT
+        REFERENCES connections (name) ON DELETE CASCADE ON UPDATE CASCADE,
+    item TEXT,
+    column_name TEXT,
+    expression TEXT,
+    UNIQUE (connection, item, column_name)
 );
 """
 # Orphaned settings exist in the wild (a `.dbman/<uuid>.json` written before
@@ -185,10 +216,22 @@ def _open_initialized(path: Path) -> sqlite3.Connection:
             _execute_ddl(conn, CONNECTIONS_DDL + CHILD_DDL)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     else:
+        # Each step brings the file up one version; v1's rebuild lands on
+        # the current schema directly (it recreates every child table from
+        # CHILD_DDL).
         if version == 1:
             _upgrade_v1(conn)
-        elif version == 2:
+        if version == 2:
             _upgrade_v2(conn)
+            version = 3
+        if version == 3:
+            _upgrade_v3(conn)
+            version = 4
+        if version == 4:
+            _upgrade_v4(conn)
+            version = 5
+        if version == 5:
+            _upgrade_v5(conn)
         if _missing_tables(conn):
             _restore_tables(conn)
     conn.execute("PRAGMA foreign_keys = ON")
@@ -311,7 +354,38 @@ def _upgrade_v2(conn: sqlite3.Connection) -> None:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(column_settings)")}
         if columns and "fit" not in columns:
             conn.execute("ALTER TABLE column_settings ADD COLUMN fit INTEGER NOT NULL DEFAULT 0")
-        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        conn.execute("PRAGMA user_version = 3")
+
+
+def _upgrade_v3(conn: sqlite3.Connection) -> None:
+    """v4 adds csv_directories. CHILD_DDL's CREATE TABLE IF NOT EXISTS
+    creates exactly the missing table and leaves the rest alone."""
+    with _transaction(conn):
+        _execute_ddl(conn, CHILD_DDL)
+        conn.execute("PRAGMA user_version = 4")
+
+
+def _upgrade_v4(conn: sqlite3.Connection) -> None:
+    """v5 adds computed_columns, the same way v4 added csv_directories."""
+    with _transaction(conn):
+        _execute_ddl(conn, CHILD_DDL)
+        conn.execute("PRAGMA user_version = 5")
+
+
+def _upgrade_v5(conn: sqlite3.Connection) -> None:
+    """v6 renames computed_columns.function to `expression`, since it now
+    holds a call with arguments, and respells "module:func" as
+    "module.func". A file that went through _upgrade_v4 already has the new
+    column from CHILD_DDL, so the rename is skipped there."""
+    with _transaction(conn):
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(computed_columns)")}
+        if "function" in columns:
+            conn.execute("ALTER TABLE computed_columns RENAME COLUMN function TO expression")
+            conn.execute(
+                "UPDATE computed_columns SET expression = replace(expression, ':', '.')"
+                " WHERE expression LIKE '%:%' AND expression NOT LIKE '%(%'"
+            )
+        conn.execute("PRAGMA user_version = 6")
 
 
 def migrate_legacy(base_dir: Path) -> bool:

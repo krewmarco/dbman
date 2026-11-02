@@ -257,9 +257,12 @@ class VirtualTableScreen(ModalScreen):
     #vt-buttons Button { margin-left: 1; }
     """
 
-    def __init__(self, table: VirtualTable):
+    def __init__(self, table: VirtualTable, edit_key=None):
         super().__init__()
         self.table = table
+        # Open straight into editing this row, as if `e` were pressed on it:
+        # a just-added computed column's next step is always its Source.
+        self.edit_key = edit_key
         self._keys: list = []  # visible row keys, positionally aligned with the DataTable
 
     def compose(self) -> ComposeResult:
@@ -282,8 +285,10 @@ class VirtualTableScreen(ModalScreen):
                     yield Button("Save", variant="success", id="vt-save")
 
     def on_mount(self):
-        self._populate()
+        self._populate(keep_key=self.edit_key)
         self.query_one("#vt-table", DataTable).focus()
+        if self.edit_key is not None and self.edit_key in self._keys:
+            self.call_after_refresh(self.action_edit_row)
 
     def _populate(self, keep_key=None):
         """Rebuild the DataTable from the VirtualTable, honouring the filter
@@ -305,7 +310,8 @@ class VirtualTableScreen(ModalScreen):
                 continue
             table.add_row(*row.cells, key=str(len(self._keys)))
             self._keys.append(row.key)
-        if keep_key in self._keys:
+        # Read-only rows all have key None, so None names no row.
+        if keep_key is not None and keep_key in self._keys:
             table.cursor_coordinate = Coordinate(self._keys.index(keep_key), 0)
 
     def _selected_key(self):
@@ -421,7 +427,7 @@ class PromptScreen(ModalScreen):
     PromptScreen { background: rgba(0, 0, 0, 0.3); align: center middle; }
     #prompt-dialog {
         background: $panel; border: thick $primary;
-        padding: 1 2; width: 50; height: auto;
+        padding: 1 2; width: 60%; min-width: 50; max-width: 110; height: auto;
     }
     #prompt-title { text-style: bold; margin-bottom: 1; }
     """

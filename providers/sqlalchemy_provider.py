@@ -26,9 +26,11 @@ class SqlAlchemyProvider(Provider):
     """Relational-database provider (SQLite primarily; Postgres/MySQL best-effort)
     backed by SQLAlchemy Core. No ORM, no caching — everything is reflected live."""
 
-    def __init__(self, db_url: str):
+    def __init__(self, db_url: str, **engine_kwargs):
         self.db_url = db_url
-        self.engine = create_engine(db_url)
+        # engine_kwargs: for a subclass that needs a particular pool, e.g.
+        # CsvProvider's in-memory database, which every connection must share.
+        self.engine = create_engine(db_url, **engine_kwargs)
         if self.engine.dialect.name == "sqlite":
             event.listen(self.engine, "connect", _enable_sqlite_foreign_keys)
         # Row add/delete target a row by SQLite's rowid, the same identity
@@ -127,7 +129,7 @@ class SqlAlchemyProvider(Provider):
     def get_page(self, name, item_type, filters, cursor, page_size, sort=None) -> RowPage:
         metadata = MetaData()
         table = Table(name, metadata, autoload_with=self.engine)
-        col_objs = [Column(name=c.name, type_name=str(c.type)) for c in table.columns]
+        col_objs = [Column(name=c.name, type_name=str(c.type), primary_key=c.primary_key) for c in table.columns]
         filter_clauses = self._build_filter_clause(table, filters)
         offset = int(cursor) if cursor else 0
         # Fetch one extra row so we can tell whether another page follows,

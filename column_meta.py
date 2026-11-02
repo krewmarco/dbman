@@ -7,17 +7,28 @@ it, so every column-level property had to claim a top-level key of its own
 (`z` hide, `w` width, `o` sort). That namespace is finite and was filling
 up; here, adding a property is adding a row.
 
-Distinct from editing the *table's* schema, which is what Schema mode (`m`)
-shows - these are dbman's own display settings for one column, persisted to
-dbman.sqlite via ViewSettingsStore, plus the provider facts that explain
-why some of them are there at all.
+Distinct from the *provider* schema, which is what Schema mode (`m`) shows:
+the backend's own columns as it declares them. This is the column as part of
+dbman's table - where its data comes from (Source: a connection's name, or
+computed by dbman), whether it's the key, and dbman's own display settings
+for it, persisted to dbman.sqlite via ViewSettingsStore.
+
+A computed column's Name and Source are editable too: Source *is* its
+expression, e.g. `bst.bst_url(row.ref, row.translation)` (see computed.py),
+checked as it's typed against the plugin and the table's columns. A
+provider column's Source is a fact - the connection it comes from.
 
 See PLANNING_space-vs-edit-keybinding.md, whose follow-on section proposed
 exactly this slot for per-column configuration.
 """
+from dataclasses import replace
+
 from rich.text import Text
 
+import computed
+from cell_render import COMPUTED_GLYPH, KEY_GLYPH
 from providers.base import Column, ColumnOption
+from view_settings import rename_column
 from virtual_table import RowEdit, VirtualRow, VirtualTable
 
 YES = Text("yes", style="green")
@@ -48,8 +59,14 @@ class ColumnMetadataTable(VirtualTable):
     # Colored row only makes sense once you can see the column has options)
     # and because a read-only column is worth knowing before you try to edit.
     def __init__(self, column: Column, item_name: str, view_settings_store,
-                 visible_column_count: int, auto_width=None, fit_width=None):
+                 visible_column_count: int, auto_width=None, fit_width=None,
+                 computed_expression=None, table_columns=()):
         self.column = column
+        # The expression behind a computed column, which is its Source.
+        self.computed_expression = computed_expression
+        # Every column of dbman's table (hidden included): what a Source
+        # may reference and a new Name mustn't collide with.
+        self.table_columns = list(table_columns)
         self.item_name = item_name
         self.store = view_settings_store
         self.settings = view_settings_store.get(item_name)
@@ -77,13 +94,36 @@ class ColumnMetadataTable(VirtualTable):
             return Text(strategy)
         return Text.assemble(strategy, (f" ({number})", "grey62"))
 
+    @property
+    def is_computed(self):
+        return self.column.source == computed.SOURCE
+
+    def _source_value(self):
+        if not self.is_computed:
+            return Text(self.column.source or "?", style="grey62")
+        if not self.computed_expression:
+            return Text.assemble(f"{COMPUTED_GLYPH} ", ("no expression yet - e to set", "grey62"))
+        return Text(f"{COMPUTED_GLYPH} {self.computed_expression}")
+
     def _sort_value(self):
         name = self._sort_name()
         return NONE if name == "none" else Text(name)
 
     def rows(self) -> list[VirtualRow]:
         col = self.column
-        rows = [
+        if self.is_computed:
+            # dbman's own column, so its name and source are its to change.
+            rows = [
+                VirtualRow("name", [Text("Name"), Text(col.name)]),
+                VirtualRow("source", [Text("Source"), self._source_value()]),
+            ]
+        else:
+            rows = [VirtualRow(None, [Text("Source", style="grey62"), self._source_value()])]
+        if col.primary_key and not self.is_computed:
+            rows.append(VirtualRow(None, [
+                Text("Key", style="grey62"), Text(f"{KEY_GLYPH} primary key, pinned left", style="grey62"),
+            ]))
+        rows += [
             VirtualRow(None, [Text("Type", style="grey62"), Text(str(col.type_name), style="grey62")]),
             VirtualRow(None, [Text("Editable", style="grey62"), (NO if col.read_only else YES)]),
         ]
@@ -130,6 +170,13 @@ class ColumnMetadataTable(VirtualTable):
     def edit_row(self, key):
         self.error = None
         name = self.column.name
+        if key == "source":
+            return RowEdit(
+                f"Source for {name}: module.func(row.column, ...) - see PLUGINS for functions",
+                self.computed_expression or "", self._set_expression,
+            )
+        if key == "name":
+            return RowEdit(f"Rename {name}", name, self._rename)
         if key == "hidden":
             return RowEdit(f"Hide {name}?", "yes" if name in self.settings.hidden else "no",
                            lambda v: self._set_hidden(v == "yes"), YES_NO)
@@ -145,6 +192,43 @@ class ColumnMetadataTable(VirtualTable):
                 f"Width for {name}: auto{auto}, fit{fit}, or a number",
                 self._width_name(), self._apply_width,
             )
+        return None
+
+    def _set_expression(self, text):
+        """The Source on-edit hook. Checked before it's saved - parses, the
+        function exists, the arguments fit it, the columns exist - so a
+        mistake is refused here with the reason rather than turning every
+        cell into #ERR. Blank clears it, leaving an empty column."""
+        text = text.strip()
+        if text:
+            others = [c for c in self.table_columns if c != self.column.name]
+            try:
+                computed.compile_expression(text, columns=others)
+            except ValueError as e:
+                return str(e)
+            text = str(computed.parse_expression(text))
+        computed.set_expression(self.store.connection, self.item_name, self.column.name, text or None)
+        self.computed_expression = text or None
+        self.changed = True
+        return None
+
+    def _rename(self, text):
+        old, new = self.column.name, text.strip()
+        if not new:
+            return "Name the column"
+        if new == old:
+            return None
+        if new in self.table_columns:
+            return f"There's already a column named '{new}'"
+        try:
+            computed.rename_binding(self.store.connection, self.item_name, old, new)
+        except ValueError as e:
+            return str(e)
+        rename_column(self.settings, old, new)
+        self._save()
+        self.table_columns = [new if c == old else c for c in self.table_columns]
+        self.column = replace(self.column, name=new)
+        self.title = f"Column: {new}"
         return None
 
     def _set_hidden(self, hide: bool):
