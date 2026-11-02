@@ -108,13 +108,17 @@ class SqlAlchemyProvider(Provider):
         for col_name, val in filters.items():
             col = table_obj.c[col_name]
             if isinstance(val, list):
-                # The picker path (see get_page's contract in base.py). No
-                # SQL column advertises Column.options today, so nothing in
-                # the UI currently produces this - implemented so the
-                # contract holds rather than raising on an unexpected shape.
+                # The list path (see get_page's contract in base.py): an OR
+                # of *exact* matches - a spot-check sample's row ids
+                # (table_actions.sample_rows), where a substring LIKE would
+                # let id 1 match 10 and 21. Only the sentinels go through
+                # _value_clause.
                 if not val:
                     continue
-                clauses.append(or_(*[self._value_clause(col, v) for v in val]))
+                clauses.append(or_(*[
+                    self._value_clause(col, v) if v in (FILTER_EMPTY, FILTER_NOT_EMPTY) else col == v
+                    for v in val
+                ]))
             else:
                 clauses.append(self._value_clause(col, val))
         return clauses

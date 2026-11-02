@@ -104,7 +104,9 @@ def _notion_choice_condition(ptype: str, val: str):
         # A multi_select cell holds several options, so "has this one" is
         # `contains`, not `equals`.
         return {"contains": val}
-    if ptype in ("select", "status"):
+    if ptype in ("select", "status") or ptype in _TEXT_FILTER_TYPES:
+        # Text types for a spot-check sample (table_actions.sample_rows),
+        # which filters on the title column's exact values.
         return {"equals": val}
     return None
 
