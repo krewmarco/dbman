@@ -36,7 +36,7 @@ from column_meta import ColumnMetadataTable
 from workspace import WorkspaceStore, ConnectionSession
 import computed
 import table_model
-from form_view import FormField, FormView
+from form_view import FieldEditor, FormField, FormView
 
 __version__ = "0.2.0"
 
@@ -182,7 +182,7 @@ class ShortcutsScreen(ModalScreen):
                 " d: Delete selected table/view (row mode: the row; column mode: a computed column)\n"
                 " x: Export current Table/View to CSV\n"
                 " y: Copy (yank) the selected cell / row (tab-separated) / column\n"
-                "    to the clipboard (View mode; Cmd+C can't reach a terminal app)\n"
+                "    to the clipboard (Cmd+C can't reach a terminal app; ctrl+c also works)\n"
                 " /: Search the loaded page - cell values, or column names in column mode;\n"
                 "    with the sidebar focused, search table/view/plugin names instead\n"
                 " n / N: Step to the next / previous match\n"
@@ -195,15 +195,26 @@ class ShortcutsScreen(ModalScreen):
 
 
                 " [bold]Form mode (m)[/]\n"
-                " The grid's cursor row as a page of fields, values in full; same\n"
-                "    hidden columns, order, filters and sort as the grid\n"
-                " j / k: Next / previous field    J / K: Next / previous record\n"
-                " e / enter: Edit the field (text in place; others open their editor)\n"
+                " The grid on its side: the cursor row as a page of fields, values in\n"
+                "    full; same hidden columns, order, filters and sort as the grid\n"
+                " s: Select mode, shared with the grid - field / row (the whole\n"
+                "    record) / column (the field's name)\n"
+                " j / k: Next / previous field (row mode: record)\n"
+                " h / l: Previous / next record    g / G: First / last\n"
+                " J / K: Field mode: next / previous record; row mode: move the record\n"
+                "    (where supported); column mode: move the field\n"
+                " e / enter: Field: edit it (text in place; others open their editor);\n"
+                "    row: edit the record (JSON, or its app); column: its properties\n"
                 " escape / tab: Leave the field, saving it\n"
                 " ctrl+n / ctrl+p: Save, then next / previous record, still editing\n"
-                " space: Open the field's URL in the browser; on another field, open the\n"
-                "    record where the provider supports it (a Notion row, a connection)\n\n"
-                " [bold]Select Mode (View mode only)[/]\n"
+                " space: Open the field's URL, or the record where the provider\n"
+                "    supports it (a Notion row, a connection)\n"
+                " Every other key is the grid's, by select mode: y / ctrl+c copy the\n"
+                "    field, record or column; / searches values or (column) field\n"
+                "    names; d deletes the record (row) or a computed column; a / A add\n"
+                "    a computed column below / above (column); f, o, z, Z, F, E as in\n"
+                "    the grid. ctrl+c with a mouse or editor selection copies that\n\n"
+                " [bold]Select Mode (View and Form mode)[/]\n"
                 " s: Rotate select mode: field -> row -> column -> field\n"
                 " e: In column mode, opens that column's properties (source, hidden,\n"
                 "    colored, width, sort) as a table - e edits, space toggles\n"
@@ -1174,6 +1185,16 @@ def _ctx(modes=None, select_modes=None, item_types=None, capability=None):
     return predicate
 
 
+def _on_grid(app):
+    """The select-mode keys apply: View mode with the grid focused, or Form
+    mode with the form focused - the grid on its side (see DbMan._grid)."""
+    if app.mode == "view":
+        return isinstance(app.focused, DataTable)
+    if app.mode == "form":
+        return isinstance(app.focused, (FormView, FieldEditor))
+    return False
+
+
 def _edit_cell_ctx(app):
     """'e' is polymorphic: SQL mode edits the View's SQL, the lookup plugin
     edits its own config, and in View mode what it edits depends on
@@ -1185,7 +1206,7 @@ def _edit_cell_ctx(app):
         return app.current_type == "view" and app.provider.capabilities.create_definition
     if app.current_type == "plugin":
         return app.current_item == "lookup" and app.lookup_plugin is not None
-    if app.mode != "view":
+    if app.mode not in ("view", "form"):
         return False
     if app.select_mode == "row":
         return app.provider.capabilities.whole_row_edit or app.provider.capabilities.open_in_browser
@@ -1212,6 +1233,13 @@ def _open_row_ctx(app):
     return app.provider.can_open_row(app.current_item, app.current_type)
 
 
+def _on_rows(app):
+    """View or Form mode with an item loaded: the rows are on screen, and the
+    grid's keys apply. Form mode stands in its current field for the
+    selected column and its record for the selected row."""
+    return app.mode in ("view", "form") and bool(app.current_item)
+
+
 def _filter_column_ctx(app):
     """Kept enabled across select modes and item types (unlike the
     column-scoped z/w/H/L/F actions) since filtering is basic/core usage -
@@ -1223,7 +1251,7 @@ def _filter_column_ctx(app):
     own notify() explain *why* filtering isn't available right now (wrong
     select mode, or a non-filterable item like a CouchDB view) instead of the
     key silently doing nothing."""
-    return app.mode == "view" and bool(app.current_item)
+    return _on_rows(app)
 
 
 def _sidebar_has_focus(app):
@@ -1236,7 +1264,7 @@ def _search_ctx(app):
     which hides it), otherwise it searches the loaded page, View mode only."""
     if _sidebar_has_focus(app):
         return True
-    return app.mode == "view"
+    return app.mode in ("view", "form")
 
 
 def _search_step_ctx(app):
@@ -1247,7 +1275,7 @@ def _search_step_ctx(app):
     else the loaded page."""
     if _sidebar_has_focus(app):
         return True if app.sidebar_search_term else None
-    if app.mode != "view" or not app.current_item:
+    if not _on_rows(app):
         return False
     return True if app.search_matches else None
 
@@ -1258,7 +1286,7 @@ def _sort_column_ctx(app):
     notify() can explain *why* sorting isn't available right now (wrong
     select mode, or a non-sortable item/provider) instead of the key
     silently doing nothing."""
-    return app.mode == "view" and bool(app.current_item)
+    return _on_rows(app)
 
 
 def _truncate_column_ctx(app):
@@ -1276,13 +1304,17 @@ def _delete_item_ctx(app):
     whole table/view (gated on capabilities.delete_row, not delete_item)."""
     if app.current_type == "plugin":
         return False
-    if app.mode == "view" and isinstance(app.focused, DataTable) and app.select_mode == "column":
+    if _on_grid(app) and app.select_mode == "column":
         # Column mode deletes the selected column - only a computed one,
         # since a provider column is the backend's to remove. Greyed rather
         # than falling through to dropping the whole table.
         return True if app._selected_column_is_computed() else None
-    if app.mode == "view" and isinstance(app.focused, DataTable) and app.select_mode == "row":
+    if _on_grid(app) and app.select_mode == "row":
         return bool(app.current_item) and app.rows_editable and app.provider.capabilities.delete_row
+    if app.mode == "form" and _on_grid(app):
+        # Field mode: a record is row mode's to delete, and the form never
+        # offers to drop the whole table.
+        return None
     return bool(app.current_type) and app.provider.capabilities.delete_item
 
 
@@ -1292,14 +1324,14 @@ def _toggle_mode_ctx(app):
 
 def _unhide_column_ctx(app):
     """Column-select-mode-scoped, like hiding. Greys out (rather than hides)
-    'u' when there's nothing to unhide."""
-    if app.mode != "view" or app.select_mode != "column" or not app.current_item:
+    'Z' when there's nothing to unhide."""
+    if app.mode not in ("view", "form") or app.select_mode != "column" or not app.current_item:
         return False
     return True if app.view_settings.get(app.current_item).hidden else None
 
 
 def _copy_ctx(app):
-    return app.mode == "view" and bool(app.current_item) and isinstance(app.focused, DataTable)
+    return _on_grid(app) and bool(app.current_item)
 
 
 def _export_csv_ctx(app):
@@ -1329,7 +1361,7 @@ def _add_ctx(app):
         if header.section_type == "view":
             return app.provider.capabilities.create_definition
         return False
-    if app.mode != "view" or not app.current_item:
+    if app.mode not in ("view", "form") or not app.current_item:
         return False
     if app.select_mode == "column":
         # A computed column, right of the selected one (A: left). dbman's
@@ -1346,7 +1378,7 @@ def _clear_filters_ctx(app):
     """Paired with 'f', and like it dispatchable in every select mode -
     clearing all filters names no column, so it needs no rotation. Greys
     out (rather than hides) when there's genuinely nothing to clear."""
-    if app.mode != "view" or not bool(app.current_item):
+    if not _on_rows(app):
         return False
     return True if app.filters else None
 
@@ -1469,6 +1501,9 @@ class DbMan(App):
         Binding("A", "add_column_left", "Add Left"),
         Binding("x", "export_csv", "Export CSV", show=False),
         Binding("y", "copy", "Copy"),
+        # Reached only when Textual's own ctrl+c (copy the mouse selection,
+        # on Screen and TextArea) finds nothing selected.
+        Binding("ctrl+c", "copy", "Copy", show=False),
         Binding("/", "search", "Search"),
         Binding("n", "search_next", "Next Match", show=False),
         Binding("N", "search_prev", "Prev Match", show=False),
@@ -1498,24 +1533,24 @@ class DbMan(App):
     ACTION_CONTEXTS = {
         "edit_cell": _edit_cell_ctx,
         "open_row": _open_row_ctx,
-        "edit_document": _ctx(modes={"view"}, capability="whole_row_edit"),
+        "edit_document": _ctx(modes={"view", "form"}, capability="whole_row_edit"),
         "filter_column": _filter_column_ctx,
         "sort_column": _sort_column_ctx,
         "search": _search_ctx,
         "search_next": _search_step_ctx,
         "search_prev": _search_step_ctx,
         "truncate_column": _truncate_column_ctx,
-        "rotate_select_mode": _ctx(modes={"view"}),
+        "rotate_select_mode": _ctx(modes={"view", "form"}),
         "reorder_column": _ctx(modes={"view"}, select_modes={"column"}),
         "move_row": _ctx(modes={"view"}, select_modes={"row"}, capability="reorder_row"),
-        "hide_column": _ctx(modes={"view"}, select_modes={"column"}),
+        "hide_column": _ctx(modes={"view", "form"}, select_modes={"column"}),
         "unhide_column": _unhide_column_ctx,
         "delete_item": _delete_item_ctx,
         "toggle_mode": _toggle_mode_ctx,
         "export_csv": _export_csv_ctx,
         "copy": _copy_ctx,
         "add": _add_ctx,
-        "add_column_left": _ctx(modes={"view"}, select_modes={"column"}, item_types={"table", "view"}),
+        "add_column_left": _ctx(modes={"view", "form"}, select_modes={"column"}, item_types={"table", "view"}),
         "clear_filters": _clear_filters_ctx,
         "switch_connection": _switch_connection_ctx,
     }
@@ -2117,7 +2152,7 @@ class DbMan(App):
                 ]
                 table_widget.add_rows(rows)
 
-            table_widget.cursor_type = self._cursor_type_for_select_mode() if self.mode == "view" else "cell"
+            table_widget.cursor_type = self._cursor_type_for_select_mode() if self.mode in ("view", "form") else "cell"
 
             if saved_coord:
                 try:
@@ -2140,7 +2175,7 @@ class DbMan(App):
             if should_focus:
                 sql_widget.focus()
                 
-        if self.search_term and self.mode == "view":
+        if self.search_term and self.mode in ("view", "form"):
             # load_item redraws every cell, so the highlight has to be laid
             # back down. Don't move the cursor: the reload is usually the
             # tail of an edit, and yanking the user back to match #1 would
@@ -2163,14 +2198,14 @@ class DbMan(App):
             if page_num > 1 or self.page_has_more:
                 page_indicator += f" [page {page_num}{'+' if self.page_has_more else ''}]"
         select_indicator = (
-            f" [{self.select_mode.upper()}]" if self.mode == "view" and self.select_mode != "field" else ""
+            f" [{self.select_mode.upper()}]" if self.mode in ("view", "form") and self.select_mode != "field" else ""
         )
         sort_indicator = ""
         if self.mode in ("view", "form") and self.sort:
             col_name, direction = self.sort[0]
             sort_indicator = f" [sort: {col_name} {'asc' if direction == 'asc' else 'desc'}]"
         search_indicator = ""
-        if self.mode == "view" and self.search_term:
+        if self.mode in ("view", "form") and self.search_term:
             if self.search_matches:
                 search_indicator = f" [/{self.search_term} {self.search_index + 1}/{len(self.search_matches)}]"
             else:
@@ -2243,10 +2278,11 @@ class DbMan(App):
         """Rotate field -> row -> column -> field. Determines what the cursor
         selects (via DataTable's native cursor_type) and what mode-dependent
         action keys (starting with 'e') operate on. See issue #7."""
-        if self.mode != "view":
-            self.notify("Select mode only applies in View mode", severity="error")
+        if self.mode not in ("view", "form"):
+            self.notify("Select mode only applies in View and Form mode", severity="error")
             return
-        if not isinstance(self.focused, DataTable):
+        table = self._grid()
+        if table is None:
             return
         idx = self.SELECT_MODES.index(self.select_mode)
         if self.search_term:
@@ -2255,7 +2291,9 @@ class DbMan(App):
             # before the scope moves out from under them.
             self._paint_search(False)
         self.select_mode = self.SELECT_MODES[(idx + 1) % len(self.SELECT_MODES)]
-        self.focused.cursor_type = self._cursor_type_for_select_mode()
+        table.cursor_type = self._cursor_type_for_select_mode()
+        if self.mode == "form":
+            self.query_one("#form-view", FormView).refresh_marks()
         if self.search_term:
             self.search_index = 0
             self._refresh_search(move_cursor=False)
@@ -2276,11 +2314,11 @@ class DbMan(App):
         which is easy to mis-key by visual identification of the unshifted
         comma/period glyphs. ctrl+left/right was avoided from the start
         since macOS reserves those for Mission Control space-switching."""
-        if self.mode != "view" or self.select_mode != "column":
+        if self.mode not in ("view", "form") or self.select_mode != "column":
             return
-        if not isinstance(self.focused, DataTable) or not self.current_item:
+        table_widget = self._grid()
+        if table_widget is None or not self.current_item:
             return
-        table_widget = self.focused
         coord = table_widget.cursor_coordinate
         columns = [c.key.value for c in table_widget.ordered_columns]
         idx = coord.column
@@ -2299,6 +2337,9 @@ class DbMan(App):
         self.view_settings.save(self.current_item, settings)
         self.load_item(self.current_item, self.current_type)
         self.query_one("#data-table", DataTable).move_cursor(row=coord.row, column=new_idx)
+        if self.mode == "form":
+            # The reload kept the field cursor's position, not its field.
+            self.query_one("#form-view", FormView).select_field(columns[new_idx])
 
     # Quiet period after the last J/K before a settled burst of local moves
     # is sent to the provider as one batch - long enough that repeated
@@ -2324,13 +2365,13 @@ class DbMan(App):
         sidesteps that by reassigning already-known order values in one
         pass instead. Only reachable when capabilities.reorder_row is True
         (currently just Notion), gated via ACTION_CONTEXTS."""
-        if self.mode != "view" or self.select_mode != "row":
+        if self.mode not in ("view", "form") or self.select_mode != "row":
             return
-        if not isinstance(self.focused, DataTable) or not self.current_item:
+        table_widget = self._grid()
+        if table_widget is None or not self.current_item:
             return
         if not self.provider.capabilities.reorder_row:
             return
-        table_widget = self.focused
         coord = table_widget.cursor_coordinate
         row_id_str = list(table_widget.rows.values())[coord.row].key.value
         if row_id_str not in self.row_order:
@@ -2356,6 +2397,8 @@ class DbMan(App):
         for key_str in self.row_order:
             table_widget.add_row(*self.rendered_rows[key_str], key=key_str)
         table_widget.move_cursor(row=new_idx, column=coord.column)
+        if self.mode == "form":
+            self.update_title()  # same record, new position
 
         self._schedule_row_order_sync()
 
@@ -2433,10 +2476,10 @@ class DbMan(App):
         """'e' in column select mode: open the selected column's own
         settings as a virtual table. The column-mode half of `e`'s
         "edit the selected thing" promise - see ColumnMetadataTable."""
-        if not isinstance(self.focused, DataTable) or not self.current_item:
+        grid = self._grid()
+        if grid is None or not self.current_item:
             return
-        coord = self.focused.cursor_coordinate
-        column_name = self.focused.ordered_columns[coord.column].key.value
+        column_name = grid.ordered_columns[grid.cursor_coordinate.column].key.value
         column = self.columns_by_name.get(column_name)
         if column is None:
             self.notify(f"No metadata for column '{column_name}'", severity="error")
@@ -2449,7 +2492,7 @@ class DbMan(App):
         ) if column.source == computed.SOURCE else None
         table = ColumnMetadataTable(
             column, self.current_item, self.view_settings,
-            visible_column_count=len(self.focused.ordered_columns),
+            visible_column_count=len(grid.ordered_columns),
             computed_expression=expression,
             table_columns=self.table_columns,
             auto_width=self.auto_column_widths.get(column_name),
@@ -2477,19 +2520,19 @@ class DbMan(App):
         from the rendered DataTable (it stays in the underlying RowPage/model
         and is unaffected in any other select mode). Persisted per table/view
         via ViewSettingsStore. See issue #2."""
-        if self.mode != "view":
-            self.notify("Hide column only allowed in View mode", severity="error")
+        if self.mode not in ("view", "form"):
+            self.notify("Hide column only allowed in View or Form mode", severity="error")
             return
         if self.select_mode != "column":
             self.notify("Hide column only allowed in column select mode (press 's' to rotate)", severity="error")
             return
-        if not isinstance(self.focused, DataTable) or not self.current_item:
+        grid = self._grid()
+        if grid is None or not self.current_item:
             return
-        if len(self.focused.ordered_columns) <= 1:
+        if len(grid.ordered_columns) <= 1:
             self.notify("Cannot hide the last visible column", severity="error")
             return
-        coord = self.focused.cursor_coordinate
-        column_name = self.focused.ordered_columns[coord.column].key.value
+        column_name = grid.ordered_columns[grid.cursor_coordinate.column].key.value
 
         settings = self.view_settings.get(self.current_item)
         if column_name not in settings.hidden:
@@ -2501,8 +2544,8 @@ class DbMan(App):
     def action_unhide_column(self):
         """'u', column-select-mode-scoped like hiding: pick a previously
         hidden column to bring back. See issue #2."""
-        if self.mode != "view" or not self.current_item:
-            self.notify("Unhide only allowed in View mode", severity="error")
+        if self.mode not in ("view", "form") or not self.current_item:
+            self.notify("Unhide only allowed in View or Form mode", severity="error")
             return
         if self.select_mode != "column":
             self.notify("Unhide only allowed in column select mode (press 's' to rotate)", severity="error")
@@ -2613,6 +2656,13 @@ class DbMan(App):
         row = table.cursor_coordinate.row if self.select_mode == "column" else coord.row
         table.cursor_coordinate = Coordinate(row, coord.column)
         self.search_index = index
+        if self.mode == "form":
+            # The form shows the grid's cursor row; put its field cursor on
+            # the matching field (in row mode, ready for switching back).
+            self._render_form()
+            self.query_one("#form-view", FormView).select_field(
+                table.ordered_columns[coord.column].key.value
+            )
 
     def _sidebar_match_rows(self):
         """Indices into the sidebar's rows whose object name matches the
@@ -2675,10 +2725,10 @@ class DbMan(App):
         if _sidebar_has_focus(self):
             self._search_sidebar()
             return
-        if self.mode != "view":
-            self.notify("Search only allowed in View mode", severity="error")
+        if self.mode not in ("view", "form"):
+            self.notify("Search only allowed in View or Form mode", severity="error")
             return
-        if not isinstance(self.focused, DataTable) or not self.current_item:
+        if self._grid() is None or not self.current_item:
             return
 
         def run(term):
@@ -2723,8 +2773,8 @@ class DbMan(App):
             self._step_search(-1)
 
     def action_filter_column(self):
-        if self.mode != "view":
-            self.notify("Filtering only allowed in View mode", severity="error")
+        if self.mode not in ("view", "form"):
+            self.notify("Filtering only allowed in View or Form mode", severity="error")
             return
         if self.select_mode == "row":
             # The cursor keeps a live column coordinate in every select
@@ -2734,13 +2784,13 @@ class DbMan(App):
             # show the user exactly what they're about to filter.
             self.notify("Filtering needs a visible column - press 's' for field or column mode", severity="error")
             return
-        if not isinstance(self.focused, DataTable) or not self.current_item:
+        grid = self._grid()
+        if grid is None or not self.current_item:
             return
+        column_name = grid.ordered_columns[grid.cursor_coordinate.column].key.value
         if not self.provider.is_filterable(self.current_type):
             self.notify("Filtering not available for this item", severity="error")
             return
-        coord = self.focused.cursor_coordinate
-        column_name = self.focused.ordered_columns[coord.column].key.value
         if self._is_computed(column_name):
             self.notify(f"'{column_name}' is computed by dbman - the database can't filter on it; try / to search", severity="error")
             return
@@ -2783,19 +2833,19 @@ class DbMan(App):
         self.push_screen(FilterColumnScreen(column_name, current_filter), apply_filter)
 
     def action_sort_column(self):
-        if self.mode != "view":
-            self.notify("Sorting only allowed in View mode", severity="error")
+        if self.mode not in ("view", "form"):
+            self.notify("Sorting only allowed in View or Form mode", severity="error")
             return
         if self.select_mode != "column":
             self.notify("Sorting only allowed in column select mode (press 's' to rotate)", severity="error")
             return
-        if not isinstance(self.focused, DataTable) or not self.current_item:
+        grid = self._grid()
+        if grid is None or not self.current_item:
             return
+        column_name = grid.ordered_columns[grid.cursor_coordinate.column].key.value
         if not self.provider.capabilities.sort_column or not self.provider.is_sortable(self.current_type):
             self.notify("Sorting not available for this item", severity="error")
             return
-        coord = self.focused.cursor_coordinate
-        column_name = self.focused.ordered_columns[coord.column].key.value
         if self._is_computed(column_name):
             self.notify(f"'{column_name}' is computed by dbman - the database can't sort on it", severity="error")
             return
@@ -2824,8 +2874,8 @@ class DbMan(App):
             self.notify(f"Cleared sort on '{column_name}'")
 
     def action_clear_filters(self):
-        if self.mode != "view":
-            self.notify("Filtering only allowed in View mode", severity="error")
+        if self.mode not in ("view", "form"):
+            self.notify("Filtering only allowed in View or Form mode", severity="error")
             return
         # No select-mode guard at all, unlike its 'f' counterpart: clearing
         # every filter doesn't name a column, so there's nothing for a
@@ -2862,18 +2912,16 @@ class DbMan(App):
         if self.current_type == "plugin":
             self.notify("Cannot delete Plugins", severity="error")
             return
-        if self.mode == "view" and isinstance(self.focused, DataTable) and self.select_mode == "column":
+        grid = self._grid()
+        if grid is not None and self.select_mode == "column":
             self._delete_computed_column()
             return
-        if (
-            self.mode == "view"
-            and isinstance(self.focused, DataTable)
-            and self.select_mode == "row"
-            and self.current_item
-            and self.rows_editable
-        ):
-            self._delete_row()
+        if grid is not None and self.select_mode == "row" and self.current_item and self.rows_editable:
+            if grid.row_count:
+                self._delete_row(list(grid.rows.values())[grid.cursor_coordinate.row].key.value)
             return
+        if self.mode == "form" and grid is not None:
+            return  # field mode: see _delete_item_ctx
         if not self.provider.capabilities.delete_item:
             self.notify("Deleting is not available for this provider", severity="error")
             return
@@ -2901,12 +2949,10 @@ class DbMan(App):
         msg = f"Delete {item_type} '{name}'?"
         self.push_screen(ConfirmScreen(msg, "Delete"), on_confirm)
 
-    def _delete_row(self):
+    def _delete_row(self, row_id_str):
         if not self.provider.capabilities.delete_row:
             self.notify("Row delete not supported for this provider — switch to field mode", severity="error")
             return
-        coord = self.focused.cursor_coordinate
-        row_id_str = list(self.focused.rows.values())[coord.row].key.value
         row_key = self.row_keys.get(row_id_str)
         if row_key is None or row_key.value is None:
             self.notify("Cannot delete this row", severity="error")
@@ -2990,10 +3036,11 @@ class DbMan(App):
             self.push_screen(LookupConfigScreen(table, fk_col, rel_table, rel_key, cols), save_lookup)
             return
 
-        if self.mode != "view":
-            self.notify(f"Editing only allowed in View mode", severity="error")
+        if self.mode not in ("view", "form"):
+            self.notify(f"Editing only allowed in View or Form mode", severity="error")
             return
-        if not isinstance(self.focused, DataTable) or not self.current_item:
+        grid = self._grid()
+        if grid is None or not self.current_item:
             return
 
         if self.select_mode == "row":
@@ -3007,16 +3054,22 @@ class DbMan(App):
         if self.select_mode == "column":
             self.action_edit_column()
             return
+        if self.mode == "form":
+            # Field mode's editors are the form's own (in place, or
+            # form_edit_other); FormView.action_edit only comes here for
+            # the other two modes.
+            self.query_one("#form-view", FormView).action_edit()
+            return
 
-        if self.focused.row_count == 0:
+        if grid.row_count == 0:
             self.notify("No row to edit", severity="error")
             return
-        coord = self.focused.cursor_coordinate
-        column_name = self.focused.ordered_columns[coord.column].key.value
-        row_id_str = list(self.focused.rows.values())[coord.row].key.value
+        coord = grid.cursor_coordinate
+        column_name = grid.ordered_columns[coord.column].key.value
+        row_id_str = list(grid.rows.values())[coord.row].key.value
         # Prefer the untruncated value: the DataTable cell may hold a
         # display-only ".."-truncated string (see view_settings.truncate_rows).
-        current_value = self.row_values.get(row_id_str, {}).get(column_name, self.focused.get_cell_at(coord))
+        current_value = self.row_values.get(row_id_str, {}).get(column_name, grid.get_cell_at(coord))
         self._edit_field(row_id_str, column_name, current_value)
 
     def _edit_field(self, row_id_str, column_name, current_value):
@@ -3117,14 +3170,13 @@ class DbMan(App):
         self.push_screen(EditCellScreen(current_value), perform_update)
 
     def action_edit_document(self):
-        if self.mode != "view" or not self.provider.capabilities.whole_row_edit:
+        if self.mode not in ("view", "form") or not self.provider.capabilities.whole_row_edit:
             self.notify("Whole-document editing is not available for this provider", severity="error")
             return
-        if not isinstance(self.focused, DataTable) or not self.current_item:
+        grid = self._grid()
+        if grid is None or not grid.row_count or not self.current_item:
             return
-
-        coord = self.focused.cursor_coordinate
-        row_id_str = list(self.focused.rows.values())[coord.row].key.value
+        row_id_str = list(grid.rows.values())[grid.cursor_coordinate.row].key.value
         row_key = self.row_keys.get(row_id_str)
         raw_doc = self.raw_docs.get(row_id_str)
         if row_key is None or raw_doc is None:
@@ -3133,14 +3185,14 @@ class DbMan(App):
         self._open_document_editor(row_key, raw_doc)
 
     def action_open_in_browser(self):
-        if self.mode != "view" or not self.provider.capabilities.open_in_browser:
+        if self.mode not in ("view", "form") or not self.provider.capabilities.open_in_browser:
             self.notify("Opening in browser is not available for this provider", severity="error")
             return
-        if not isinstance(self.focused, DataTable) or not self.current_item:
+        grid = self._grid()
+        if grid is None or not grid.row_count or not self.current_item:
             return
 
-        coord = self.focused.cursor_coordinate
-        row_id_str = list(self.focused.rows.values())[coord.row].key.value
+        row_id_str = list(grid.rows.values())[grid.cursor_coordinate.row].key.value
         row_key = self.row_keys.get(row_id_str)
         if row_key is None or row_key.value is None:
             self.notify("Cannot open this row", severity="error")
@@ -3157,12 +3209,11 @@ class DbMan(App):
         provider says it leads (Provider.open_row) - a url in the browser,
         or, for a dbman.sqlite `connections` row, that connection. In field
         mode, show the focused cell's whole value (_view_cell)."""
-        if not isinstance(self.focused, DataTable) or not self.current_item:
+        grid = self._grid()
+        if grid is None or not self.current_item or not grid.row_count:
             return
-        if not self.focused.row_count:
-            return
-        coord = self.focused.cursor_coordinate
-        row_id_str = list(self.focused.rows.values())[coord.row].key.value
+        coord = grid.cursor_coordinate
+        row_id_str = list(grid.rows.values())[coord.row].key.value
         if self.select_mode == "field":
             self._view_cell(coord, row_id_str)
             return
@@ -3292,8 +3343,8 @@ class DbMan(App):
             else:
                 self.notify("Add only allowed on a Table or View", severity="error")
             return
-        if self.mode != "view" or not self.current_item:
-            self.notify("Add only allowed in View mode, on a Table or View", severity="error")
+        if self.mode not in ("view", "form") or not self.current_item:
+            self.notify("Add only allowed in View or Form mode, on a Table or View", severity="error")
             return
         if self.select_mode == "column" and self.current_type in ("table", "view"):
             self._add_computed_column(right=True)
@@ -3307,7 +3358,7 @@ class DbMan(App):
     def action_add_column_left(self):
         """'A' in column select mode: a computed column left of the
         selected one ('a' adds it to the right)."""
-        if self.mode != "view" or self.select_mode != "column" or self.current_type not in ("table", "view"):
+        if self.mode not in ("view", "form") or self.select_mode != "column" or self.current_type not in ("table", "view"):
             return
         self._add_computed_column(right=False)
 
@@ -3316,8 +3367,8 @@ class DbMan(App):
         one, then open its properties straight into editing its Source -
         the expression that fills it (see computed.py). Placement is just
         the saved column order, the same thing H/L write."""
-        table_widget = self.query_one("#data-table", DataTable)
-        if not table_widget.ordered_columns:
+        table_widget = self._grid()
+        if table_widget is None or not table_widget.ordered_columns:
             self.notify("No column to add beside", severity="error")
             return
         anchor = table_widget.ordered_columns[table_widget.cursor_coordinate.column].key.value
@@ -3356,22 +3407,25 @@ class DbMan(App):
                 table.focus()
                 self.action_edit_column(edit_key="source")
 
-        side = "right" if right else "left"
+        if self.mode == "form":
+            side = "below" if right else "above"  # the grid on its side
+        else:
+            side = "right of" if right else "left of"
         self.push_screen(
-            PromptScreen(RowEdit(f"New computed column, {side} of {anchor}. Name:", "", create)),
+            PromptScreen(RowEdit(f"New computed column, {side} {anchor}. Name:", "", create)),
             created,
         )
 
     def _selected_column_is_computed(self):
-        table = self.focused
-        if not isinstance(table, DataTable) or not table.ordered_columns:
+        table = self._grid()
+        if table is None or not table.ordered_columns:
             return False
         return self._is_computed(table.ordered_columns[table.cursor_coordinate.column].key.value)
 
     def _delete_computed_column(self):
         """'d' in column select mode: remove a computed column - its binding
         and its display settings. The plugin function is untouched."""
-        table_widget = self.focused
+        table_widget = self._grid()
         name = table_widget.ordered_columns[table_widget.cursor_coordinate.column].key.value
         if not self._is_computed(name):
             self.notify(f"'{name}' comes from {self.columns_by_name[name].source}; only computed columns can be deleted here",
@@ -3429,6 +3483,8 @@ class DbMan(App):
         if key_str in self.row_order:
             table_widget = self.query_one("#data-table", DataTable)
             table_widget.move_cursor(row=self.row_order.index(key_str))
+            if self.mode == "form":
+                self._render_form()
         raw_doc = self.raw_docs.get(key_str)
         if raw_doc is not None:
             self._open_document_editor(row_key, raw_doc)
@@ -3487,9 +3543,11 @@ class DbMan(App):
         its own - empty - selection), so this is the in-app way.
 
         Reads row_values (untruncated) rather than the DataTable cells,
-        which may hold '..'-shortened display strings."""
-        table = self.focused
-        if not isinstance(table, DataTable) or not table.row_count:
+        which may hold '..'-shortened display strings. Form mode is the
+        same three selections (a field is a cell). ctrl+c does the same when
+        there's no mouse selection for Textual to copy instead."""
+        table = self._grid()
+        if table is None or not table.row_count:
             return
         coord = table.cursor_coordinate
         columns = [c.key.value for c in table.ordered_columns]
@@ -3507,14 +3565,16 @@ class DbMan(App):
         else:
             text = value(row_ids[coord.row], columns[coord.column])
             what = "cell"
-        self._copy_to_clipboard(text)
+        self.copy_to_clipboard(text)
         preview = text if len(text) <= 40 else text[:37] + "..."
         self.notify(f"Copied {what}: {preview}" if self.select_mode == "field" else f"Copied {what}")
 
-    def _copy_to_clipboard(self, text):
+    def copy_to_clipboard(self, text):
         # OSC 52 covers iTerm2/kitty/WezTerm and works over ssh, but macOS
         # Terminal.app ignores it, so locally also go through pbcopy.
-        self.copy_to_clipboard(text)
+        # Overriding Textual's method (rather than wrapping it) means its own
+        # copies - a TextArea selection, a mouse selection - get pbcopy too.
+        super().copy_to_clipboard(text)
         if sys.platform == "darwin" and shutil.which("pbcopy"):
             try:
                 subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True, timeout=2)
@@ -3531,6 +3591,43 @@ class DbMan(App):
         if not table.row_count or table.cursor_row >= len(self.row_order):
             return None
         return self.row_order[table.cursor_row]
+
+    def _grid(self):
+        """The DataTable the select-mode actions read their cursor from, or
+        None when the focus isn't on the rows. In View mode that's the
+        focused grid; in Form mode it's the grid behind the form, with its
+        cursor column moved to the current field (its cursor row already is
+        the record). So the form is the grid on its side, and one code path
+        serves both."""
+        if self.mode == "form":
+            if not isinstance(self.focused, (FormView, FieldEditor)):
+                return None
+            table = self.query_one("#data-table", DataTable)
+            names = [c.key.value for c in table.ordered_columns]
+            name = self._form_field_name()
+            if name in names and table.row_count:
+                table.cursor_coordinate = Coordinate(table.cursor_coordinate.row, names.index(name))
+            return table
+        if self.mode == "view" and isinstance(self.focused, DataTable):
+            return self.focused
+        return None
+
+    def form_record_edge(self, end):
+        """g/G in form row mode: first/last record on the loaded page."""
+        table = self.query_one("#data-table", DataTable)
+        if table.row_count:
+            table.move_cursor(row=table.row_count - 1 if end else 0)
+            self._render_form()
+
+    def _form_field_name(self):
+        """The current field's column - what _grid points the column cursor
+        at in form mode."""
+        if self.mode != "form":
+            return None
+        form = self.query_one("#form-view", FormView)
+        if not form.fields:
+            return None
+        return form.fields[form.current].name or None
 
     def _form_inline_note(self, col, value, row_key):
         """None if the field is edited in place as text, else why not."""
