@@ -148,6 +148,27 @@ def load_function(module_name: str, func_name: str, base_dir: Optional[Path] = N
     return func
 
 
+def clear_caches(connection: str, item: str, base_dir: Optional[Path] = None) -> int:
+    """Clear the memo of every function item's computed columns call, where
+    it has one (`functools.cache`/`lru_cache` give `cache_clear`). Called by
+    'r': dbman doesn't cache calls itself, since it can't know a function is
+    deterministic - the recommended pattern reads a cache file, a hidden
+    input - so caching is the plugin author's call, and this is how 'r'
+    still means "fresh". Returns how many were cleared; a binding that
+    doesn't resolve is skipped (the load reports it)."""
+    cleared = set()
+    for binding in read_bindings(connection, item, base_dir):
+        try:
+            expr = parse_expression(binding.expression or "")
+            func = load_function(expr.module, expr.func, base_dir)
+        except ValueError:
+            continue
+        if callable(getattr(func, "cache_clear", None)) and func not in cleared:
+            func.cache_clear()
+            cleared.add(func)
+    return len(cleared)
+
+
 def compile_expression(text: str, base_dir: Optional[Path] = None,
                        columns: Optional[list[str]] = None) -> Callable[[dict], Any]:
     """A `row dict -> value` callable for an expression, checked as far as

@@ -153,7 +153,8 @@ class ShortcutsScreen(ModalScreen):
                 " tab: Cycle focus (Sidebar -> Main Area)\n"
                 " shift+tab: Jump to next sidebar section\n"
                 " m: Cycle View / Form / Diagram mode\n"
-                " r: Reload current table/view from the database\n"
+                " r: Reload current table/view from the database (also clears computed\n"
+                "    columns' @functools.cache memos)\n"
                 " c: Switch connection (pick from dbman.sqlite, j/k + enter)\n"
                 " ?: Toggle this Shortcuts panel\n"
                 " ctrl+p: Open Textual's command palette\n"
@@ -1710,8 +1711,11 @@ class DbMan(App):
         currently shown."""
         if not self.current_item:
             return
+        cleared = 0
+        if self.current_type in ("table", "view"):
+            cleared = computed.clear_caches(self.view_settings.connection, self.current_item)
         self.load_item(self.current_item, self.current_type)
-        self.notify("Reloaded")
+        self.notify(f"Reloaded, cleared {cleared} function cache(s)" if cleared else "Reloaded")
 
     def action_switch_connection(self):
         if self.workspace is None:
